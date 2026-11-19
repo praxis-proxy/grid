@@ -16,8 +16,9 @@ pub(crate) const MAX_MODEL_NAME_BYTES: usize = 256;
 ///
 /// A vLLM or `KServe` endpoint serves one base model plus its `LoRA` adapters,
 /// usually a handful to dozens. At [`MAX_MODEL_NAME_BYTES`] per name, the
-/// worst case is 64 KiB of status, far below the etcd object limit.
-pub(crate) const MAX_SERVED_MODELS: usize = 256;
+/// worst case is 64 KiB of status, far below the etcd object limit. Shared with the
+/// signed inventory and the providers record so every hop carries the same set.
+pub(crate) const MAX_SERVED_MODELS: usize = swim::MAX_INVENTORY_MODELS;
 
 // ---------------------------------------------------------------------------
 // ServedModelsError

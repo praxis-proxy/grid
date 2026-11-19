@@ -3,7 +3,7 @@
 //! The top-level tenancy boundary for the AI Grid. A cluster
 //! can host multiple `GridNetworks` for multi-tenancy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crdt::GCounter;
 use kube::CustomResource;
@@ -43,6 +43,215 @@ pub enum RoutingPolicy {
     /// KV-cache pressure, latency) should drive routing decisions across
     /// sites.
     ScoreFirst,
+}
+
+// ---------------------------------------------------------------------------
+// Regional policy
+// ---------------------------------------------------------------------------
+
+/// Maximum number of regions or sovereignty zones accepted by one policy set.
+pub const REGIONAL_POLICY_MAX_VALUES: usize = 64;
+
+/// Maximum length of one region or sovereignty-zone identifier.
+pub const REGIONAL_POLICY_MAX_VALUE_LENGTH: usize = 253;
+
+/// Maximum length of a canonical sovereignty-zone token.
+pub const REGIONAL_POLICY_MAX_SOVEREIGNTY_ZONE_LENGTH: usize = grid_signals::zone::MAX_ZONE_LEN;
+
+/// Regional eligibility and preference mode for a consumer gateway.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RegionalPolicyMode {
+    /// Prefer configured or gateway-local regions, with optional explicit fallback.
+    Affinity,
+    /// Exclude every candidate outside an explicit region allowlist.
+    Locked,
+}
+
+/// Whether affinity routing may consider candidates outside preferred regions.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CrossRegionFallback {
+    /// Allow fallback only when no preferred-region candidate can accept new work.
+    Allow,
+    /// Do not route outside preferred regions.
+    #[default]
+    Deny,
+}
+
+/// Admission rule refusing `allowedRegions` in affinity mode.
+pub(crate) const REGIONAL_POLICY_AFFINITY_FORBIDS_ALLOWED_REGIONS: &str =
+    "self.mode != 'affinity' || !has(self.allowedRegions)";
+
+/// Admission rule requiring `allowedRegions` in locked mode.
+pub(crate) const REGIONAL_POLICY_LOCKED_REQUIRES_ALLOWED_REGIONS: &str =
+    "self.mode != 'locked' || has(self.allowedRegions)";
+
+/// Admission rule refusing `preferredRegions` in locked mode.
+pub(crate) const REGIONAL_POLICY_LOCKED_FORBIDS_PREFERRED_REGIONS: &str =
+    "self.mode != 'locked' || !has(self.preferredRegions)";
+
+/// Admission rule refusing `crossRegionFallback` in locked mode.
+pub(crate) const REGIONAL_POLICY_LOCKED_FORBIDS_CROSS_REGION_FALLBACK: &str =
+    "self.mode != 'locked' || !has(self.crossRegionFallback)";
+
+/// Per-gateway regional routing contract.
+///
+/// The policy applies to every capability in the containing [`GatewayRef`]'s
+/// edge-local overlay. It uses trusted [`GridSite`] metadata; caller-supplied
+/// region headers are not policy inputs.
+///
+/// [`GridSite`]: crate::crd::grid_site::GridSite
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": REGIONAL_POLICY_AFFINITY_FORBIDS_ALLOWED_REGIONS,
+    "message": "allowedRegions is not valid in affinity mode"
+}, {
+    "rule": REGIONAL_POLICY_LOCKED_REQUIRES_ALLOWED_REGIONS,
+    "message": "allowedRegions is required in locked mode"
+}, {
+    "rule": REGIONAL_POLICY_LOCKED_FORBIDS_PREFERRED_REGIONS,
+    "message": "preferredRegions is not valid in locked mode"
+}, {
+    "rule": REGIONAL_POLICY_LOCKED_FORBIDS_CROSS_REGION_FALLBACK,
+    "message": "crossRegionFallback is not valid in locked mode"
+}]))]
+pub struct RegionalPolicy {
+    /// Whether regions are preferred or form a hard eligibility boundary.
+    pub mode: RegionalPolicyMode,
+
+    /// Unordered preferred-region set for affinity mode.
+    ///
+    /// This Kubernetes set contains 1–64 non-empty values without whitespace,
+    /// each at most 253 characters.
+    ///
+    /// When absent, the operator derives the preferred region from the trusted
+    /// [`GridSite`] resolved through [`GatewayRef::site_name`].
+    ///
+    /// [`GridSite`]: crate::crd::grid_site::GridSite
+    #[schemars(
+        length(min = 1, max = 64),
+        inner(length(min = 1, max = 253), regex(pattern = r"^\S+$")),
+        extend("x-kubernetes-list-type" = "set")
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_regions: Option<Vec<String>>,
+
+    /// Unordered hard region allowlist for locked mode.
+    ///
+    /// This Kubernetes set contains 1–64 non-empty values without whitespace,
+    /// each at most 253 characters.
+    #[schemars(
+        length(min = 1, max = 64),
+        inner(length(min = 1, max = 253), regex(pattern = r"^\S+$")),
+        extend("x-kubernetes-list-type" = "set")
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_regions: Option<Vec<String>>,
+
+    /// Explicit cross-region fallback behavior for affinity mode.
+    ///
+    /// Omission is equivalent to [`CrossRegionFallback::Deny`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_region_fallback: Option<CrossRegionFallback>,
+
+    /// Independent hard sovereignty-zone allowlist for either mode.
+    ///
+    /// Values use the [`GridSite`] `sovereigntyZone` token format. Matching
+    /// uses the shared canonical form and is case-insensitive.
+    ///
+    /// [`GridSite`]: crate::crd::grid_site::GridSite
+    #[schemars(
+        length(min = 1, max = 64),
+        inner(length(min = 1, max = 63), regex(pattern = "^[A-Za-z0-9._-]+$")),
+        extend("x-kubernetes-list-type" = "set")
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_sovereignty_zones: Option<Vec<String>>,
+}
+
+impl RegionalPolicy {
+    /// Return the effective affinity fallback behavior.
+    #[must_use]
+    pub fn effective_cross_region_fallback(&self) -> CrossRegionFallback {
+        self.cross_region_fallback.unwrap_or_default()
+    }
+
+    /// Validate mode-specific fields and bounded policy sets defensively.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explanatory message when the policy combines incompatible
+    /// fields or contains an invalid set value.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.mode {
+            RegionalPolicyMode::Affinity => {
+                if self.allowed_regions.is_some() {
+                    return Err("allowedRegions is not valid in affinity mode".to_owned());
+                }
+                validate_regional_policy_set("preferredRegions", self.preferred_regions.as_deref())?;
+            },
+            RegionalPolicyMode::Locked => {
+                if self.allowed_regions.is_none() {
+                    return Err("allowedRegions is required in locked mode".to_owned());
+                }
+                if self.preferred_regions.is_some() {
+                    return Err("preferredRegions is not valid in locked mode".to_owned());
+                }
+                if self.cross_region_fallback.is_some() {
+                    return Err("crossRegionFallback is not valid in locked mode".to_owned());
+                }
+                validate_regional_policy_set("allowedRegions", self.allowed_regions.as_deref())?;
+            },
+        }
+        validate_regional_policy_sovereignty_zone_set(self.allowed_sovereignty_zones.as_deref())
+    }
+}
+
+/// Validate one optional bounded set in the regional policy contract.
+fn validate_regional_policy_set(field: &'static str, values: Option<&[String]>) -> Result<(), String> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    if values.is_empty() {
+        return Err(format!("{field} must not be empty when present"));
+    }
+    if values.len() > REGIONAL_POLICY_MAX_VALUES {
+        return Err(format!(
+            "{field} must contain at most {REGIONAL_POLICY_MAX_VALUES} values"
+        ));
+    }
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() || value.chars().any(char::is_whitespace) {
+            return Err(format!("{field} contains a blank or whitespace-bearing value"));
+        }
+        if value.chars().count() > REGIONAL_POLICY_MAX_VALUE_LENGTH {
+            return Err(format!(
+                "{field} contains a value longer than {REGIONAL_POLICY_MAX_VALUE_LENGTH} characters"
+            ));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(format!("{field} contains duplicate value {value:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the canonical token set used by the sovereignty routing fence.
+fn validate_regional_policy_sovereignty_zone_set(values: Option<&[String]>) -> Result<(), String> {
+    validate_regional_policy_set("allowedSovereigntyZones", values)?;
+    let Some(values) = values else {
+        return Ok(());
+    };
+    for value in values {
+        if grid_signals::zone::sovereignty_zone(value).is_none() {
+            return Err("allowedSovereigntyZones contains an invalid sovereignty-zone token".to_owned());
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +420,21 @@ impl MembershipMode {
 pub struct MembershipConfig {
     /// Membership source. Local requires `signalTransport.mode: poll`.
     pub mode: MembershipMode,
+
+    /// SWIM seed peers used when `mode` is `Swim`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swim: Option<SwimConfig>,
+}
+
+impl MembershipConfig {
+    /// Whether this membership mode permits a SWIM configuration block.
+    #[must_use]
+    pub const fn swim_config_matches_mode(&self) -> bool {
+        match self.mode {
+            MembershipMode::Swim => true,
+            MembershipMode::Local => self.swim.is_none(),
+        }
+    }
 }
 
 /// How signals propagate across the sites of a grid.
@@ -475,7 +699,7 @@ pub enum BudgetPolicyValidationError {
 /// found, in declaration order: a blank `tenantId`, a duplicate `tenantId`, a
 /// negative `capUsd`, or a non-finite `capUsd`.
 pub fn validate_budget_policy(policy: &BudgetPolicyConfig) -> Result<(), BudgetPolicyValidationError> {
-    let mut seen_tenant_ids = std::collections::HashSet::new();
+    let mut seen_tenant_ids = HashSet::new();
     for tenant in &policy.tenants {
         if tenant.tenant_id.trim().is_empty() {
             return Err(BudgetPolicyValidationError::BlankTenantId);
@@ -636,8 +860,7 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 
 /// Specification for a [`GridNetwork`].
 ///
-/// Defines the grid's seed peers, gateway associations, SWIM
-/// tuning, and TLS secret references.
+/// Defines the grid's gateway associations, membership, and TLS secret references.
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis.fast",
@@ -667,6 +890,9 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 }, {
     "rule": "!has(self.membership) || self.membership.mode != 'Local' || (has(self.signalTransport) && self.signalTransport.mode == 'poll')",
     "message": "membership.mode Local requires signalTransport.mode poll"
+}, {
+    "rule": "!has(self.membership) || self.membership.mode == 'Swim' || !has(self.membership.swim)",
+    "message": "membership.swim is only valid when membership.mode is Swim"
 }]))]
 #[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
@@ -679,21 +905,12 @@ pub struct GridNetworkSpec {
     #[schemars(length(max = 63), regex(pattern = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"))]
     pub grid_id: String,
 
-    /// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed
-    /// IPv6, and DNS hostnames are accepted.
-    #[serde(default)]
-    pub seeds: Vec<String>,
-
     /// References to Praxis Gateways that participate in this grid.
     #[serde(default, alias = "gatewayRefs")]
     pub consumer_gateways: Vec<GatewayRef>,
 
     /// Region where this site is deployed.
     pub region: Option<String>,
-
-    /// SWIM protocol configuration.
-    #[serde(default)]
-    pub swim: SwimConfig,
 
     /// TLS secret references for grid certificate management.
     #[serde(default)]
@@ -856,6 +1073,14 @@ pub struct GatewayRef {
     #[serde(default, alias = "localSiteName")]
     pub site_name: Option<String>,
 
+    /// Regional eligibility and preference policy for this gateway's overlay.
+    ///
+    /// The policy applies to every capability rendered for this gateway. When
+    /// absent, Grid preserves the existing unconstrained routing behavior.
+    /// Per-route overrides are outside this contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regional_policy: Option<RegionalPolicy>,
+
     /// Model-discovery contract version supported by the running gateway.
     ///
     /// Set this only after the gateway is running an image that understands
@@ -903,6 +1128,10 @@ impl GatewayRef {
     }
 }
 
+/// Admission rule refusing a sovereignty fence under any router but `gridSiteRoute`.
+pub(crate) const SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE: &str =
+    "!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == 'gridSiteRoute')";
+
 /// Opt-in configuration for operator-generated consumer Praxis config.
 ///
 /// When `generate` is `true` on a [`GatewayRef`], the `GridNetwork` controller
@@ -926,6 +1155,10 @@ impl GatewayRef {
     reason = "wire-compatible opt-in and attestation fields are separate"
 )]
 #[schemars(transform = add_consumer_config_legacy_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE,
+    "message": "sovereignty is applied only by siteRouter gridSiteRoute"
+}]))]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
@@ -1046,6 +1279,55 @@ pub struct ConsumerConfig {
     /// Default: `intelligentRoute`.
     #[serde(default)]
     pub site_router: SiteRouter,
+
+    /// The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
+    /// may be served in, and whether it refuses or only audits. Admission rejects it under
+    /// any other router.
+    ///
+    /// Default: unset, no fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sovereignty: Option<SovereigntyFence>,
+}
+
+/// A `gridSiteRoute` sovereignty fence.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SovereigntyFence {
+    /// Request header naming the zones a request may be served in: one zone, or a
+    /// comma-separated list in a single header line, matched against each `GridSite`
+    /// `sovereigntyZone`. The upstream that sets it must replace, never append to, a
+    /// caller's copy.
+    #[schemars(regex(pattern = "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$"), length(max = 63))]
+    pub header: String,
+
+    /// What the fence does with a request it does not admit.
+    ///
+    /// Default: `enforce`.
+    #[serde(default)]
+    pub mode: FenceMode,
+}
+
+/// What a sovereignty fence does with a request it does not admit.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FenceMode {
+    /// Refuse it: 400 for no valid zone, 403 when no site in its zones serves it.
+    #[default]
+    Enforce,
+    /// Route it as if unfenced, and log and count what would be refused.
+    Audit,
+}
+
+impl FenceMode {
+    /// The value `grid_site_route` reads.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Audit => "audit",
+        }
+    }
 }
 
 /// The filter an operator-generated consumer config routes with.
@@ -1187,6 +1469,7 @@ impl Default for ConsumerConfig {
             listener_port: default_listener_port(),
             telemetry: None,
             site_router: SiteRouter::IntelligentRoute,
+            sovereignty: None,
         }
     }
 }
@@ -1381,21 +1664,18 @@ fn default_listener_port() -> u16 {
     8080
 }
 
-/// SWIM protocol tuning parameters.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// Optional SWIM membership configuration.
+///
+/// The controller passes seeds to the SWIM runtime for peer discovery.
+/// Protocol tuning values are not exposed because the runtime does not consume them.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct SwimConfig {
-    /// Fanout for indirect probes.
-    #[serde(default = "default_gossip_nodes")]
-    pub gossip_nodes: u32,
-
-    /// WAN probe interval (e.g. "5s").
-    #[serde(default = "default_probe_interval")]
-    pub probe_interval: String,
-
-    /// Suspicion timeout before declaring dead (e.g. "10s").
-    #[serde(default = "default_suspicion_timeout")]
-    pub suspicion_timeout: String,
+    /// SWIM peer endpoints in host:port form. Literal IPv4, bracketed IPv6,
+    /// and DNS hostnames are accepted.
+    #[serde(default)]
+    pub seeds: Vec<String>,
 }
 
 /// TLS configuration for grid certificate management.
@@ -1540,7 +1820,7 @@ pub struct GatewayAgeReport {
     /// Random process identity, unchanged across poller reloads.
     #[schemars(regex(pattern = "^[0-9a-f]{32}$"))]
     pub epoch: String,
-    /// Last durably accepted sequence.
+    /// Last durably recorded sequence; live sequence watermarks are process-local.
     #[schemars(range(min = 1))]
     pub sequence: i64,
     /// Cumulative skew rejection count.
@@ -1769,31 +2049,6 @@ pub struct OverlayRevisionStatus {
 // Defaults
 // ---------------------------------------------------------------------------
 
-/// Default SWIM gossip fanout.
-fn default_gossip_nodes() -> u32 {
-    3
-}
-
-/// Default WAN probe interval.
-fn default_probe_interval() -> String {
-    "5s".to_owned()
-}
-
-/// Default suspicion timeout.
-fn default_suspicion_timeout() -> String {
-    "10s".to_owned()
-}
-
-impl Default for SwimConfig {
-    fn default() -> Self {
-        Self {
-            gossip_nodes: default_gossip_nodes(),
-            probe_interval: default_probe_interval(),
-            suspicion_timeout: default_suspicion_timeout(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1817,6 +2072,81 @@ mod tests {
     }
 
     #[test]
+    fn membership_swim_is_optional_and_only_allowed_for_swim_mode() {
+        let crd = crd_json();
+        let spec = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec")
+            .unwrap_or_else(|| std::process::abort());
+        let spec_properties = spec
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            !spec_properties.contains_key("seeds"),
+            "top-level seeds must be removed"
+        );
+        assert!(
+            !spec_properties.contains_key("swim"),
+            "top-level swim tuning must be removed"
+        );
+
+        let membership = spec_properties
+            .get("membership")
+            .unwrap_or_else(|| std::process::abort());
+        let swim_schema = membership
+            .pointer("/properties/swim")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            swim_schema.get("default").is_none(),
+            "membership.swim must not have a schema default"
+        );
+        assert!(
+            !membership
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|required| { required.iter().any(|field| field.as_str() == Some("swim")) }),
+            "membership.swim must be optional"
+        );
+        let validations = spec
+            .get("x-kubernetes-validations")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            validations.iter().any(|validation| {
+                validation.get("rule").and_then(serde_json::Value::as_str)
+                    == Some("!has(self.membership) || self.membership.mode == 'Swim' || !has(self.membership.swim)")
+            }),
+            "CRD must reject membership.swim for Local mode"
+        );
+        let configured_swim = serde_json::from_value::<MembershipConfig>(serde_json::json!({
+            "mode": "Swim",
+            "swim": {"seeds": ["peer.example:7946"]}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            configured_swim.swim_config_matches_mode(),
+            "Swim mode must accept membership.swim"
+        );
+        let local = serde_json::from_value::<MembershipConfig>(serde_json::json!({
+            "mode": "Local",
+            "swim": {"seeds": ["peer.example:7946"]}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !local.swim_config_matches_mode(),
+            "Local mode must reject membership.swim"
+        );
+        assert!(
+            serde_json::from_value::<MembershipConfig>(serde_json::json!({
+                "mode": "Swim",
+                "swim": {"probeInterval": "2s"}
+            }))
+            .is_err(),
+            "unsupported tuning fields must be rejected"
+        );
+    }
+
+    #[test]
     fn a_backend_ca_key_is_a_file_name_never_a_path() {
         let schema = schemars::schema_for!(EndpointCaSecretRef);
         assert_eq!(
@@ -1828,14 +2158,6 @@ mod tests {
             "what Kubernetes accepts as a Secret key: `root..crt` and `.hidden` pass, `/`, `.`, `..` \
              and a `..` prefix do not"
         );
-    }
-
-    #[test]
-    fn default_swim_config() {
-        let cfg = SwimConfig::default();
-        assert_eq!(cfg.gossip_nodes, 3, "default gossip nodes");
-        assert_eq!(cfg.probe_interval, "5s", "default probe interval");
-        assert_eq!(cfg.suspicion_timeout, "10s", "default suspicion timeout");
     }
 
     #[test]
@@ -1856,14 +2178,19 @@ mod tests {
     fn spec_serde_round_trip() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": ["grid.cluster-b:7946"],
             "consumerGateways": [{"name": "gw", "namespace": "ns"}],
-            "swim": {"probeInterval": "3s"},
+            "membership": {"mode": "Swim", "swim": {"seeds": ["grid.cluster-b:7946"]}},
             "tls": {}
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(spec.seeds.len(), 1, "should have 1 seed");
-        assert_eq!(spec.swim.probe_interval, "3s", "custom probe interval");
+        assert_eq!(
+            spec.membership
+                .as_ref()
+                .and_then(|membership| membership.swim.as_ref())
+                .map(|swim| swim.seeds.len()),
+            Some(1),
+            "membership SWIM config carries its seed"
+        );
     }
 
     #[test]
@@ -1989,6 +2316,266 @@ mod tests {
         assert!(gw.site_name.is_none(), "absent siteName must default to None");
     }
 
+    // -----------------------------------------------------------------------
+    // RegionalPolicy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regional_policy_absent_preserves_gateway_compatibility() {
+        let gateway: GatewayRef = serde_json::from_value(serde_json::json!({
+            "name": "gw",
+            "namespace": "ns"
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            gateway.regional_policy.is_none(),
+            "an omitted regionalPolicy must preserve unconstrained behavior"
+        );
+        let serialized = serde_json::to_value(gateway).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            serialized.get("regionalPolicy").is_none(),
+            "an absent regionalPolicy must remain omitted on serialization"
+        );
+    }
+
+    #[test]
+    fn affinity_policy_round_trips_with_explicit_sets() {
+        let gateway: GatewayRef = serde_json::from_value(serde_json::json!({
+            "name": "gw",
+            "namespace": "ns",
+            "regionalPolicy": {
+                "mode": "affinity",
+                "preferredRegions": ["east", "west"],
+                "crossRegionFallback": "allow",
+                "allowedSovereigntyZones": ["eu"]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let policy = gateway
+            .regional_policy
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(policy.mode, RegionalPolicyMode::Affinity);
+        assert_eq!(policy.effective_cross_region_fallback(), CrossRegionFallback::Allow);
+        assert!(policy.validate().is_ok(), "the approved affinity shape must be valid");
+    }
+
+    #[test]
+    fn affinity_policy_defaults_fallback_to_deny() {
+        let policy = RegionalPolicy {
+            mode: RegionalPolicyMode::Affinity,
+            preferred_regions: None,
+            allowed_regions: None,
+            cross_region_fallback: None,
+            allowed_sovereignty_zones: None,
+        };
+        assert_eq!(
+            policy.effective_cross_region_fallback(),
+            CrossRegionFallback::Deny,
+            "omitting crossRegionFallback must fail closed"
+        );
+        assert!(
+            policy.validate().is_ok(),
+            "affinity may derive its preferred region from the gateway GridSite"
+        );
+    }
+
+    #[test]
+    fn locked_policy_requires_only_an_allowed_region_set() {
+        let policy = RegionalPolicy {
+            mode: RegionalPolicyMode::Locked,
+            preferred_regions: None,
+            allowed_regions: Some(vec!["east".to_owned(), "west".to_owned()]),
+            cross_region_fallback: None,
+            allowed_sovereignty_zones: Some(vec!["eu".to_owned()]),
+        };
+        assert!(policy.validate().is_ok(), "the approved locked shape must be valid");
+    }
+
+    #[test]
+    fn regional_policy_rejects_mode_incompatible_fields() {
+        let affinity = RegionalPolicy {
+            mode: RegionalPolicyMode::Affinity,
+            preferred_regions: None,
+            allowed_regions: Some(vec!["east".to_owned()]),
+            cross_region_fallback: None,
+            allowed_sovereignty_zones: None,
+        };
+        assert_eq!(
+            affinity.validate(),
+            Err("allowedRegions is not valid in affinity mode".to_owned())
+        );
+
+        for policy in [
+            RegionalPolicy {
+                mode: RegionalPolicyMode::Locked,
+                preferred_regions: None,
+                allowed_regions: None,
+                cross_region_fallback: None,
+                allowed_sovereignty_zones: None,
+            },
+            RegionalPolicy {
+                mode: RegionalPolicyMode::Locked,
+                preferred_regions: Some(vec!["east".to_owned()]),
+                allowed_regions: Some(vec!["east".to_owned()]),
+                cross_region_fallback: None,
+                allowed_sovereignty_zones: None,
+            },
+            RegionalPolicy {
+                mode: RegionalPolicyMode::Locked,
+                preferred_regions: None,
+                allowed_regions: Some(vec!["east".to_owned()]),
+                cross_region_fallback: Some(CrossRegionFallback::Deny),
+                allowed_sovereignty_zones: None,
+            },
+        ] {
+            assert!(
+                policy.validate().is_err(),
+                "locked mode must reject missing allowedRegions, preferredRegions, and fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn regional_policy_rejects_invalid_set_values() {
+        for (values, expected_message) in [
+            (Vec::new(), "preferredRegions must not be empty when present"),
+            (
+                vec!["east".to_owned(), "east".to_owned()],
+                "preferredRegions contains duplicate value \"east\"",
+            ),
+            (
+                vec!["east region".to_owned()],
+                "preferredRegions contains a blank or whitespace-bearing value",
+            ),
+            (
+                vec!["x".repeat(REGIONAL_POLICY_MAX_VALUE_LENGTH + 1)],
+                "preferredRegions contains a value longer than 253 characters",
+            ),
+            (
+                (0..=REGIONAL_POLICY_MAX_VALUES)
+                    .map(|index| format!("r{index}"))
+                    .collect(),
+                "preferredRegions must contain at most 64 values",
+            ),
+        ] {
+            let policy = RegionalPolicy {
+                mode: RegionalPolicyMode::Affinity,
+                preferred_regions: Some(values),
+                allowed_regions: None,
+                cross_region_fallback: None,
+                allowed_sovereignty_zones: None,
+            };
+            assert_eq!(policy.validate(), Err(expected_message.to_owned()));
+        }
+    }
+
+    #[test]
+    fn regional_policy_rejects_invalid_sovereignty_zone_values() {
+        let policy = RegionalPolicy {
+            mode: RegionalPolicyMode::Locked,
+            preferred_regions: None,
+            allowed_regions: Some(vec!["east".to_owned()]),
+            cross_region_fallback: None,
+            allowed_sovereignty_zones: Some(vec!["eu,us".to_owned()]),
+        };
+        assert_eq!(
+            policy.validate(),
+            Err("allowedSovereigntyZones contains an invalid sovereignty-zone token".to_owned())
+        );
+    }
+
+    #[test]
+    fn regional_policy_schema_encodes_bounds_sets_and_mode_rules() {
+        let crd = crd_json();
+        for gateways in ["consumerGateways", "gatewayRefs"] {
+            let policy_schema = crd
+                .pointer(&format!(
+                    "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/{gateways}/items/properties/regionalPolicy"
+                ))
+                .unwrap_or_else(|| std::process::abort());
+            for field in ["preferredRegions", "allowedRegions"] {
+                let field_schema = policy_schema
+                    .pointer(&format!("/properties/{field}"))
+                    .unwrap_or_else(|| std::process::abort());
+                assert_eq!(field_schema.get("minItems"), Some(&serde_json::json!(1)));
+                assert_eq!(field_schema.get("maxItems"), Some(&serde_json::json!(64)));
+                assert_eq!(
+                    field_schema.get("x-kubernetes-list-type"),
+                    Some(&serde_json::json!("set"))
+                );
+                assert_eq!(field_schema.pointer("/items/minLength"), Some(&serde_json::json!(1)));
+                assert_eq!(field_schema.pointer("/items/maxLength"), Some(&serde_json::json!(253)));
+                assert_eq!(
+                    field_schema.pointer("/items/pattern"),
+                    Some(&serde_json::json!(r"^\S+$"))
+                );
+            }
+            let sovereignty_schema = policy_schema
+                .pointer("/properties/allowedSovereigntyZones")
+                .unwrap_or_else(|| std::process::abort());
+            assert_eq!(sovereignty_schema.get("minItems"), Some(&serde_json::json!(1)));
+            assert_eq!(sovereignty_schema.get("maxItems"), Some(&serde_json::json!(64)));
+            assert_eq!(
+                sovereignty_schema.get("x-kubernetes-list-type"),
+                Some(&serde_json::json!("set"))
+            );
+            assert_eq!(
+                sovereignty_schema.pointer("/items/minLength"),
+                Some(&serde_json::json!(1))
+            );
+            assert_eq!(
+                sovereignty_schema.pointer("/items/maxLength"),
+                Some(&serde_json::json!(REGIONAL_POLICY_MAX_SOVEREIGNTY_ZONE_LENGTH))
+            );
+            assert_eq!(
+                sovereignty_schema.pointer("/items/pattern"),
+                Some(&serde_json::json!("^[A-Za-z0-9._-]+$"))
+            );
+            let rules = policy_schema
+                .get("x-kubernetes-validations")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| std::process::abort());
+            for expected_rule in [
+                "self.mode != 'affinity' || !has(self.allowedRegions)",
+                "self.mode != 'locked' || has(self.allowedRegions)",
+                "self.mode != 'locked' || !has(self.preferredRegions)",
+                "self.mode != 'locked' || !has(self.crossRegionFallback)",
+            ] {
+                assert!(
+                    rules.iter().any(|validation| {
+                        validation.get("rule").and_then(serde_json::Value::as_str) == Some(expected_rule)
+                    }),
+                    "{gateways} regionalPolicy schema must contain rule {expected_rule:?}"
+                );
+            }
+            assert_eq!(
+                policy_schema.pointer("/properties/mode/enum"),
+                Some(&serde_json::json!(["affinity", "locked"]))
+            );
+            assert_eq!(
+                policy_schema.pointer("/properties/crossRegionFallback/enum"),
+                Some(&serde_json::json!(["allow", "deny"]))
+            );
+        }
+    }
+
+    #[test]
+    fn regional_policy_rejects_unknown_fields() {
+        let result = serde_json::from_value::<GatewayRef>(serde_json::json!({
+            "name": "gw",
+            "namespace": "ns",
+            "regionalPolicy": {
+                "mode": "affinity",
+                "regionHeader": "x-region"
+            }
+        }));
+        assert!(
+            result.is_err(),
+            "caller-controlled policy inputs must not enter the contract"
+        );
+    }
+
     #[test]
     fn grid_network_crd_has_correct_group_and_plural() {
         let crd = crd_json();
@@ -2038,9 +2625,7 @@ mod tests {
     #[test]
     fn stale_candidate_ttl_defaults_to_none_when_absent() {
         let json = serde_json::json!({
-            "gridId": "",
-            "seeds": [],
-            "swim": {}
+            "gridId": ""
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2053,7 +2638,6 @@ mod tests {
     fn stale_candidate_ttl_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "staleCandidateTtlSeconds": 3600
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2067,7 +2651,7 @@ mod tests {
     #[test]
     fn stale_candidate_ttl_serializes_only_when_present() {
         // absent field must not appear in serialized output
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2131,6 +2715,37 @@ mod tests {
                     .any(|validation| validation.get("rule").and_then(serde_json::Value::as_str) == Some(rule)),
                 "legacy schema must keep nested validation {rule:?}: {validations:?}"
             );
+        }
+    }
+
+    #[test]
+    fn every_consumer_config_path_refuses_sovereignty_without_grid_site_route() {
+        let crd = crd_json();
+        let spec = "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties";
+        for gateways in ["consumerGateways", "gatewayRefs"] {
+            for config in ["praxisConfig", "consumerConfig"] {
+                let path = format!("{spec}/{gateways}/items/properties/{config}");
+                let schema = crd.pointer(&path).unwrap_or_else(|| std::process::abort());
+                let rules = schema
+                    .get("x-kubernetes-validations")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap_or_else(|| std::process::abort());
+                assert!(
+                    rules.iter().any(|rule| {
+                        rule.get("rule").and_then(serde_json::Value::as_str)
+                            == Some(SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE)
+                    }),
+                    "{path} must refuse sovereignty without gridSiteRoute: {rules:?}"
+                );
+                let description = schema
+                    .pointer("/properties/sovereignty/description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    description.contains("Admission rejects it under"),
+                    "{path} sovereignty description must name admission rejection: {description:?}"
+                );
+            }
         }
     }
 
@@ -2511,6 +3126,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             site_name: None,
+            regional_policy: None,
             model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
@@ -2792,9 +3408,7 @@ mod tests {
     #[test]
     fn routing_policy_defaults_to_none_when_absent() {
         let json = serde_json::json!({
-            "gridId": "",
-            "seeds": [],
-            "swim": {}
+            "gridId": ""
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2807,7 +3421,6 @@ mod tests {
     fn routing_policy_geography_first_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "routingPolicy": "geographyFirst"
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2822,7 +3435,6 @@ mod tests {
     fn routing_policy_score_first_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "routingPolicy": "scoreFirst"
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2835,7 +3447,7 @@ mod tests {
 
     #[test]
     fn routing_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2985,7 +3597,7 @@ mod tests {
 
     #[test]
     fn scoring_policy_absent_defaults_to_none() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
             spec.scoring_policy.is_none(),
@@ -2997,7 +3609,6 @@ mod tests {
     fn scoring_policy_queue_depth_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "queueDepth" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -3013,7 +3624,6 @@ mod tests {
     fn scoring_policy_no_metrics_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "noMetrics" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -3029,7 +3639,6 @@ mod tests {
     fn scoring_policy_kv_cache_pressure_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "kvCachePressure" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -3045,7 +3654,6 @@ mod tests {
     fn scoring_policy_rejects_removed_profile_shape() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "profile": "balanced" }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -3054,7 +3662,7 @@ mod tests {
 
     #[test]
     fn scoring_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -3191,7 +3799,6 @@ mod tests {
     fn scoring_policy_rejects_unknown_strategy() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "prefixAware" }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -3201,7 +3808,6 @@ mod tests {
     #[test]
     fn selection_policy_round_trips_and_rejects_unknown_mode() {
         let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
-            "seeds": [],
             "selectionPolicy": { "mode": "roundRobin" }
         }))
         .unwrap_or_else(|_| std::process::abort());
@@ -3211,7 +3817,6 @@ mod tests {
         );
 
         let result = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-            "seeds": [],
             "selectionPolicy": { "mode": "not-a-mode" }
         }));
         let Err(error) = result else {
@@ -3251,16 +3856,14 @@ mod tests {
 
     #[test]
     fn peer_trust_round_trips_and_rejects_unknown_mode() {
-        let spec: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({"seeds": [], "peerTrust": {"mode": "spiffe"}}))
-                .unwrap_or_else(|_| std::process::abort());
+        let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({"peerTrust": {"mode": "spiffe"}}))
+            .unwrap_or_else(|_| std::process::abort());
         assert_eq!(spec.peer_trust.map(|trust| trust.mode), Some(PeerTrustMode::Spiffe));
         let bare: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({"seeds": []})).unwrap_or_else(|_| std::process::abort());
+            serde_json::from_value(serde_json::json!({})).unwrap_or_else(|_| std::process::abort());
         assert!(bare.peer_trust.is_none(), "absent stays absent");
         assert_eq!(PeerTrustMode::default(), PeerTrustMode::Pin);
-        let Err(_unknown) =
-            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"seeds": [], "peerTrust": {"mode": "x"}}))
+        let Err(_unknown) = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"peerTrust": {"mode": "x"}}))
         else {
             std::process::abort();
         };
@@ -3269,7 +3872,7 @@ mod tests {
     #[test]
     fn signed_state_is_off_unless_enforced() {
         let parse = |peer_trust: serde_json::Value| {
-            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"seeds": [], "peerTrust": peer_trust}))
+            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"peerTrust": peer_trust}))
                 .map(|spec| spec.peer_trust.map(|trust| trust.signed_state))
         };
 
@@ -3294,7 +3897,6 @@ mod tests {
     #[test]
     fn signal_transport_round_trips_and_rejects_unknown_mode() {
         let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
-            "seeds": [],
             "signalTransport": { "mode": "poll" }
         }))
         .unwrap_or_else(|_| std::process::abort());
@@ -3302,12 +3904,11 @@ mod tests {
 
         // Absent policy resolves to the gossip default.
         let bare: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({ "seeds": [] })).unwrap_or_else(|_| std::process::abort());
+            serde_json::from_value(serde_json::json!({})).unwrap_or_else(|_| std::process::abort());
         assert!(bare.signal_transport.is_none());
         assert_eq!(SignalMode::default(), SignalMode::Gossip);
 
         let Err(unknown_mode) = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-            "seeds": [],
             "signalTransport": { "mode": "not-a-mode" }
         })) else {
             std::process::abort();
@@ -3317,7 +3918,6 @@ mod tests {
         // deny_unknown_fields: an extra key is rejected.
         assert!(
             serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-                "seeds": [],
                 "signalTransport": { "mode": "poll", "extra": true }
             }))
             .is_err(),
@@ -3338,7 +3938,6 @@ mod tests {
     fn scoring_policy_rejects_removed_weights_field() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": {
                 "strategy": "queueDepth",
                 "weights": { "locality": 1.0 }
@@ -3634,14 +4233,14 @@ mod tests {
 
     #[test]
     fn budget_policy_absent_defaults_to_none() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(spec.budget_policy.is_none(), "absent budgetPolicy must default to None");
     }
 
     #[test]
     fn budget_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -3654,7 +4253,6 @@ mod tests {
     fn budget_policy_with_tenants_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "budgetPolicy": {
                 "tenants": [
                     { "tenantId": "tenant-a", "capUsd": 100.0 },
@@ -3702,7 +4300,6 @@ mod tests {
     fn budget_policy_rejects_unknown_shape() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "budgetPolicy": { "caps": [] }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -3840,7 +4437,6 @@ mod tests {
     fn legacy_spec_json() -> serde_json::Value {
         serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "gatewayRefs": [{
                 "name": "consumer-gw",
                 "namespace": "praxis-system",
@@ -3850,7 +4446,6 @@ mod tests {
                     "credentialMountBase": "/run/secrets/legacy-provider"
                 }
             }],
-            "swim": {},
             "tls": {
                 "swimKeyRef": { "name": "legacy-swim-key", "namespace": "praxis-system" }
             }

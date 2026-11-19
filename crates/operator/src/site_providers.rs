@@ -46,7 +46,10 @@ pub const MAX_PROVIDERS: usize = 256;
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Models one provider record may name. A record naming more is refused.
-pub const MAX_MODELS_PER_RECORD: usize = 64;
+///
+/// The same bound as discovery and the signed inventory, so a provider those carry is not
+/// then refused here. [`MAX_BODY_BYTES`] still bounds what one poll costs.
+pub const MAX_MODELS_PER_RECORD: usize = swim::MAX_INVENTORY_MODELS;
 
 /// One provider record as a peer reads it.
 ///
@@ -1235,8 +1238,8 @@ mod tests {
     /// East and west each past a third of the ceiling, east first; north within its share.
     fn east_west_north() -> PeerProviders {
         let peers = PeerProviders::default();
-        peers.replace("east", catalog("e", 9, MAX_MODELS_PER_RECORD));
-        peers.replace("west", catalog("w", 10, MAX_MODELS_PER_RECORD));
+        peers.replace("east", catalog("e", 9, 64));
+        peers.replace("west", catalog("w", 10, 64));
         peers.replace("north", catalog("n", 1, 1));
         peers
     }
@@ -1333,7 +1336,7 @@ mod tests {
             600,
             "alone, the remainder covers it"
         );
-        peers.replace("other", catalog("o", 8, MAX_MODELS_PER_RECORD));
+        peers.replace("other", catalog("o", 8, 64));
         let bare: Vec<crdt::ProviderState> = admitted(&peers)
             .into_iter()
             .filter(|record| record.site_id == "bare")
@@ -1357,7 +1360,7 @@ mod tests {
     fn a_greedy_first_peer_cannot_take_every_declared_peers_share() {
         let peers = PeerProviders::default();
         peers.declare(3);
-        peers.replace("greedy", catalog("g", 16, MAX_MODELS_PER_RECORD));
+        peers.replace("greedy", catalog("g", 16, 64));
         assert_eq!(
             routes(&peers, &ClusterSites::new()).len(),
             16,
@@ -1376,7 +1379,7 @@ mod tests {
             "{:?}",
             peers.verdicts()["greedy"]
         );
-        peers.replace("greedy", catalog("g", 5, MAX_MODELS_PER_RECORD));
+        peers.replace("greedy", catalog("g", 5, 64));
         assert_eq!(
             routes(&peers, &ClusterSites::new()).len(),
             6,

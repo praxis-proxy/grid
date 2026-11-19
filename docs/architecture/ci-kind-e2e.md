@@ -51,6 +51,7 @@ Topology and execution details are maintained in the
 | `verify-swim-state` | CRDT-over-SWIM provider state propagates across sites. |
 | `verify-swim-dns-hostnames` | Hostname-based advertise and seed endpoints resolve before SWIM startup, then membership and provider-state propagation are verified. |
 | `verify-metrics-routing` | Live normalized metrics affect overlay ordering and request routing. |
+| `regional_policy_consumers` (provider-traffic `--full`) | Trusted region and sovereignty metadata filter the overlay before scoring; affinity fallback, locked no-route, session invalidation, and operator-to-Gateway revision acceptance are proven across `intelligent_route` and `grid_site_route`. |
 | `verify-stale-gc-ttl` | Aged stale candidates are omitted from rendered overlays when TTL is configured. |
 | `verify-api-fallback-native` | Provider credentials are injected from mounted Secret files, not overlay or ConfigMap token bytes. |
 | `verify-failover-under-lost-peer` | Lost peer state degrades remote candidates and routes shared-model traffic to healthy fallback capacity. |

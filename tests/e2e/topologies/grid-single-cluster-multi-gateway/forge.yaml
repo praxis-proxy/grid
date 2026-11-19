@@ -156,10 +156,6 @@ spec:
                 strategy: noMetrics
               selectionPolicy:
                 mode: roundRobin
-              swim:
-                probeInterval: "5s"
-                suspicionTimeout: "15s"
-                gossipNodes: 3
               tls:
                 caSecretRef:
                   name: consumer-gateway-tls

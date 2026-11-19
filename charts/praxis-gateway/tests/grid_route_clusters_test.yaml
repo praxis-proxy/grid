@@ -115,3 +115,66 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: praxisConfig.render.backends needs at least one backend
+
+  - it: renders the sovereignty fence header only when set
+    template: templates/gateway-config.yaml
+    set:
+      image.flavor: grid-gateway
+      grid.siteName: dagobah
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.source: render
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.gridServing.siteRoute.sovereignty.header: x-grid-sovereignty-zone
+      praxisConfig.render.backends:
+        - cluster: grid-local-a
+          endpoints: ["10.0.0.1:8000"]
+          transport: { mode: plaintext }
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'filter: grid_site_route\n(\s+.*\n)*?\s+sovereignty:\n\s+header: "x-grid-sovereignty-zone"\n\s+mode: enforce'
+
+  - it: renders no fence by default
+    template: templates/gateway-config.yaml
+    set:
+      image.flavor: grid-gateway
+      grid.siteName: dagobah
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.source: render
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.backends:
+        - cluster: grid-local-a
+          endpoints: ["10.0.0.1:8000"]
+          transport: { mode: plaintext }
+    asserts:
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'sovereignty'
+
+  - it: renders an auditing fence
+    template: templates/gateway-config.yaml
+    set:
+      image.flavor: grid-gateway
+      grid.siteName: dagobah
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.source: render
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.gridServing.siteRoute.sovereignty.header: x-grid-sovereignty-zone
+      praxisConfig.render.gridServing.siteRoute.sovereignty.mode: audit
+      praxisConfig.render.backends:
+        - cluster: grid-local-a
+          endpoints: ["10.0.0.1:8000"]
+          transport: { mode: plaintext }
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'sovereignty:\n\s+header: "x-grid-sovereignty-zone"\n\s+mode: audit'

@@ -77,6 +77,11 @@ pub struct GridServingConfig {
     #[serde(default)]
     pub provider_hop_sni: BTreeMap<String, String>,
 
+    /// Each site's sovereignty zone, by site name. A zone belongs to the site, so every candidate
+    /// there carries it; an invalid zone is none, which no fence admits.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sovereignty_zones: BTreeMap<String, String>,
+
     /// Peers to poll for live load.
     pub peers: Vec<PeerServingConfig>,
 }
@@ -187,6 +192,9 @@ pub enum DialTransport {
         /// The CA bundle the server is verified with; absent, the system roots.
         #[serde(default)]
         ca_path: Option<String>,
+        /// Whether this site's grid certificate is presented to the server.
+        #[serde(default)]
+        present_identity: bool,
         /// The name the server is verified by.
         sni: String,
     },
@@ -201,6 +209,15 @@ impl DialTransport {
         match self {
             Self::MutualTls { sni, .. } | Self::Tls { sni, .. } => Some(sni),
             Self::Plaintext => None,
+        }
+    }
+
+    /// Whether the dial presents this site's grid certificate.
+    pub(crate) const fn presents_identity(&self) -> bool {
+        match self {
+            Self::MutualTls { .. } => true,
+            Self::Tls { present_identity, .. } => *present_identity,
+            Self::Plaintext => false,
         }
     }
 
@@ -434,9 +451,19 @@ impl GridRuntime {
 ///
 /// Returns [`FilterError`] if the file cannot be read or does not parse.
 pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError> {
-    let text =
-        fs::read_to_string(path).map_err(|error| -> FilterError { format!("grid: reading {path}: {error}").into() })?;
-    serde_yaml::from_str(&text).map_err(|error| -> FilterError { format!("grid: parsing {path}: {error}").into() })
+    load_serving_config_with_bytes(path).map(|(config, _)| config)
+}
+
+/// Read and parse a grid serving config file, retaining the exact accepted bytes.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the file cannot be read or does not parse.
+pub fn load_serving_config_with_bytes(path: &str) -> Result<(GridServingConfig, Vec<u8>), FilterError> {
+    let bytes = fs::read(path).map_err(|error| -> FilterError { format!("grid: reading {path}: {error}").into() })?;
+    let config = serde_yaml::from_slice(&bytes)
+        .map_err(|error| -> FilterError { format!("grid: parsing {path}: {error}").into() })?;
+    Ok((config, bytes))
 }
 
 /// The dial file beside the serving config at `serving`.

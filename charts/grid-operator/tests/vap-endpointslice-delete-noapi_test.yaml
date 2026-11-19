@@ -1,0 +1,13 @@
+suite: EndpointSlice delete ValidatingAdmissionPolicy - API absent
+templates:
+  - templates/vap-endpointslice-delete.yaml
+release:
+  name: grid-operator
+  namespace: grid-system
+tests:
+  - it: renders no policy when the ValidatingAdmissionPolicy API is not available
+    set:
+      swim.service.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0

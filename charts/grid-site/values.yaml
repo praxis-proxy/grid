@@ -9,7 +9,6 @@ gridNetwork:
   region: ""
   zone: ""
   seeds: []
-  swim: {}
   tls: {}
   # New chart installations use stabilized admission parameters. Pressure
   # transitions require an active scoringPolicy and matching provider metrics
@@ -26,6 +25,7 @@ gridNetwork:
       recoveryHoldDown: 30s
     missingMetrics: existingOnly
   # -- Local selection mode. Set to null to leave it to the gateway default, deterministic.
+  # The grid-operator chart renders the same defaults from grid.admissionPolicy and grid.selectionPolicy.
   selectionPolicy:
     mode: roundRobin
   # -- Grid-wide signal propagation mode: gossip (default) or poll. Omit for

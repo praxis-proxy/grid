@@ -16,4 +16,7 @@ ignore = [
   # The allocator-shim issue applies only to wasm32; grid-gateway is a native
   # binary and does not build for WebAssembly.
   "RUSTSEC-2026-0410",
+  # libsqlite3-sys reaches the lockfile only through sqlx-sqlite, an optional
+  # sqlx driver we never enable, so SQLite is never compiled into grid.
+  "RUSTSEC-2026-0459",
 ]

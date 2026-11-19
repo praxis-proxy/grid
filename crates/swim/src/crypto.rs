@@ -38,16 +38,30 @@
 //! that share the same key are expected to communicate.  Per-network label
 //! isolation requires separate per-network key dispatch.
 //!
+//! # Backends
+//!
+//! The AEAD primitive is chosen at compile time, mirroring the seam in
+//! [`crate::signing`]: the default `rust-crypto` feature uses the `aes-gcm`
+//! crate, while the `fips` feature routes AES-256-GCM through the system
+//! OpenSSL (`openssl::symm`) so a FIPS host enforces the validated module.
+//! Both backends produce the identical wire format, so FIPS and non-FIPS
+//! sites interoperate on the same gossip key.
+//!
 //! # Key rotation
 //!
 //! Key replacement technically takes effect immediately, but safe rotation
 //! requires a coordinated restart or simultaneous replacement across sites
 //! because there is no multi-key keyring.
 
+#[cfg(not(feature = "fips"))]
+use aes_gcm::aead::consts::U12;
+#[cfg(not(feature = "fips"))]
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead as _, Generate as _, KeyInit as _},
 };
+#[cfg(feature = "fips")]
+use openssl::symm::{Cipher, decrypt_aead, encrypt_aead};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,6 +87,83 @@ pub const OVERHEAD: usize = 4 + 1 + NONCE_LEN + TAG_LEN;
 
 /// AES-256-GCM key: exactly 32 bytes.
 pub type SwimKey = [u8; 32];
+
+// ---------------------------------------------------------------------------
+// Backend
+// ---------------------------------------------------------------------------
+
+/// Run AES-256-GCM encryption over a fixed nonce.
+///
+/// The nonce is a parameter so the public [`encrypt`] can source it from the
+/// backend RNG while tests pin it for known-answer vectors.  Returns the
+/// AEAD output in wire order: ciphertext followed by the 16-byte GCM tag,
+/// matching the `aes-gcm` crate's layout byte-for-byte.
+fn seal_with_nonce(key: &SwimKey, nonce: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    #[cfg(feature = "fips")]
+    {
+        let mut tag = [0_u8; TAG_LEN];
+        let ciphertext = encrypt_aead(Cipher::aes_256_gcm(), key, Some(nonce), &[], plaintext, &mut tag)
+            .map_err(|_error| CryptoError::EncryptFailed)?;
+        let mut out = ciphertext;
+        out.extend_from_slice(&tag);
+        Ok(out)
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        let cipher_key = Key::<Aes256Gcm>::from(*key);
+        let cipher = Aes256Gcm::new(&cipher_key);
+        let nonce = Nonce::try_from(nonce).map_err(|_error| CryptoError::EncryptFailed)?;
+        cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|_e| CryptoError::EncryptFailed)
+    }
+}
+
+/// Run AES-256-GCM decryption over the wire body (ciphertext with the tag
+/// appended) and a fixed nonce.
+fn open_with_nonce(key: &SwimKey, nonce: &[u8], ciphertext_and_tag: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    #[cfg(feature = "fips")]
+    {
+        let body_len = ciphertext_and_tag.len();
+        let tag_start = body_len.checked_sub(TAG_LEN).ok_or(CryptoError::TooShort)?;
+        let (ciphertext, tag) = ciphertext_and_tag
+            .split_at_checked(tag_start)
+            .ok_or(CryptoError::TooShort)?;
+        decrypt_aead(Cipher::aes_256_gcm(), key, Some(nonce), &[], ciphertext, tag)
+            .map_err(|_error| CryptoError::AuthFailed)
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        let cipher_key = Key::<Aes256Gcm>::from(*key);
+        let cipher = Aes256Gcm::new(&cipher_key);
+        let nonce = Nonce::try_from(nonce).map_err(|_error| CryptoError::AuthFailed)?;
+        cipher
+            .decrypt(&nonce, ciphertext_and_tag)
+            .map_err(|_e| CryptoError::AuthFailed)
+    }
+}
+
+/// Generate a fresh 12-byte nonce from the active crypto backend's RNG.
+///
+/// The `fips` backend draws from the OpenSSL DRBG, which a FIPS host runs
+/// inside the validated module; the default backend uses the OS RNG.
+#[cfg_attr(
+    not(feature = "fips"),
+    expect(clippy::unnecessary_wraps, reason = "the RustCrypto OS RNG path cannot fail")
+)]
+fn generate_nonce() -> Result<[u8; NONCE_LEN], CryptoError> {
+    #[cfg(feature = "fips")]
+    {
+        let mut nonce = [0_u8; NONCE_LEN];
+        openssl::rand::rand_bytes(&mut nonce).map_err(|_error| CryptoError::EncryptFailed)?;
+        Ok(nonce)
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        let nonce: [u8; NONCE_LEN] = Nonce::<U12>::generate().into();
+        Ok(nonce)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -131,12 +222,8 @@ pub enum CryptoError {
 /// Returns [`CryptoError::EncryptFailed`] if GCM encryption fails (infallible
 /// in practice once the cipher and nonce are valid).
 pub fn encrypt(key: &SwimKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let cipher_key = Key::<Aes256Gcm>::from(*key);
-    let cipher = Aes256Gcm::new(&cipher_key);
-    let nonce = Nonce::generate();
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
-        .map_err(|_e| CryptoError::EncryptFailed)?;
+    let nonce = generate_nonce()?;
+    let ciphertext = seal_with_nonce(key, &nonce, plaintext)?;
 
     let capacity = OVERHEAD.saturating_add(plaintext.len());
     let mut out = Vec::with_capacity(capacity);
@@ -173,10 +260,7 @@ pub fn decrypt(key: &SwimKey, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let nonce_bytes = data.get(5..17).ok_or(CryptoError::TooShort)?;
     let ciphertext = data.get(17..).ok_or(CryptoError::TooShort)?;
 
-    let nonce = Nonce::try_from(nonce_bytes).map_err(|_error| CryptoError::TooShort)?;
-    let cipher_key = Key::<Aes256Gcm>::from(*key);
-    let cipher = Aes256Gcm::new(&cipher_key);
-    cipher.decrypt(&nonce, ciphertext).map_err(|_e| CryptoError::AuthFailed)
+    open_with_nonce(key, nonce_bytes, ciphertext)
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +428,31 @@ mod tests {
             ciphertext.len(),
             OVERHEAD + PLAINTEXT.len(),
             "total length must be OVERHEAD + plaintext length"
+        );
+    }
+
+    #[test]
+    fn known_answer_vector_pins_the_wire_body_across_backends() {
+        let key = [0x42_u8; 32];
+        let nonce = [0xA1_u8; NONCE_LEN];
+        let expected_body: [u8; 26] = [
+            0x8C, 0x5F, 0x1B, 0x33, 0x91, 0x8B, 0x23, 0x58, 0x61, 0xED, 0x6E, 0xF2, 0xB0, 0xF3, 0xBB, 0x15, 0xB4, 0x12,
+            0xCF, 0xA7, 0xEC, 0x57, 0xC0, 0x5F, 0x2C, 0xA0,
+        ];
+        let body = seal_with_nonce(&key, &nonce, b"hello SWIM").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            body, expected_body,
+            "the rust-crypto and openssl backends must emit the identical AES-256-GCM body for the pinned vector"
+        );
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC);
+        frame.push(ENCRYPTED_VERSION);
+        frame.extend_from_slice(&nonce);
+        frame.extend_from_slice(&expected_body);
+        let plaintext = decrypt(&key, &frame).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            plaintext, b"hello SWIM",
+            "the pinned frame must decrypt under either backend"
         );
     }
 }

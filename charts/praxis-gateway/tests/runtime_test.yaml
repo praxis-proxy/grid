@@ -1,0 +1,57 @@
+suite: gateway runtime settings
+templates:
+  - templates/gateway-config.yaml
+tests:
+  - it: renders the keepalive pool size in the runtime block
+    template: templates/gateway-config.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: edge
+      praxisConfig.render.model: test-model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends:
+        site-a:
+          endpoint: 203.0.113.20:8080
+          transport:
+            mode: plaintext
+      praxisConfig.render.runtime.upstreamKeepalivePoolSize: 512
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'runtime:\n\s+upstream_keepalive_pool_size: 512\n'
+
+  - it: keeps the upstream CA file beside the pool size in one runtime block
+    template: templates/gateway-config.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: edge
+      praxisConfig.render.model: test-model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends:
+        site-a:
+          endpoint: 203.0.113.20:8080
+          transport:
+            mode: plaintext
+      upstreamCA.secretName: my-ca
+      praxisConfig.render.runtime.upstreamKeepalivePoolSize: 512
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'runtime:\n\s+upstream_ca_file: "/etc/praxis/upstream-ca/ca.crt"\n\s+upstream_keepalive_pool_size: 512\n'
+
+  - it: renders no runtime block by default
+    template: templates/gateway-config.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: edge
+      praxisConfig.render.model: test-model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends:
+        site-a:
+          endpoint: 203.0.113.20:8080
+          transport:
+            mode: plaintext
+    asserts:
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'runtime:'

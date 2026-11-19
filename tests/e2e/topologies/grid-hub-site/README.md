@@ -23,6 +23,30 @@ The focused run verifies singleton inference and its signed expiry; withdrawal a
 
 The scenario saves site status, routing and serving configurations, captured timestamps, gateway expiry/readiness responses, the expected full model list, singleton inference responses, and per-model inference responses under `$ARTIFACTS/<mode>/model-gossip` and `$ARTIFACTS/<mode>/inference`. Set `IMAGE_BUILD_PROFILE=debug` (the script default) to build debug images; `release` selects release builds. Container builds share the Cargo registry cache and keep separate target caches for the root workspace and gateway workspace. On an ARM host, the script pulls and loads the `linux/amd64` vllm-vcr image for the site Kind cluster by default; set `VCR_PLATFORM` to override it. The ordinary static routing and withdrawal suite runs when `MODEL_GOSSIP_TEST` is off.
 
+Add `PROVIDER_SCOPE_TEST=1` with `HUB_ROUTER=operator SIGNED_STATE=enforce
+MODES=pin` to qualify signed provider-network isolation. CI enables it in the
+signed model-gossip leg. The script builds the test-only
+`swim` example `provider_scope_probe` on the host and uses the enrolled site's
+signing key and shared mesh key to send an encrypted, correctly signed update
+for an unauthorized network. The relay has its own membership identity and
+leaves after delivery; it does not replace the real site operator.
+
+The injected revision is deliberately ahead of ordinary operator updates but
+within the permitted lease skew. The hub must report
+`provider_network_not_allowed`, preserve its original remote candidates, and
+continue serving inference. The script then creates a distinct legitimate
+provider and requires its named route to appear, proving that the rejected
+higher revision did not poison subsequent valid updates. It deletes that
+provider and observes its withdrawal before restoring the hub allowlist.
+
+Public probe metadata, rejection logs, routing snapshots, recovery-provider
+configuration, and inference responses are saved in
+`$ARTIFACTS/<mode>/provider-scope`. Private signing and mesh keys stay in a
+restricted temporary directory and are removed by the script's cleanup trap;
+they are never copied to artifacts. The host needs Cargo and network access
+to the hub's SWIM LoadBalancer; `NET_PREFIX` applies to the probe as it does
+to LoadBalancer curl requests.
+
 The script pins each LoadBalancer address from the MetalLB pool, so it knows the enrollment URL and SWIM seeds before install. The site gateway dials the mock model at its ClusterIP. A selectorless `grid-enrollment` Service in the site's `grid-enrollment` namespace forwards to the hub enrollment LoadBalancer, so the site operator enrolls by the Service name on the enrollment certificate.
 
 ## What It Asserts
@@ -38,6 +62,9 @@ For each mode in `MODES`, after it resets the `grid` and `grid-enrollment` names
 - The site gateway refuses `rogue`, an identity enrolled from its own invite: 403 in pin mode, a TLS alert in spiffe mode.
 - With `SIGNED_STATE=enforce`, both operators sign their state, so the remote candidate above came from verified state. Once the site's GridNetwork turns signed state off, the hub refuses the site's unsigned state. Certificate rotation is excluded: a renewed key is locked out under enforce.
 - With `MODEL_GOSSIP_TEST=1`, the site discovers its served model, the hub renders it from verified signed inventory with its expiry, and an inference request reaches the site provider. This focused path replaces the static routing and withdrawal assertions for that run.
+- With `PROVIDER_SCOPE_TEST=1`, an authenticated cross-network provider update
+  is rejected without losing the legitimate route, and subsequent valid
+  provider creation and withdrawal still converge.
 - No container in either namespace restarted, and no grid container log, init and hook containers included, matches ` ERROR`, `panic`, or `fatal`. WARN lines print for review.
 
 Logs land in `ARTIFACTS` (default `/tmp/grid-hub-site-e2e`). Poll signal transport is not covered.

@@ -225,7 +225,7 @@ tests:
       mountReconciliation.network: production
     asserts:
       - failedTemplate:
-          errorPattern: praxisConfig.byo.configMapName must name consumerConfig.configMapName
+          errorPattern: praxisConfig.byo.configMapName must name the GridNetwork consumerGateways
 
   - it: leaves the config to praxisConfig.render when source is render
     template: templates/configmap.yaml

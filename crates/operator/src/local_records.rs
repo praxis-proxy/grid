@@ -88,6 +88,7 @@ pub fn grid_network(plan: &Plan) -> Result<GridNetwork, OperatorError> {
     });
     spec.membership = Some(MembershipConfig {
         mode: plan.modes.membership,
+        swim: None,
     });
     let mut network = GridNetwork::new(&plan.network, spec);
     network.metadata.labels = Some(created_by());

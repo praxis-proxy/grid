@@ -33,6 +33,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(AGENT_TOOL_PROVIDER_TOOLS_CUT.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MCP_PROBE_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MCP_PROBE_DURATION.clone()))
@@ -97,7 +99,26 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SignalsAdmission::gauges()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(REGIONAL_POLICY_CANDIDATES.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r
+});
+
+/// Candidate decisions made by the regional-policy eligibility gate.
+///
+/// All labels are closed sets: `mode` is `affinity` or `locked`; `outcome`
+/// is `permitted` or `excluded`; and `reason` is a policy enum label. Region
+/// names, sovereignty-zone values, gateway names, and request identifiers are
+/// deliberately never labels.
+static REGIONAL_POLICY_CANDIDATES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "grid_regional_policy_candidates_total",
+            "Routing candidates evaluated by regional policy mode, outcome, and bounded reason",
+        ),
+        &["mode", "outcome", "reason"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 /// Peer catalog reads by peer and outcome: `replaced` when a catalog landed, `failed` when
@@ -484,6 +505,17 @@ pub(crate) fn record_gateway_feedback(event: GatewayFeedbackEvent) {
     GATEWAY_FEEDBACK_EVENTS.with_label_values(&[event.as_str()]).inc();
 }
 
+/// Count one candidate decision from the regional-policy eligibility gate.
+///
+/// Callers must pass only the stable labels exposed by
+/// `resources::regional_policy`; this API intentionally receives no inventory
+/// identifiers or policy values.
+pub(crate) fn record_regional_policy_candidate(mode: &str, outcome: &str, reason: &str) {
+    REGIONAL_POLICY_CANDIDATES
+        .with_label_values(&[mode, outcome, reason])
+        .inc();
+}
+
 /// What a bounded relay render left out, by store and by what was cut.
 static SIGNALS_RELAY_TRUNCATED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
@@ -796,6 +828,20 @@ static AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS: LazyLock<IntCounterVec> = LazyLock
     .unwrap_or_else(|_| std::process::abort())
 });
 
+/// Discovered tools left out of routing by the per-provider cap, by provider.
+///
+/// Status keeps the larger discovered list, so without this the cut shows only in a log.
+static AGENT_TOOL_PROVIDER_TOOLS_CUT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "grid_agent_tool_provider_tools_cut",
+            "Discovered tools the per-provider cap leaves out of routing",
+        ),
+        &["namespace", "provider"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
 /// Total `AgentToolProvider` MCP `tools/list` probe attempts by outcome.
 ///
 /// The `outcome` label comes from
@@ -903,6 +949,41 @@ pub(crate) fn record_agent_tool_provider_phase_transition(from: &str, to: &str, 
     AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS
         .with_label_values(&[from, to, reason])
         .inc();
+}
+
+/// Providers with a tools-cut series, so a deleted provider's series can be removed.
+static AGENT_TOOL_PROVIDER_TOOLS_CUT_TRACKED: LazyLock<std::sync::Mutex<std::collections::BTreeSet<(String, String)>>> =
+    LazyLock::new(Default::default);
+
+/// Set how many of each listed provider's tools the per-provider cap leaves out of routing.
+///
+/// `cuts` is every provider, so one absent from it, or no longer cut, loses its series.
+pub(crate) fn set_agent_tool_provider_tools_cut(cuts: impl IntoIterator<Item = (String, String, usize)>) {
+    let mut tracked = AGENT_TOOL_PROVIDER_TOOLS_CUT_TRACKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sweep_tools_cut(&AGENT_TOOL_PROVIDER_TOOLS_CUT, &mut tracked, cuts);
+}
+
+/// Set each cut provider's series and remove the rest of `tracked`.
+fn sweep_tools_cut(
+    gauge: &IntGaugeVec,
+    tracked: &mut std::collections::BTreeSet<(String, String)>,
+    cuts: impl IntoIterator<Item = (String, String, usize)>,
+) {
+    let mut present = std::collections::BTreeSet::new();
+    for (namespace, provider, cut) in cuts {
+        if cut > 0 {
+            gauge
+                .with_label_values(&[namespace.as_str(), provider.as_str()])
+                .set(i64::try_from(cut).unwrap_or(i64::MAX));
+            present.insert((namespace, provider));
+        }
+    }
+    for (namespace, provider) in tracked.difference(&present) {
+        let _absent = gauge.remove_label_values(&[namespace.as_str(), provider.as_str()]);
+    }
+    *tracked = present;
 }
 
 /// Record a completed `AgentToolProvider` MCP `tools/list` probe attempt.
@@ -1221,6 +1302,33 @@ mod tests {
     }
 
     #[test]
+    fn tools_cut_series_goes_when_its_provider_leaves_the_list_or_fits_the_cap() {
+        let gauge = IntGaugeVec::new(Opts::new("tools_cut_sweep_test", "test"), &["namespace", "provider"])
+            .unwrap_or_else(|_| std::process::abort());
+        let mut tracked = std::collections::BTreeSet::new();
+        let entry = |ns: &str, name: &str, cut: usize| (ns.to_owned(), name.to_owned(), cut);
+
+        sweep_tools_cut(
+            &gauge,
+            &mut tracked,
+            [entry("a", "kept", 2), entry("a", "deleted", 5), entry("a", "fits", 1)],
+        );
+        assert_eq!(gauge.with_label_values(&["a", "deleted"]).get(), 5);
+
+        sweep_tools_cut(&gauge, &mut tracked, [entry("a", "kept", 3), entry("a", "fits", 0)]);
+        assert_eq!(gauge.with_label_values(&["a", "kept"]).get(), 3);
+        assert!(
+            gauge.remove_label_values(&["a", "deleted"]).is_err(),
+            "a deleted provider keeps no series"
+        );
+        assert!(
+            gauge.remove_label_values(&["a", "fits"]).is_err(),
+            "a provider within the cap keeps no series"
+        );
+        assert_eq!(tracked.len(), 1);
+    }
+
+    #[test]
     fn a_forgotten_peer_leaves_no_series_behind() {
         record_every_peer_series("forget-gone");
         record_every_peer_series("forget-kept");
@@ -1357,6 +1465,24 @@ mod tests {
             text.contains("grid_gateway_feedback_events_total"),
             "the operator exports the feedback events"
         );
+    }
+
+    #[test]
+    fn regional_policy_candidate_decisions_are_counted_with_bounded_labels() {
+        let permitted = REGIONAL_POLICY_CANDIDATES.with_label_values(&["affinity", "permitted", "preferred"]);
+        let excluded = REGIONAL_POLICY_CANDIDATES.with_label_values(&["locked", "excluded", "region_not_allowed"]);
+        let permitted_before = permitted.get();
+        let excluded_before = excluded.get();
+
+        record_regional_policy_candidate("affinity", "permitted", "preferred");
+        record_regional_policy_candidate("locked", "excluded", "region_not_allowed");
+
+        assert_eq!(permitted.get(), permitted_before + 1);
+        assert_eq!(excluded.get(), excluded_before + 1);
+        let text = String::from_utf8(encode_metrics()).unwrap_or_else(|_| std::process::abort());
+        assert!(text.contains("grid_regional_policy_candidates_total"));
+        assert!(text.contains("mode=\"affinity\""));
+        assert!(text.contains("reason=\"region_not_allowed\""));
     }
 
     #[test]

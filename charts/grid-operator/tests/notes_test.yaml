@@ -45,3 +45,23 @@ tests:
     asserts:
       - notMatchRegexRaw:
           pattern: Metrics and health are plaintext
+  - it: warns when a forced NetworkPolicy falls back to the OpenShift namespaces off OpenShift
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - matchRegexRaw:
+          pattern: set networkPolicy.metricsFrom to the namespace your Prometheus runs in
+  - it: does not warn on OpenShift
+    capabilities:
+      apiVersions: [security.openshift.io/v1]
+    asserts:
+      - notMatchRegexRaw:
+          pattern: set networkPolicy.metricsFrom
+  - it: does not warn when metricsFrom is set
+    set:
+      networkPolicy.enabled: true
+      networkPolicy.metricsFrom:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+    asserts:
+      - notMatchRegexRaw:
+          pattern: set networkPolicy.metricsFrom

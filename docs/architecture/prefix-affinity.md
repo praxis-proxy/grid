@@ -126,12 +126,14 @@ default therefore holds the keys of at least 4 MiB of distinct prompt text per
 cluster. An entry recorded for a request still waiting on its answer takes a
 slot like a confirmed one.
 
-**When capacity is too small.** The gateway exports no eviction or occupancy
-metric. Watch the `sticky` share of `grid_route_prefix_affinity_total`. When it
-falls and `no_match` rises while the replica count and the `not_applicable`
-share hold steady, conversations are losing their keys before their next turn.
-Raise `capacity`. As a rough check, compare the distinct prompt text each
-cluster receives within `ttl_secs` with `capacity × 256` bytes.
+**When capacity is too small.** `grid_route_prefix_index_entries` over
+`grid_route_prefix_index_capacity` is each cluster's fill in this replica. A
+rising `capacity` rate on `grid_route_prefix_index_evictions_total` means a full
+index is pushing out keys that still count, so conversations lose their keys
+before their next turn: raise `capacity`. A rising `ttl` rate instead means
+turns arrive after `ttl_secs`, which `capacity` does not fix. Both show up as a
+falling `sticky` share and a rising `no_match` share of
+`grid_route_prefix_affinity_total`.
 
 **Memory limits.** The `praxis-gateway` chart sets no `resources` on the gateway
 container by default, so nothing bounds the index unless the deployer sets a

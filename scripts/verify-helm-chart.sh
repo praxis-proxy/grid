@@ -194,15 +194,35 @@ for crd in agenttoolprovider gridnetwork gridsite inferenceprovider siteinvite; 
   fi
 done
 CRD_TEMPLATES=("$CHART_DIR"/templates/crds/*.yaml)
-if [ "${#CRD_TEMPLATES[@]}" -eq 5 ] && [ ! -d "$CHART_DIR/crds" ]; then
+if [ "${#CRD_TEMPLATES[@]}" -eq 6 ] && [ ! -d "$CHART_DIR/crds" ]; then
   pass "crds ship only as templates gated by crds.enabled"
 else
   fail "unexpected CRD files: ${CRD_TEMPLATES[*]} $([ -d "$CHART_DIR/crds" ] && echo "$CHART_DIR/crds")"
+fi
+if render v-crds "$CHART_DIR" --show-only templates/crds/agenttoagentprovider.yaml \
+  --set experimental.a2a.enabled=true \
+  && diff -q <(crd_body <<<"$RENDERED") <(crd_body <"deploy/crds-experimental/agenttoagentprovider.yaml") >/dev/null; then
+  pass "experimental A2A CRD sync"
+else
+  fail "experimental A2A CRD differs from the feature-generated manifest"
+fi
+if render v-crds "$CHART_DIR" \
+  && ! grep -q 'name: agenttoagentproviders.grid.praxis.fast' <<<"$RENDERED"; then
+  pass "A2A CRD is absent by default"
+else
+  fail "A2A CRD renders without the experimental profile"
 fi
 if render v-crds "$CHART_DIR" --set crds.enabled=false && ! grep -q 'kind: CustomResourceDefinition' <<<"$RENDERED"; then
   pass "crds.enabled=false renders no CRD"
 else
   fail "crds.enabled=false still renders a CRD"
+fi
+if render v-crds "$CHART_DIR" --set experimental=null \
+  && ! grep -q 'name: agenttoagentproviders.grid.praxis.fast' <<<"$RENDERED" \
+  && ! grep -q 'agenttoagentproviders' <<<"$RENDERED"; then
+  pass "experimental=null preserves the stable profile"
+else
+  fail "experimental=null does not preserve the stable profile"
 fi
 
 # A CRD missing from the kustomization is silently dropped by kustomize consumers.
@@ -212,6 +232,13 @@ if [ "$listed" = "$present" ]; then
   pass "crd kustomization lists every CRD"
 else
   fail "crd kustomization out of sync with $DEPLOY_CRDS (rerun scripts/generate-deployment-crds.sh)"
+fi
+listed_experimental=$(sed -n 's/^  - //p' deploy/crds-experimental/kustomization.yaml | sort)
+present_experimental=$(cd deploy/crds-experimental && printf '%s\n' *.yaml | grep -vx kustomization.yaml | sort)
+if [ "$listed_experimental" = "$present_experimental" ]; then
+  pass "experimental CRD kustomization lists every CRD"
+else
+  fail "experimental CRD kustomization is stale"
 fi
 
 # Default template rendering
@@ -518,9 +545,9 @@ TGZ=$(echo "$PKG_OUT" | grep -oP "${WORK}/\\S+\\.tgz")
 if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
-  for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml templates/crds/agenttoolprovider.yaml \
-    templates/crds/gridnetwork.yaml templates/crds/gridsite.yaml templates/crds/inferenceprovider.yaml \
-    templates/crds/siteinvite.yaml; do
+  for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml templates/crds/agenttoagentprovider.yaml \
+    templates/crds/agenttoolprovider.yaml templates/crds/gridnetwork.yaml templates/crds/gridsite.yaml \
+    templates/crds/inferenceprovider.yaml templates/crds/siteinvite.yaml; do
     if echo "$CONTENTS" | matches "$f"; then
       pass "package contains: $f"
     else
@@ -714,6 +741,7 @@ try_reject_msg "$GW_DIR" "praxisConfig.byo.inline not a mapping" "praxisConfig.b
   --set-string praxisConfig.byo.inline=not-a-mapping --namespace praxis
 try_reject "$GW_DIR" "invalid digest (gw)" "${GW_REQ[@]}" --set image.digest=invalid
 try_reject "$GW_DIR" "invalid service type (gw)" "${GW_REQ[@]}" --set service.type=ExternalName
+try_reject "$GW_DIR" "fips.required not a boolean (gw)" "${GW_REQ[@]}" --set fips.required=maybe
 try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true
 try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --set global.foo=bar
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
@@ -1460,14 +1488,19 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     fail "kind: operator install"
   fi
 
-  for crd in agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast gridsites.grid.praxis.fast \
-    inferenceproviders.grid.praxis.fast siteinvites.grid.praxis.fast; do
+  for crd in agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast \
+    gridsites.grid.praxis.fast inferenceproviders.grid.praxis.fast siteinvites.grid.praxis.fast; do
     if kubectl --context "$KCTX" get crd "$crd" >/dev/null 2>&1; then
       pass "kind: crd $crd established"
     else
       fail "kind: crd $crd not found"
     fi
   done
+  if kubectl --context "$KCTX" get crd agenttoagentproviders.grid.praxis.fast >/dev/null 2>&1; then
+    fail "kind: A2A CRD rendered without the experimental profile"
+  else
+    pass "kind: A2A CRD absent by default"
+  fi
 
   for short in gnw infpvd; do
     if kubectl --context "$KCTX" get "$short" >/dev/null 2>&1; then
@@ -1787,8 +1820,8 @@ GEN_EOF
     fail "kind: operator uninstall"
   fi
 
-  for crd in agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast gridsites.grid.praxis.fast \
-    inferenceproviders.grid.praxis.fast siteinvites.grid.praxis.fast; do
+  for crd in agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast \
+    gridsites.grid.praxis.fast inferenceproviders.grid.praxis.fast siteinvites.grid.praxis.fast; do
     if kubectl --context "$KCTX" get crd "$crd" >/dev/null 2>&1; then
       pass "kind: crd $crd retained after uninstall"
     else

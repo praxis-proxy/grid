@@ -302,6 +302,17 @@ pub(crate) fn site_phase_under(
                 "gateway and signals endpoints declared; awaiting control-plane trust verification".to_owned(),
             )
         },
+        GridSitePhase::Pending if declared && is_declared(site) && !has_egress_address => (
+            GridSitePhase::Pending,
+            "GatewayAddressMissing".to_owned(),
+            "no gateway endpoint declared; set spec.gatewayEndpoint.address".to_owned(),
+        ),
+        GridSitePhase::Pending if declared && is_declared(site) => (
+            GridSitePhase::Pending,
+            "SignalsAddressMissing".to_owned(),
+            "no dialable signals endpoint; set spec.signalsEndpoint or a dialable spec.gatewayEndpoint.address"
+                .to_owned(),
+        ),
         GridSitePhase::Pending => (
             GridSitePhase::Pending,
             "AwaitingDiscovery".to_owned(),
@@ -1250,13 +1261,37 @@ mod tests {
     fn pending_declared_with_an_undialable_gateway_endpoint_stays_pending() {
         for address in ["127.0.0.1:443", "169.254.169.254:80", "https://peer:443", "peer"] {
             let site = declared_at(address);
-            let (next, ..) = site_phase_under(&GridSitePhase::Pending, &site, None, true);
+            let (next, reason, _msg) = site_phase_under(&GridSitePhase::Pending, &site, None, true);
             assert_eq!(
                 next,
                 GridSitePhase::Pending,
                 "{address} derives no signals endpoint to advance on"
             );
+            assert_eq!(
+                reason, "SignalsAddressMissing",
+                "{address} names the missing signals endpoint"
+            );
         }
+    }
+
+    #[test]
+    fn pending_declared_peer_without_a_gateway_reports_missing_under_local() {
+        let site = site_no_egress(Some(GridSitePhase::Pending));
+        let (next, reason, message) = site_phase_under(&GridSitePhase::Pending, &site, None, true);
+        assert_eq!(next, GridSitePhase::Pending, "nothing declared to advance on");
+        assert_eq!(reason, "GatewayAddressMissing");
+        assert!(
+            message.contains("spec.gatewayEndpoint.address"),
+            "message names the field to set"
+        );
+    }
+
+    #[test]
+    fn under_swim_a_site_without_endpoints_still_waits_for_discovery() {
+        let site = site_no_egress(Some(GridSitePhase::Pending));
+        let (next, reason, _msg) = site_phase_under(&GridSitePhase::Pending, &site, None, false);
+        assert_eq!(next, GridSitePhase::Pending, "discovery advances it");
+        assert_eq!(reason, "AwaitingDiscovery");
     }
 
     #[test]

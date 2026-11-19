@@ -40,6 +40,16 @@ tests:
           path: spec.tls.swimKeySecretRef.name
           value: grid-swim-key
 
+  - it: Swim writes configured seeds under membership.swim
+    set:
+      gridNetwork.seeds: [10.0.0.1:7946]
+    asserts:
+      - equal:
+          path: spec.membership.swim.seeds
+          value: [10.0.0.1:7946]
+      - notExists:
+          path: spec.seeds
+
   - it: Local refuses gossip signals
     set:
       grid.membership.source: Local

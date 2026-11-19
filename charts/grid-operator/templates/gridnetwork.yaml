@@ -18,12 +18,23 @@ spec:
   membership:
     mode: {{ dig "membership" "source" "Swim" . | quote }}
   {{- with .seeds }}
-  seeds:
-    {{- toYaml . | nindent 4 }}
+    swim:
+      seeds:
+        {{- toYaml . | nindent 8 }}
   {{- end }}
   {{- with .signals }}
   signalTransport:
     mode: {{ . | quote }}
+  {{- end }}
+  {{- with .admissionPolicy }}
+  admissionPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .selectionPolicy }}
+  {{- if .mode }}
+  selectionPolicy:
+    mode: {{ .mode | quote }}
+  {{- end }}
   {{- end }}
   {{- if or .peerTrust .signedState }}
   peerTrust:

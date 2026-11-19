@@ -326,6 +326,24 @@ mod tests {
                 .unwrap_or(0)
         }
 
+        /// The fence's `grid_route_fenced_total` for `cause`, refused when `enforced`, zero until the series exists.
+        fn fenced(&self, cause: &str, enforced: bool) -> u64 {
+            let Ok(mut stream) = TcpStream::connect(("127.0.0.1", self.admin)) else {
+                return 0;
+            };
+            let _sent = stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let mut body = String::new();
+            let _read = stream.read_to_string(&mut body);
+            let labels = [format!(r#"cause="{cause}""#), format!(r#"enforced="{enforced}""#)];
+            body.lines()
+                .find(|line| {
+                    line.starts_with("grid_route_fenced_total{") && labels.iter().all(|label| line.contains(label))
+                })
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0)
+        }
+
         /// The value of the first admin metrics series named `name`, if it exists.
         fn metric(&self, name: &str) -> Option<f64> {
             let mut stream = TcpStream::connect(("127.0.0.1", self.admin)).ok()?;
@@ -758,6 +776,37 @@ mod tests {
         signals: &str,
         identity: &Mount,
     ) -> (String, String) {
+        fixtures_from(
+            (SITE_ROUTE_PRAXIS, SITE_ROUTE_SERVING),
+            listen,
+            admin,
+            local,
+            remote,
+            signals,
+            identity,
+        )
+    }
+
+    /// The operator's fenced gridSiteRoute fixtures: site-a in `eu`, site-b in `us`.
+    const FENCED_SITE_ROUTE_PRAXIS: &str = include_str!("testdata/consumer-config-site-route-fenced.yaml");
+    const FENCED_SITE_ROUTE_SERVING: &str = include_str!("testdata/serving-config-site-route-fenced.json");
+
+    /// `fixtures`, praxis config then serving config, pointed at local test servers as
+    /// [`site_route_fixtures`] does.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each address the fixtures point at is its own server"
+    )]
+    fn fixtures_from(
+        fixtures: (&str, &str),
+        listen: u16,
+        admin: u16,
+        local: &str,
+        remote: &str,
+        signals: &str,
+        identity: &Mount,
+    ) -> (String, String) {
+        let (site_route_praxis, site_route_serving) = fixtures;
         let tls = identity.dir.to_string_lossy().into_owned();
         let credentials = identity.dir.with_file_name("credentials");
         std::fs::create_dir_all(credentials.join("grid-model-client")).expect("credential dir");
@@ -771,13 +820,13 @@ mod tests {
         };
         let praxis = format!(
             "insecure_options:\n  allow_private_endpoints: true\n  allow_private_health_checks: true\n{}",
-            point(SITE_ROUTE_PRAXIS)
+            point(site_route_praxis)
                 .replace("0.0.0.0:8080", &format!("127.0.0.1:{listen}"))
                 .replace("127.0.0.1:9901", &format!("127.0.0.1:{admin}"))
                 .replace("10.96.0.20:8000", local)
                 .replace("203.0.113.20:8443", remote)
         );
-        let serving = point(SITE_ROUTE_SERVING).replace("grid-operator-signals.grid.svc:9091", signals);
+        let serving = point(site_route_serving).replace("grid-operator-signals.grid.svc:9091", signals);
         (praxis, serving)
     }
 
@@ -858,6 +907,153 @@ mod tests {
     /// A port with nothing listening on it.
     fn dead_endpoint() -> String {
         format!("127.0.0.1:{}", free_port())
+    }
+
+    /// A chat request for `llama` carrying each of `zones` as a zone header line.
+    fn fenced_chat(listen: u16, zones: &[&str]) -> u16 {
+        let lines: String = zones
+            .iter()
+            .map(|zone| format!("x-grid-sovereignty-zone: {zone}\r\n"))
+            .collect();
+        post(listen, r#"{"model":"llama","messages":[]}"#, &lines)
+    }
+
+    #[test]
+    fn the_operator_fenced_render_routes_each_request_only_inside_its_zones() {
+        let work = fresh_work("site-route-fenced");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let (east, signals, local) = (Peer::start(&ca, "east"), Peer::start(&ca, "site-a"), Plain::start());
+        let (listen, admin) = (free_port(), free_port());
+        let (praxis, serving_json) = fixtures_from(
+            (FENCED_SITE_ROUTE_PRAXIS, FENCED_SITE_ROUTE_SERVING),
+            listen,
+            admin,
+            &local.addr,
+            &east.addr,
+            &signals.addr,
+            &identity,
+        );
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[("serving-config.json", serving_json.as_bytes())]);
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway routes inside a zone", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok() && fenced_chat(listen, &["eu"]) == 200
+        });
+        let (local_before, east_before) = (local.requests.load(Ordering::SeqCst), east.routed());
+
+        for sent in 1..=10 {
+            assert_eq!(fenced_chat(listen, &["eu"]), 200, "eu request {sent} routes");
+        }
+        assert_eq!(
+            local.requests.load(Ordering::SeqCst) - local_before,
+            10,
+            "every eu request stays on site-a"
+        );
+        assert_eq!(east.routed(), east_before, "none crosses to us");
+
+        for sent in 1..=10 {
+            assert_eq!(fenced_chat(listen, &[" US "]), 200, "us request {sent} routes");
+        }
+        assert_eq!(
+            east.routed() - east_before,
+            10,
+            "every us request goes to site-b, case and space aside"
+        );
+        assert_eq!(
+            local.requests.load(Ordering::SeqCst) - local_before,
+            10,
+            "none stays on site-a"
+        );
+
+        let (local_mid, east_mid) = (local.requests.load(Ordering::SeqCst), east.routed());
+        for (zones, status, why) in [
+            (&[][..], 400, "no zone"),
+            (&[""], 400, "an empty zone"),
+            (&["eu west"], 400, "an invalid zone"),
+            (&["eu", "us"], 400, "two header lines are refused, never merged"),
+            (&["ch"], 403, "no site serves llama in ch"),
+        ] {
+            assert_eq!(fenced_chat(listen, zones), status, "{why}");
+        }
+        assert_eq!(
+            (local.requests.load(Ordering::SeqCst), east.routed()),
+            (local_mid, east_mid),
+            "no refused request reached any site"
+        );
+        assert_eq!(fenced_chat(listen, &["us,eu"]), 200, "a list admits either site");
+        assert_eq!(
+            gateway.fenced("zone_required", true),
+            4,
+            "each refused header is counted"
+        );
+        assert_eq!(
+            gateway.fenced("outside_zones", true),
+            1,
+            "the request no site in ch serves"
+        );
+        assert_eq!(gateway.fenced("outside_zones", false), 0, "nothing is only audited");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn an_auditing_fence_routes_everything_and_counts_what_it_would_refuse() {
+        let work = fresh_work("site-route-audit");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let (east, signals, local) = (Peer::start(&ca, "east"), Peer::start(&ca, "site-a"), Plain::start());
+        let (listen, admin) = (free_port(), free_port());
+        let audit = FENCED_SITE_ROUTE_PRAXIS.replace("          mode: enforce\n", "          mode: audit\n");
+        assert_ne!(audit, FENCED_SITE_ROUTE_PRAXIS, "the fixture enforces");
+        let (praxis, serving_json) = fixtures_from(
+            (&audit, FENCED_SITE_ROUTE_SERVING),
+            listen,
+            admin,
+            &local.addr,
+            &east.addr,
+            &signals.addr,
+            &identity,
+        );
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[("serving-config.json", serving_json.as_bytes())]);
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway routes", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok() && fenced_chat(listen, &["eu", "us"]) == 200
+        });
+        let required = gateway.fenced("zone_required", false);
+        for (zones, why) in [
+            (&[][..], "no zone"),
+            (&["eu west"], "an invalid zone"),
+            (&["eu", "us"], "two header lines"),
+            (&["ch"], "no site in ch"),
+        ] {
+            assert_eq!(fenced_chat(listen, zones), 200, "{why} is routed, not refused");
+        }
+        assert_eq!(
+            gateway.fenced("zone_required", false) - required,
+            3,
+            "each request naming no valid zone is counted, not refused"
+        );
+        let outside = gateway.fenced("outside_zones", false);
+        for _ in 0..20 {
+            assert_eq!(fenced_chat(listen, &["eu"]), 200, "routed as if unfenced");
+        }
+        assert!(east.routed() > 0, "an eu request reached site-b in us");
+        assert!(
+            gateway.fenced("outside_zones", false) > outside,
+            "and each such pick is counted"
+        );
+        assert_eq!(
+            [
+                gateway.fenced("zone_required", true),
+                gateway.fenced("outside_zones", true)
+            ],
+            [0, 0],
+            "an auditing fence refuses nothing"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
     }
 
     #[test]
@@ -957,6 +1153,104 @@ mod tests {
             );
         }
         assert_eq!(east.routed(), routed + 10, "the other site serves every request");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_regional_policy_revision_controls_site_route_and_fails_closed() {
+        let work = fresh_work("regional-policy-site-route");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let (east, signals, local) = (Peer::start(&ca, "east"), Peer::start(&ca, "site-a"), Plain::start());
+        let (listen, admin) = (free_port(), free_port());
+        let (mut praxis, serving_json) =
+            site_route_fixtures(listen, admin, &local.addr, &east.addr, &signals.addr, &identity);
+        praxis = praxis.replace(
+            "        model_header: X-Model\n",
+            "        model_header: X-Model\n        prefix_affinity:\n          enabled: false\n",
+        );
+
+        // The operator represents affinity's preferred and permitted fallback regions as
+        // selection groups. The remote provider is live, but it cannot bypass group zero.
+        let mut preferred: serde_yaml::Value = serde_yaml::from_str(&serving_json).expect("serving");
+        preferred["candidates"][0]["selection_group"] = serde_yaml::to_value(0_u32).expect("group zero");
+        preferred["candidates"][1]["selection_group"] = serde_yaml::to_value(1_u32).expect("group one");
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            serde_yaml::to_string(&preferred).expect("yaml").as_bytes(),
+        )]);
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+
+        for request in 1..=10 {
+            assert_eq!(chat(listen, "llama", None), 200, "preferred request {request} routes");
+        }
+        assert_eq!(east.routed(), 0, "a lower policy group receives no new requests");
+        let local_before_recovery = local.requests.load(Ordering::SeqCst);
+        assert_eq!(
+            local_before_recovery, 10,
+            "the preferred local region serves every request"
+        );
+
+        // Pressure changes the preferred candidate's admission state without changing the
+        // regional groups. New work may now use the explicitly permitted fallback, but only
+        // because no group-zero candidate admits it.
+        let mut fallback = preferred.clone();
+        fallback["candidates"][0]["admission"] = serde_yaml::Value::from("existing_only");
+        gateway.serve(&mut serving, &fallback);
+        for request in 1..=10 {
+            assert_eq!(chat(listen, "llama", None), 200, "fallback request {request} routes");
+        }
+        assert_eq!(
+            local.requests.load(Ordering::SeqCst),
+            local_before_recovery,
+            "an existing-only preferred region is not selected for new work"
+        );
+        assert_eq!(
+            east.routed(),
+            10,
+            "the explicitly permitted fallback serves every request"
+        );
+
+        // A valid policy with no candidates is authoritative, not a malformed update for
+        // which last-known-good traffic may remain live.
+        let mut empty = fallback.clone();
+        empty["candidates"] = serde_yaml::Value::Sequence(Vec::new());
+        gateway.serve(&mut serving, &empty);
+        assert_ne!(
+            chat(listen, "llama", None),
+            200,
+            "an authoritative empty revision fails closed"
+        );
+        assert_eq!(east.routed(), 10, "the withdrawn fallback receives no further traffic");
+
+        // A malformed update after that valid empty revision is rejected, retaining the empty
+        // last-known-good serving state rather than resurrecting either policy group.
+        let rejected = gateway.rejected();
+        serving.write(&[("serving-config.json", br#"{"unexpected":true}"#)]);
+        gateway.eventually("the malformed serving revision is rejected", || {
+            gateway.rejected() > rejected
+        });
+        assert_ne!(
+            chat(listen, "llama", None),
+            200,
+            "a rejected update retains the empty revision"
+        );
+        assert_eq!(east.routed(), 10, "last-known-good does not restore prohibited traffic");
+
+        // A later valid revision recovers service through the current preferred group.
+        gateway.serve(&mut serving, &preferred);
+        gateway.eventually("a valid regional-policy recovery routes again", || {
+            chat(listen, "llama", None) == 200
+        });
+        assert!(
+            local.requests.load(Ordering::SeqCst) > local_before_recovery,
+            "the recovered preferred region receives new work"
+        );
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);
     }
@@ -1175,6 +1469,71 @@ mod tests {
             backend.request_body_bytes_read.load(Ordering::SeqCst),
             body.len(),
             "the backend consumed the full body before answering; a head-only read can reset the response on Linux"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn the_configured_request_ceiling_is_the_one_body_limit_on_the_chart_chain() {
+        const MIB: usize = 1024 * 1024;
+        let work = fresh_work("body-ceiling");
+        let backend = Plain::start();
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            br#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"east","cluster":"pool-east"}],"peers":[]}"#,
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        // The chart's chain: model_to_header buffers 10 MiB by itself, grid_site_route sets no cap.
+        let praxis = format!(
+            "insecure_options:\n  allow_private_endpoints: true\nbody_limits:\n  max_request_bytes: {ceiling}\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: model_to_header\n        header: X-Gateway-Model-Name\n      - filter: grid_site_route\n        model_header: X-Gateway-Model-Name\n      - filter: load_balancer\n        clusters:\n          - name: pool-east\n            endpoints: [\"{endpoint}\"]\n",
+            ceiling = 32 * MIB,
+            endpoint = backend.addr,
+        );
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+
+        let body = format!(
+            r#"{{"model":"llama","messages":[],"padding":"{}"}}"#,
+            "x".repeat(12 * MIB)
+        );
+        assert_eq!(
+            post(listen, &body, ""),
+            200,
+            "a body past 10 MiB and under the ceiling routes"
+        );
+        assert_eq!(
+            backend.request_body_bytes_read.load(Ordering::SeqCst),
+            body.len(),
+            "the backend received the whole body"
+        );
+
+        let mut stream = TcpStream::connect(("127.0.0.1", listen)).expect("connect gateway");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .write_all(
+                format!(
+                    "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+                    len = 40 * MIB
+                )
+                .as_bytes(),
+            )
+            .expect("send head");
+        let mut response = String::new();
+        let _read = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "a body declared past the ceiling gets a 413: {response}"
+        );
+        assert_eq!(
+            backend.requests.load(Ordering::SeqCst),
+            1,
+            "the oversized body never reached the backend"
         );
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);

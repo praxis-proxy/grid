@@ -98,7 +98,7 @@ pub async fn reconcile(provider: Arc<AgentToolProvider>, client: Arc<Client>) ->
     let (phase, matching_sites, reason, discovered_tools) =
         Box::pin(resolve_phase_and_sites(&provider, &client)).await?;
     let generation = provider.metadata.generation.unwrap_or(0);
-    update_status(
+    Box::pin(update_status(
         &provider,
         &client,
         phase,
@@ -108,7 +108,7 @@ pub async fn reconcile(provider: Arc<AgentToolProvider>, client: Arc<Client>) ->
         reason,
         &recorder,
         &object_ref,
-    )
+    ))
     .await?;
 
     Ok(Action::requeue(REQUEUE_INTERVAL))

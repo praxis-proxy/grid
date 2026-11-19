@@ -650,6 +650,17 @@ impl ModelInventoryAssembler {
         self.blocked_origins.remove(origin);
     }
 
+    /// Remove one grid's buffers, complete inventories, and revision floors.
+    /// Origin-wide abuse blocks remain in force across grid trust changes.
+    pub(crate) fn remove_grid(&mut self, grid_id: &str, origin: Option<&str>) {
+        let keep = |scope: &InventoryScope| {
+            scope.grid_id != grid_id || origin.is_some_and(|origin| scope.origin_site != origin)
+        };
+        self.pending.retain(|key, _| keep(&key.scope));
+        self.complete.retain(|scope, _| keep(scope));
+        self.revision_floor.retain(|scope, _| keep(scope));
+    }
+
     /// Drop an over-limit origin's entire inventory and refuse replays until they age out.
     fn block_origin(&mut self, origin: &str, now_ms: u64) {
         self.remove_origin(origin);
@@ -1048,6 +1059,50 @@ mod tests {
             ModelInventoryBroadcast::decode(&wrong_magic),
             Err(bincode::error::DecodeError::Other(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn grid_cleanup_preserves_other_grids_and_clears_pending_frames_and_floors() -> Result<(), InventoryFrameError> {
+        let mut assembler = ModelInventoryAssembler::default();
+        let grid_a = inventory(10, &["complete-a"]);
+        let mut grid_b = inventory(10, &["complete-b"]);
+        grid_b.grid_id = "grid-b".to_owned();
+        push_inventory(&mut assembler, &grid_a)?;
+        push_inventory(&mut assembler, &grid_b)?;
+        for complete in [&grid_a, &grid_b] {
+            let mut pending = complete.clone();
+            pending.revision = 11;
+            pending.models = vec!["one".to_owned(), "two".to_owned()];
+            let frame = broadcasts(&pending)?.pop().unwrap_or_else(|| std::process::abort());
+            assert_eq!(assembler.push(frame, 1)?, InventoryAssemblyResult::Incomplete);
+        }
+        let mut other_origin = grid_a.clone();
+        other_origin.origin_site = "other-site".to_owned();
+        push_inventory(&mut assembler, &other_origin)?;
+        assembler.blocked_origins.insert("blocked".to_owned(), 999);
+
+        assembler.remove_grid("grid-a", Some("site-a"));
+
+        assert_eq!(assembler.pending.len(), 1);
+        assert!(assembler.pending.keys().all(|key| key.scope.grid_id == "grid-b"));
+        assert_eq!(
+            assembler.complete.len(),
+            2,
+            "another origin in A is retained during peer-specific cleanup"
+        );
+        assert_eq!(assembler.revision_floor.len(), 2);
+        assert_eq!(assembler.blocked_origins.get("blocked"), Some(&999));
+        let reset = inventory(1, &["new-a"]);
+        push_inventory(&mut assembler, &reset)?;
+        assert!(
+            assembler.inventories(1).contains(&reset),
+            "A's revision floor was cleared"
+        );
+        assembler.remove_grid("grid-a", None);
+        assert_eq!(assembler.inventories(1), [grid_b]);
+        assert_eq!(assembler.pending.len(), 1, "B's incomplete inventory survives");
+        assert_eq!(assembler.revision_floor.len(), 1);
         Ok(())
     }
 

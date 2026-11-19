@@ -56,7 +56,9 @@ const ENDPOINT_TLS_IDENTITY_MISMATCH: &str = "EndpointTlsIdentityMismatch";
 /// Bounds the Kubernetes status object's size against a server advertising
 /// an implausibly large tool catalog; ordinary MCP servers advertise a
 /// handful to a few dozen tools. Applied after deduplication, so it only
-/// discards genuinely distinct names beyond this limit.
+/// discards genuinely distinct names beyond this limit. Larger than the routing cap,
+/// [`crate::resources::routing_overlay::MAX_TOOLS_PER_PROVIDER`], so the `spec.tools`
+/// allowlist applies to the whole catalog before routing cuts it.
 const MAX_DISCOVERED_TOOLS: usize = 500;
 
 /// Maximum length, in bytes, of a single tool name persisted to

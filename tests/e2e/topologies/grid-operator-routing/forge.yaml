@@ -1,0 +1,196 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: grid-operator-routing
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: grid-operator-routing
+
+  network:
+    dnsZone: grid-operator-routing.test
+
+  clusters:
+    - name: local
+      stacks: [operator, mock-providers, grid-resources, embedded-gateway]
+      properties:
+        siteName: local
+        networkName: grid-operator-routing
+        gatewayName: operator-routing-gateway
+        gatewayImage: "grid-gateway:operator-routing"
+        operatorImage: "grid-operator:operator-routing"
+        mockProviderImage: "grid-mock-providers:operator-routing"
+        overlaySyncImage: "grid-overlay-sync:unused"
+        imagePullPolicy: Never
+        gatewayImageRepo: "grid-gateway"
+        gatewayImageTag: "operator-routing"
+        operatorImageRepo: "grid-operator"
+        operatorImageTag: "operator-routing"
+
+  stacks:
+    operator:
+      description: Source-matched Grid operator with local poll-mode reconciliation
+      steps:
+        - type: manifest
+          path: resources/namespace.yaml
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              siteName: "{{ cluster.properties.siteName }}"
+              service:
+                enabled: false
+            grid:
+              signals: poll
+            signals:
+              enabled: false
+        - type: wait
+          resource: deployment/grid-operator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+
+    mock-providers:
+      description: Attributable local inference backends and independent provider health endpoint
+      steps:
+        - type: template-manifest
+          path: resources/mock-providers.yaml
+        - type: wait
+          resource: deployment/provider-a
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: wait
+          resource: deployment/provider-b-old
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: wait
+          resource: deployment/provider-b-replacement
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+
+    grid-resources:
+      description: Single local GridNetwork, GridSite, and two providers with no gateway backend entries
+      steps:
+        - type: helm
+          release: grid-site
+          chart: charts/grid-site
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            grid:
+              membership:
+                source: Local
+            gridNetwork:
+              name: "{{ cluster.properties.networkName }}"
+              gridId: "grid-operator-routing-v1"
+              region: local
+              zone: local-1
+              routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: noMetrics
+              selectionPolicy:
+                mode: roundRobin
+              signalTransport:
+                mode: poll
+              consumerGateways:
+                - name: "{{ cluster.properties.gatewayName }}"
+                  namespace: grid-system
+                  siteName: "{{ cluster.properties.siteName }}"
+            gridSite:
+              name: "{{ cluster.properties.siteName }}"
+              region: local
+              zone: local-1
+              providerSiteLabel: local
+            inferenceProviders:
+              - name: provider-a
+                gridNetworkRef: "{{ cluster.properties.networkName }}"
+                clusterName: provider-a
+                providerKind: openai
+                backendKind: local
+                endpoint: "http://provider-a.grid-system.svc:8080"
+                siteSelector:
+                  matchLabels:
+                    grid.praxis.fast/provider-site: local
+                accessPolicy:
+                  siteSelector:
+                    matchLabels: {}
+                models:
+                  - name: operator-routing-test-model
+                    capabilities: [text_generation]
+                    contextWindow: 4096
+                healthCheck:
+                  endpoint: "http://provider-a.grid-system.svc:8080"
+                  path: /health
+                  interval: 2s
+                  timeout: 1s
+              - name: provider-b
+                gridNetworkRef: "{{ cluster.properties.networkName }}"
+                clusterName: provider-b
+                providerKind: openai
+                backendKind: local
+                endpoint: "http://provider-b-old.grid-system.svc:8080"
+                siteSelector:
+                  matchLabels:
+                    grid.praxis.fast/provider-site: local
+                accessPolicy:
+                  siteSelector:
+                    matchLabels: {}
+                models:
+                  - name: operator-routing-test-model
+                    capabilities: [text_generation]
+                    contextWindow: 4096
+                healthCheck:
+                  endpoint: "http://provider-a.grid-system.svc:8080"
+                  path: /health
+                  interval: 2s
+                  timeout: 1s
+
+    embedded-gateway:
+      description: Grid Gateway chart mounting the operator's serving-config.json and dial.json
+      steps:
+        - type: helm
+          release: operator-routing-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            fullnameOverride: "{{ cluster.properties.gatewayName }}"
+            image:
+              repository: "{{ cluster.properties.gatewayImageRepo }}"
+              tag: "{{ cluster.properties.gatewayImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+              flavor: grid-gateway
+            grid:
+              networkName: "{{ cluster.properties.networkName }}"
+              siteName: "{{ cluster.properties.siteName }}"
+            praxisConfig:
+              source: render
+              render:
+                role: consumer
+                auth:
+                  mode: none
+                  stripAuthorization: false
+                backends: []
+                gridServing:
+                  enabled: true
+                  networkName: "{{ cluster.properties.networkName }}"
+                  gatewayRefName: "{{ cluster.properties.gatewayName }}"
+            gridIdentity:
+              tlsSecretName: operator-routing-gateway-tls
+        - type: wait
+          resource: deployment/operator-routing-gateway
+          namespace: grid-system
+          condition: available
+          timeout: "120s"

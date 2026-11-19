@@ -11,10 +11,6 @@ gridNetwork:
   gridId: ""
   region: us-west-2
   zone: west-b
-  swim:
-    probeInterval: 5s
-    suspicionTimeout: 15s
-    gossipNodes: 3
   consumerGateways:
     - name: consumer-gateway
       namespace: grid-system

@@ -3,19 +3,18 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  seeds:
-    - site-a.example.com:7946
-    - site-b.example.com:7946
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - site-a.example.com:7946
+        - site-b.example.com:7946
   selectionPolicy:
     mode: roundRobin
   scoringPolicy:
     strategy: queueDepth
   peerTrust:
     mode: pin
-  swim:
-    gossipNodes: 5
-    probeInterval: "5s"
-    suspicionTimeout: "10s"
   tls:
     caSecretRef:
       name: grid-ca

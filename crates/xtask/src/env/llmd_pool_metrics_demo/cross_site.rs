@@ -39,8 +39,8 @@ const TWO_SITE_SHARE_RANGE: (f64, f64) = (0.1, 0.9);
 const CROSS_SITE_HIGHER_WAITING_REQUESTS: u32 = 2;
 /// The test Gateway keeps the moderate queue above its default backlog threshold but below EPP capacity.
 const CROSS_SITE_QUEUE_FULL_THRESHOLD: u32 = 3;
-/// A reported load signal gives the embedded Gateway a nonzero rho while both sites remain eligible.
-const CROSS_SITE_HIGHER_KV_CACHE: f64 = 0.95;
+/// KV pressure below the 0.8 full point: a nonzero rho (0.75) while both sites keep room.
+const CROSS_SITE_HIGHER_KV_CACHE: f64 = 0.6;
 /// A lighter local signal than the peer's trusted baseline for the wrong-pin check.
 const WRONG_PIN_LOCAL_WAITING_REQUESTS: u32 = 1;
 /// Provider identity retained while pool-a's EPP signal expires.
@@ -1048,7 +1048,7 @@ fn prepare_poll_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Restore the chart's configured queue threshold before the learned-ceiling proof uses backlog evidence.
+/// Restore the chart's configured queue threshold once the cross-site proof is done.
 fn restore_gateway_default_queue_threshold(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     let context = kind_context(GRID_SERVING_SITE);
     let status = Command::new("helm")
@@ -1092,10 +1092,13 @@ fn set_cross_site_waiting_requests(
 
 /// Keep the EPP queue signal and Gateway saturation signal distinct and deterministic.
 fn cross_site_simulator_metrics(waiting_requests: u32, scoring_flavor: super::ScoringFlavor) -> (u32, f64) {
-    let (waiting_requests, mut kv_cache_usage) = super::simulator_metrics(waiting_requests, scoring_flavor);
-    if scoring_flavor == super::ScoringFlavor::QueueDepth && waiting_requests > 0 {
-        kv_cache_usage = CROSS_SITE_HIGHER_KV_CACHE;
-    }
+    let (waiting_requests, kv_cache_usage) = super::simulator_metrics(waiting_requests, scoring_flavor);
+    // Either flavor's pressure stays below full, or the selector loses its two-site draw.
+    let kv_cache_usage = if waiting_requests > 0 || kv_cache_usage > 0.0 {
+        CROSS_SITE_HIGHER_KV_CACHE
+    } else {
+        kv_cache_usage
+    };
     (waiting_requests, kv_cache_usage)
 }
 

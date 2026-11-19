@@ -2,9 +2,16 @@
 unmaintained = "all"
 maximum-db-staleness = "P30D"
 ignore = [
+  # Temporary acceptance of unmaintained notices, not a vulnerability waiver.
+  # chrono is transitive through schema/MCP/query dependencies; no patched
+  # version is listed. Migration: https://github.com/praxis-proxy/grid/issues/604
+  { id = "RUSTSEC-2026-0543", reason = "chrono is transitively required; all versions unmaintained; migration tracked in grid#604" },
   # bincode 2.x is unmaintained (RUSTSEC-2025-0141); SWIM uses it
   # directly for broadcasts, and foca also requires it for membership messages.
   { id = "RUSTSEC-2025-0141", reason = "SWIM and foca require bincode 2.x; no compatible upstream fix" },
+  # chrono is transitive through Kubernetes, PromQL, and MCP dependencies.
+  # The advisory marks every version unmaintained and provides no safe upgrade.
+  { id = "RUSTSEC-2026-0543", reason = "transitive chrono dependency; no safe upgrade available" },
 ]
 
 [licenses]

@@ -128,8 +128,11 @@ metadata:
   name: production
 spec:
   gridId: "production-grid"     # the stable ID supplied by bootstrap
-  seeds:
-    - "10.0.0.5:7946"
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - "10.0.0.5:7946"
   consumerGateways:
     - name: inference-gw
       namespace: praxis-system
@@ -162,10 +165,6 @@ spec:
                 # key: ca.crt          # optional; defaults to ca.crt
   region: us-east-1
   zone: us-east-1a
-  swim:
-    probeInterval: 5s           # WAN probe interval
-    suspicionTimeout: 10s       # before declaring dead
-    gossipNodes: 3              # indirect probe fanout
   peerTrust:
     mode: pin                    # pin (default) or spiffe
     signedState: "off"           # off (default) or enforce
@@ -239,6 +238,7 @@ means no polled peer has a rejected timestamp; `False` means at least one does.
 |---|---|---|
 | `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
 | `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 Under Local membership the poller also writes three conditions, each under its own field
 manager. Which peers, and why, is on each peer's `GridSite`, as described in
@@ -252,6 +252,7 @@ round had no time for are not counted.
 |---|---|---|
 | `False` | `PeersUnreachable` | A checked peer's signals endpoint did not answer. The message counts them, for example `2 of 5 peers unreachable`. |
 | `True` | `PeerSignalsReachable` | Every polled peer's signals endpoint answered. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 `PeerCatalogsAccepted` (`grid-operator-peer-catalogs`) counts the peers whose catalog,
 or part of it, was refused, out of the peers whose catalog is held.
@@ -260,6 +261,7 @@ or part of it, was refused, out of the peers whose catalog is held.
 |---|---|---|
 | `False` | `CatalogsRefused` | A peer's catalog was refused. The message counts them, for example `1 of 5 peers' catalogs refused`. |
 | `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 `PeerPollsComplete` (`grid-operator-peer-polls`) says whether each round had time to poll
 every peer. A peer the round had no time for keeps its last `SignalsReachable` verdict, so
@@ -269,6 +271,7 @@ the overrun is this site's, never the peer's.
 |---|---|---|
 | `False` | `PollRoundOverrun` | The last round ran out before it polled some peers. The message counts them, for example `2 of 40 peers not polled within the round`. |
 | `True` | `PeerPollsComplete` | The last round polled every peer. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 A `Swim` condition, under its own field manager (`grid-operator-swim`), reads `True`
 with reason `Swim` while SWIM runs, and `False` when it is configured but cannot start,
@@ -336,6 +339,7 @@ until every site names one source.
 |---|---|---|
 | `False` | `PeerMembershipMismatch` | A polled peer names a different membership source. The message names those peers and their sources: set `grid.membership.source` alike on every site. |
 | `True` | `PeerMembership` | Every polled peer that names a mode names this site's. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
@@ -370,15 +374,21 @@ gateway process has unresolved rejected ages. `False` requires genuine newer
 clean evidence from every recorded rejecting process. `Unknown` means the
 remaining evidence is stale, predates the operator restart, or reporter
 capacity was exceeded. Conditions never change network phase or routing.
+The primary `GridNetwork` watch filters status-only changes; spec generation
+and watched related-resource changes still trigger routing reconciliation.
 
 `gatewayAgeReports[]` retains at most 128 records keyed by random process epoch:
-replica label, sequence, cumulative skew count, original report flag, effective
-rejection state, and receipt timestamp. Live freshness uses a five-minute
-monotonic receipt window. Expiration is evaluated when another report arrives;
-if reporting stops entirely, the last condition remains until a report arrives.
-After an operator restart, persisted rejected epochs have unknown freshness
-until that same epoch submits a strictly newer observation. Wall-clock changes
-and duplicate reports cannot establish recovery or renew freshness.
+replica label, last durably recorded sequence, cumulative skew count, original
+report flag, effective rejection state, and receipt timestamp. The operator
+keeps the latest accepted sequence and freshness on its monotonic clock in
+memory, so routine reports with unchanged evidence do not write status. It
+refreshes the durable row at most once per five-minute freshness window and
+writes evidence transitions immediately. Expiration is evaluated when another
+report arrives; if reporting stops entirely, the last condition remains until
+a report arrives. After an operator restart, persisted rejected epochs have
+unknown freshness until that same epoch submits a strictly newer observation.
+Wall-clock changes and duplicate reports cannot establish recovery or renew
+freshness.
 
 A clean report from another replica or replacement process never clears an
 older rejected epoch. The listener identifies the site, not authoritative pod
@@ -495,8 +505,10 @@ status:
 
 ### CRD-driven SWIM seeds
 
-`spec.seeds` is a list of SWIM endpoints (`host:port`) used to bootstrap
-SWIM mesh formation. Each entry may be a literal IPv4 address, a bracketed IPv6
+`spec.membership.swim` is optional and has no schema default. Set it only when
+`spec.membership.mode` is `Swim`; the API rejects it for `Local`. Its `seeds`
+field is a list of SWIM endpoints (`host:port`) used to bootstrap SWIM mesh
+formation. Each entry may be a literal IPv4 address, a bracketed IPv6
 address, or a DNS hostname. Hostnames are resolved with a bounded lookup before
 they are announced to the running SWIM runtime on every
 `GridNetwork` reconcile.  Re-announcing to an existing peer is idempotent: foca
@@ -506,22 +518,22 @@ ignores redundant joins.
 
 | Change | Effect |
 |---|---|
-| Seed added to `spec.seeds` | Announced to the SWIM runtime on the next reconcile (~300 s default); SWIM join initiated |
-| Seed removed from `spec.seeds` | No active disconnect; SWIM failure detection ages out the peer naturally |
-| `spec.seeds` unchanged | Re-announced on every reconcile; idempotent, no side effects |
+| Seed added to `membership.swim.seeds` | Announced to the SWIM runtime on the next reconcile (~300 s default); SWIM join initiated |
+| Seed removed from `membership.swim.seeds` | No active disconnect; SWIM failure detection ages out the peer naturally |
+| `membership.swim.seeds` unchanged | Re-announced on every reconcile; idempotent, no side effects |
 
 **Channel-full behavior:** If the SWIM announce channel is temporarily full
 (capacity 16 batches), the announce is silently retried on the next reconcile.
 Seeds are not guaranteed to be joined within one reconcile cycle under heavy
 broadcast load, but the retry is automatic.
 
-**Scope:** `spec.seeds` targets the SWIM site-membership layer.  The SWIM runtime
+**Scope:** `spec.membership.swim.seeds` targets the SWIM site-membership layer. The SWIM runtime
 is process-global: all `GridNetwork` resources in the operator process share the
 same SWIM node.  Seeds from any `GridNetwork` reach the shared SWIM membership
 table.  Provider CRDT state remains scoped per network.
 
 **Self-filtering:** The operator removes its own SWIM bind address from
-`spec.seeds` before announcing, preventing self-join loops.
+`membership.swim.seeds` before announcing, preventing self-join loops.
 
 **`spec.tls.swimKeySecretRef`:** References a Kubernetes Secret containing the 32-byte
 AES-256-GCM key for SWIM transport authentication.  When configured, the
@@ -592,6 +604,33 @@ embedded gateway's startup upstream configuration must use that TLS identity.
 This field is independent of `praxisConfig`; absent or disabled generated
 consumer Praxis config cannot make embedded serving fail validation or change
 its provider-hop allowlist.
+
+### GatewayRef.regionalPolicy
+
+`spec.consumerGateways[].regionalPolicy` is an optional per-gateway contract
+for regional eligibility. It applies to every candidate in that gateway's
+overlay; omitting it preserves the existing routing behavior. Grid reads
+region and sovereignty only from trusted `GridSite` metadata. A caller cannot
+change policy eligibility with a request header.
+
+| Field | Applies to | Meaning |
+|---|---|---|
+| `mode: affinity` | affinity | Use `preferredRegions`, or the region of the trusted `siteName` `GridSite` when it is omitted. `crossRegionFallback` defaults to `deny`; `allow` creates a fallback group used only when no preferred candidate admits new work. |
+| `mode: locked` | locked | Requires non-empty `allowedRegions`; candidates outside the set never enter routing. `preferredRegions` and `crossRegionFallback` are invalid in this mode. |
+| `allowedSovereigntyZones` | both modes | Optional independent hard allowlist. A candidate must pass both this set and its regional rule; comparison uses the shared sovereignty-zone canonical form (trimmed, lowercased tokens). |
+
+`preferredRegions` and `allowedRegions` are unordered Kubernetes sets of 1–64
+non-empty values containing no whitespace, each at most 253 characters.
+`allowedSovereigntyZones` uses the shared sovereignty-zone token grammar: ASCII
+letters, digits, `.`, `_`, or `-`, at most 63 characters; values are compared
+case-insensitively, so `EU` and `eu` denote the same zone. A valid policy with
+unresolved required site metadata, or with no
+permitted candidate, publishes an authoritative empty revision and fails
+closed. An invalid policy update is rejected before it can
+replace the last-known-good revision. See the
+[regional-policy example](../../examples/gateway/regional-policy.yaml) and
+[routing guide](../routing.md#regional-policy-affinity-locking-and-sovereignty)
+for complete behavior, updates, sessions, and observability.
 
 ### GatewayRef.modelDiscoveryContractVersion
 
@@ -799,11 +838,12 @@ A discovered SWIM peer is not automatically authorized for routing.
 
 | Reason | Phase | Meaning |
 |---|---|---|
-| `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
+| `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive, or an auto-discovered record waits for discovery |
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
 | `EndpointsDeclared` | Connecting | Declared site names a dialable gateway endpoint, which also gives its signals endpoint; advancing without discovery |
-| `GatewayAddressMissing` | Pending, Discovered, Connecting, or Unreachable | No usable gateway address is known: the own site's endpoint and configured address are absent, or a peer has not announced an address |
+| `GatewayAddressMissing` | Pending, Discovered, Connecting, or Unreachable | No usable gateway address is known: the own site's endpoint and configured address are absent, a declared site under Local membership sets no `spec.gatewayEndpoint.address`, or a peer has not announced an address |
+| `SignalsAddressMissing` | Pending | A declared site under Local membership has a gateway address but no dialable signals endpoint: set `spec.signalsEndpoint`, or a dialable `spec.gatewayEndpoint.address` |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
 | `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
 | `PlaintextUnreachable` | Connecting or Unreachable | TCP probe failed (explicit Plaintext mode) |
@@ -935,10 +975,12 @@ time by provider gateway filters.
 **Single-site / combined-site deployments:** Site discovery is driven by *remote*
 SWIM peers - the `Pending -> Discovered` transition above requires a remote peer
 observed Alive. A single or combined cluster has no peers, so its own `GridSite`
-stays `Pending` with reason `AwaitingDiscovery` when a usable gateway address is
-available. If its endpoint is undeclared and gateway discovery has no address,
-reconciliation uses `GatewayAddressMissing` under both Swim and Local
-membership; this reason is emitted as a `Warning` event. **Either reason is
+stays `Pending` with reason `AwaitingDiscovery` under Swim when a usable gateway
+address is available. Under Local membership it advances to `Connecting` with reason
+`EndpointsDeclared` once its gateway and signals endpoints are known, and otherwise
+stays `Pending` naming the one that is missing. If its endpoint is undeclared and
+gateway discovery has no address, reconciliation uses `GatewayAddressMissing` under
+both Swim and Local membership; this reason is emitted as a `Warning` event. **Either reason is
 expected and does not block local serving:** local `InferenceProvider`s are
 eligible regardless of `GridSite.status.phase`; only *remote* CRDT provider
 records are phase-gated (see
@@ -1513,6 +1555,9 @@ Discovered sets are held in memory per provider:
 | `GRID_MODEL_DISCOVERY_TTL_SECS` | `180` | how long a set survives without a successful poll; at least interval + timeout |
 | `GRID_MODEL_DISCOVERY_CONCURRENCY` | `8` | providers polled at once |
 
+Each is also a `--model-discovery-*` flag. A value that does not parse stops the operator at
+startup.
+
 Each poll increments `grid_model_discovery_total{provider,outcome}`, where
 `outcome` is one of `ok`, `credential`, `tls`, `config`, `unreachable`,
 `timeout`, `http_status`, `invalid_response`. Failures are also logged.
@@ -1583,6 +1628,14 @@ telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
 
 Represents A2A agents available over the grid.
 
+This API is experimental and is disabled from the default Grid build and
+installation. Enable the operator `a2a` Cargo feature, which activates the
+`experimental` marker, and the chart value `experimental.a2a.enabled=true`
+before installing or using this CRD.
+The current contract is API-only; Agent Card discovery and routing are
+follow-up tasks. A2A metrics configuration is not part of this contract and
+will be designed with future A2A scoring work.
+
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
 kind: AgentToAgentProvider
@@ -1590,17 +1643,73 @@ metadata:
   name: claims-agent
 spec:
   gridNetworkRef: production
-  protocol: a2a
-  endpoint: http://claims-agent.agents:8080
+  binding: JSONRPC
+  endpoint: https://claims-agent.agents:8443
   agentCard:
-    skills: [claims-processing, document-review]
-    modalities: [text]
+    path: /.well-known/agent-card.json
+    skillAllowlist: [claims-processing, document-review]
   auth:
     strategy: mtls_only
+  tls:
+    caSecretRef:
+      name: claims-agent-ca
+      namespace: grid-system
+    clientCertificateSecretRef:
+      name: claims-agent-client-cert
+      namespace: grid-system
+      certificateKey: tls.crt
+      privateKeyKey: tls.key
   accessPolicy:
     siteSelector:
       matchLabels:
         grid.praxis.fast/site: cluster-a
 ```
 
+`binding` currently accepts only `JSONRPC`, meaning JSON-RPC over HTTP(S).
+When `agentCard` is omitted, discovery uses
+`/.well-known/agent-card.json` on the origin of `spec.endpoint`. A configured
+`agentCard.path` is also resolved against that origin, rather than appended to
+an endpoint path. For example, an endpoint of
+`https://agent.example/a2a/v1` with the default path resolves to
+`https://agent.example/.well-known/agent-card.json`.
+
+Set at most one of `agentCard.url` and `agentCard.path`. Discovery follows no
+redirects and rejects loopback, link-local, unspecified, unique-local, and
+cloud-metadata addresses using the same SSRF policy as the AgentToolProvider
+probe. Authentication and TLS client identity are sent only to the HTTPS
+origin of `spec.endpoint`; an explicit card URL on another origin is fetched
+without those credentials. A discovered card never changes the configured
+endpoint used for the private agent hop. `skillAllowlist` is empty by default
+and identifies skills by the Agent Card `id`, not by display name.
+
 **Phases**: Pending → Available → Degraded → Unavailable
+
+`status.discoveredCard` is deliberately bounded. It contains the observed
+agent name/version, card-level default input/output modes,
+protocol-interface binding metadata, streaming capability, and each allowed
+skill's ID, name, and effective input/output modes. Effective skill modes use
+the skill override when present and the card-level defaults otherwise. Full
+Agent Card JSON, descriptions, examples, schemas, URLs, and all credentials
+are excluded from status and future SWIM/CRDT records. The bounded status
+contains at most 128 skills and 8 ASCII modes per direction per list. Agent
+and skill display names are bounded to 128 characters; the schema and a
+maximum-size serialization test keep the complete status below 512 KiB.
+
+#### AgentToAgentProvider reason codes
+
+| Reason | Phase | Meaning |
+|---|---|---|
+| `ProviderConfigInvalid` | Unavailable | Static endpoint, selector, card URL/path, or binding validation failed. |
+| `GridNetworkNotFound` | Unavailable | `spec.gridNetworkRef` does not resolve to a `GridNetwork`. |
+| `UnsupportedAuthStrategy` | Unavailable | The configured authentication strategy is not supported by the controller. |
+| `CredentialSecretRefInvalid` | Unavailable | The authentication Secret reference is absent or malformed. |
+| `CredentialSecretMissing` | Unavailable | The configured authentication Secret cannot be resolved. |
+| `CredentialSecretKeyMissing` | Unavailable | The configured authentication key is absent. |
+| `CredentialSecretValueInvalid` | Unavailable | The resolved credential is not valid UTF-8 or cannot be sent safely. |
+| `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist. |
+| `EndpointTlsKeyMissing` | Unavailable | A referenced TLS key is absent or empty. |
+| `EndpointTlsMaterialInvalid` | Unavailable | CA or client certificate material cannot be parsed. |
+| `AgentCardUnreachable` | Unavailable | Card discovery failed due to transport, DNS, timeout, or policy rejection. |
+| `AgentCardInvalid` | Unavailable | The response is not a bounded, valid A2A Agent Card. |
+| `AgentCardUnsupportedBinding` | Unavailable | The card does not expose the configured JSON-RPC binding. |
+| `AgentCardNoRoutableSkills` | Unavailable | No discovered skill remains after validation and the configured allowlist. |

@@ -19,14 +19,17 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
 
 use super::{
-    DemoMode, GlbDemoOptions, certs,
+    DemoMode, GlbDemoOptions, Membership, certs,
     external_provider::{self, ExternalProviderDescriptor},
     glb, kubectl, operator, safe_truncate_str,
 };
@@ -43,6 +46,20 @@ const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
+
+/// The run's membership, set once by [`run`]. The assertions are plain `fn()` and read it here.
+static MEMBERSHIP: OnceLock<Membership> = OnceLock::new();
+
+/// The run's membership, Swim until [`run`] sets it.
+fn membership() -> Membership {
+    MEMBERSHIP.get().copied().unwrap_or_default()
+}
+
+/// Port the operator serves signals and its provider catalog on under Local membership.
+const SIGNALS_PORT: &str = "9091";
+
+/// Signals LoadBalancer Service the operator chart renders under Local membership.
+const SIGNALS_SERVICE: &str = "grid-operator-signals";
 
 /// Consumer gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
@@ -448,9 +465,9 @@ where
     clippy::disallowed_methods,
     reason = "Sleep is required for polling with timeout functionality"
 )]
-fn poll_until<F, T>(condition: F, timeout: Duration, interval: Duration) -> Result<T, Box<dyn std::error::Error>>
+fn poll_until<F, T>(mut condition: F, timeout: Duration, interval: Duration) -> Result<T, Box<dyn std::error::Error>>
 where
-    F: Fn() -> Result<Option<T>, Box<dyn std::error::Error>>,
+    F: FnMut() -> Result<Option<T>, Box<dyn std::error::Error>>,
 {
     let start = Instant::now();
 
@@ -1273,6 +1290,140 @@ fn assert_site_auto_discovery() -> AssertionResult {
             start.elapsed(),
         ))
     }
+}
+
+/// Assert every site runs Local membership with poll signals and nothing from SWIM.
+fn assert_local_membership() -> AssertionResult {
+    let start = Instant::now();
+    let mut observed_facts = BTreeMap::new();
+    let mut all_ok = true;
+
+    for cluster in CLUSTERS {
+        let context = format!("kind-grid-combined-{cluster}");
+        let network = poll_until(
+            || {
+                let output = Command::new("kubectl")
+                    .args([
+                        "get",
+                        "gridnetwork/grid-combined-site",
+                        "--context",
+                        &context,
+                        "-o",
+                        "jsonpath={.status.phase},{.spec.membership.mode},{.spec.signalTransport.mode}",
+                    ])
+                    .output()?;
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                Ok((output.status.success() && value == "Active,Local,poll").then_some(value))
+            },
+            Duration::from_secs(90),
+            Duration::from_secs(3),
+        );
+        let swim_service = kubectl_names(&context, &["svc", "grid-operator-swim", "-n", GRID_SYSTEM_NS])?;
+        let discovered = kubectl_names(
+            &context,
+            &["gridsites", "-A", "-l", "grid.praxis.fast/auto-discovered=true"],
+        )?;
+        let ok = network.is_ok() && swim_service.is_empty() && discovered.is_empty();
+        all_ok &= ok;
+        observed_facts.insert(
+            format!("{cluster}_network"),
+            serde_json::Value::String(network.unwrap_or_else(|error| error.to_string())),
+        );
+        observed_facts.insert(format!("{cluster}_swim_service"), serde_json::json!(swim_service));
+        observed_facts.insert(
+            format!("{cluster}_auto_discovered_sites"),
+            serde_json::json!(discovered),
+        );
+    }
+
+    if all_ok {
+        Ok(proof_success(
+            "Every GridNetwork is Active under Local membership with poll signals, no SWIM Service and no discovered GridSite",
+            observed_facts,
+            start.elapsed(),
+        ))
+    } else {
+        Ok(proof_failure(
+            "One or more sites is not running Local membership without SWIM",
+            observed_facts,
+            start.elapsed(),
+        ))
+    }
+}
+
+/// Assert every site holds both other sites as declared, pinned, Active peers with a signals endpoint.
+fn assert_local_declared_peers() -> AssertionResult {
+    let start = Instant::now();
+    let mut observed_facts = BTreeMap::new();
+    let mut all_ok = true;
+    let port_suffix = format!(":{PROVIDER_GATEWAY_PORT}");
+    let signals_suffix = format!(":{SIGNALS_PORT}");
+
+    for local in CLUSTERS {
+        let context = format!("kind-grid-combined-{local}");
+        for remote in CLUSTERS.iter().filter(|remote| *remote != local) {
+            let expected_pin = certs::site_certificate_fingerprint(remote)?;
+            let output = Command::new("kubectl")
+                .args([
+                    "get",
+                    "gridsite",
+                    remote,
+                    "--context",
+                    &context,
+                    "-o",
+                    "jsonpath={.status.phase}\t{.spec.gatewayEndpoint.address}\t{.spec.signalsEndpoint.address}\t{.spec.trust.canonicalFingerprints[0]}",
+                ])
+                .output()?;
+            let body = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let fields: Vec<&str> = body.split('\t').collect();
+            let ok = output.status.success()
+                && matches!(fields.as_slice(), [phase, gateway, signals, pin]
+                    if *phase == "Active"
+                        && gateway.ends_with(&port_suffix)
+                        && signals.ends_with(&signals_suffix)
+                        && *pin == expected_pin);
+            all_ok &= ok;
+            observed_facts.insert(
+                format!("{local}_peer_{remote}"),
+                serde_json::json!({ "ok": ok, "observed": body }),
+            );
+        }
+    }
+
+    if all_ok {
+        Ok(proof_success(
+            "Every site holds both other sites as Active declared peers pinned to their certificates, with signals endpoints",
+            observed_facts,
+            start.elapsed(),
+        ))
+    } else {
+        Ok(proof_failure(
+            "One or more declared Local peers is missing, unpinned or not Active",
+            observed_facts,
+            start.elapsed(),
+        ))
+    }
+}
+
+/// Names `kubectl get <args>` returns in `context`, empty when nothing matches.
+fn kubectl_names(context: &str, args: &[&str]) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args(["--context", context, "get"])
+        .args(args)
+        .args(["--ignore-not-found", "-o", "name"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl get {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Assert each consumer receives and accepts a versioned overlay.
@@ -2905,25 +3056,51 @@ fn assert_operator_restart_recovery() -> AssertionResult {
     for cluster in CLUSTERS {
         let context = format!("kind-grid-combined-{cluster}");
 
-        // Verify operator is ready before restart
-        let initial_output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/grid-operator",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.status.readyReplicas}",
-            ])
-            .output()?;
+        let before_deployment = match operator_deployment_snapshot(&context) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                observed_facts.insert(
+                    format!("{cluster}_initial_deployment_error"),
+                    serde_json::Value::String(error.to_string()),
+                );
+                all_recovered = false;
+                continue;
+            },
+        };
+        let before_pods = match operator_pod_snapshot(&context) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                observed_facts.insert(
+                    format!("{cluster}_initial_pod_query_error"),
+                    serde_json::Value::String(error.to_string()),
+                );
+                observed_facts.insert(
+                    format!("{cluster}_deployment_before_restart"),
+                    operator_deployment_summary(&before_deployment),
+                );
+                all_recovered = false;
+                continue;
+            },
+        };
+        observed_facts.insert(
+            format!("{cluster}_deployment_before_restart"),
+            operator_deployment_summary(&before_deployment),
+        );
+        observed_facts.insert(
+            format!("{cluster}_pods_before_restart"),
+            serde_json::Value::Array(before_pods.clone()),
+        );
 
-        let initially_ready =
-            initial_output.status.success() && String::from_utf8_lossy(&initial_output.stdout).trim() == "1";
+        let initially_ready = operator_deployment_ready(&before_deployment)
+            && before_pods.iter().any(operator_pod_is_ready)
+            && before_pods.iter().any(|pod| operator_pod_uid(pod).is_some());
+
+        observed_facts.insert(
+            format!("{cluster}_initially_ready"),
+            serde_json::Value::Bool(initially_ready),
+        );
 
         if !initially_ready {
-            observed_facts.insert(format!("{cluster}_initially_ready"), serde_json::Value::Bool(false));
             all_recovered = false;
             continue;
         }
@@ -2941,45 +3118,132 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             ])
             .output()?;
 
+        record_command_output(&mut observed_facts, &format!("{cluster}_restart"), &restart_output);
+
         if !restart_output.status.success() {
             observed_facts.insert(format!("{cluster}_restart_initiated"), serde_json::Value::Bool(false));
             all_recovered = false;
             continue;
         }
 
-        // Poll until operator is ready again
-        let deploy_recovered = poll_until(
+        let rollout_output = Command::new("kubectl")
+            .args([
+                "rollout",
+                "status",
+                "deployment/grid-operator",
+                "--context",
+                &context,
+                "-n",
+                "grid-system",
+                "--timeout=90s",
+            ])
+            .output()?;
+        record_command_output(
+            &mut observed_facts,
+            &format!("{cluster}_rollout_status"),
+            &rollout_output,
+        );
+        let rollout_succeeded = rollout_output.status.success();
+        observed_facts.insert(
+            format!("{cluster}_rollout_status_succeeded"),
+            serde_json::Value::Bool(rollout_succeeded),
+        );
+
+        let mut after_deployment = serde_json::Value::Null;
+        let mut after_pods = Vec::new();
+        let mut last_observation_error = None;
+        let state_converged = poll_until(
             || {
-                let out = Command::new("kubectl")
-                    .args([
-                        "get",
-                        "deployment/grid-operator",
-                        "--context",
-                        &context,
-                        "-n",
-                        "grid-system",
-                        "-o",
-                        "jsonpath={.status.readyReplicas}",
-                    ])
-                    .output();
-                match out {
-                    Ok(o) if o.status.success() => {
-                        if String::from_utf8_lossy(&o.stdout).trim() == "1" {
-                            Ok(Some(()))
-                        } else {
-                            Ok(None)
-                        }
+                let deployment = match operator_deployment_snapshot(&context) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        last_observation_error = Some(error.to_string());
+                        return Ok(None);
                     },
-                    _ => Ok(None),
-                }
+                };
+                let pods = match operator_pod_snapshot(&context) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        last_observation_error = Some(error.to_string());
+                        return Ok(None);
+                    },
+                };
+                after_deployment = deployment;
+                after_pods = pods;
+
+                Ok(operator_restart_state_converged(&before_pods, &after_pods).then_some(()))
             },
             Duration::from_secs(90),
-            Duration::from_secs(3),
+            Duration::from_secs(2),
         )
         .is_ok();
 
-        // Verify SWIM membership from the reconciled GridNetwork status.
-        let swim_recovered = if deploy_recovered {
+        observed_facts.insert(
+            format!("{cluster}_deployment_after_restart"),
+            operator_deployment_summary(&after_deployment),
+        );
+        observed_facts.insert(
+            format!("{cluster}_pods_after_restart"),
+            serde_json::Value::Array(after_pods.clone()),
+        );
+        if let Some(error) = last_observation_error {
+            observed_facts.insert(
+                format!("{cluster}_last_state_query_error"),
+                serde_json::Value::String(safe_truncate_str(&error, 512)),
+            );
+        }
+
+        let deploy_recovered = rollout_succeeded && state_converged;
+        observed_facts.insert(
+            format!("{cluster}_new_ready_pod_observed"),
+            serde_json::Value::Bool(operator_has_new_ready_pod(&before_pods, &after_pods)),
+        );
+        observed_facts.insert(
+            format!("{cluster}_old_pods_terminated"),
+            serde_json::Value::Bool(operator_old_pods_terminated(&before_pods, &after_pods)),
+        );
+        observed_facts.insert(
+            format!("{cluster}_deployment_generation_ready"),
+            serde_json::Value::Bool(operator_deployment_ready(&after_deployment)),
+        );
+
+        // Local has no connectedSites: the GridNetwork and both declared peers read Active. Those
+        // phases can outlive the restart, so under Local this shows availability, not resumed polling.
+        let membership_recovered = if deploy_recovered && membership() == Membership::Local {
+            poll_until(
+                || {
+                    let network = Command::new("kubectl")
+                        .args([
+                            "get",
+                            "gridnetwork/grid-combined-site",
+                            "--context",
+                            &context,
+                            "-o",
+                            "jsonpath={.status.phase}",
+                        ])
+                        .output()?;
+                    let mut active = String::from_utf8_lossy(&network.stdout).trim() == "Active";
+                    for remote in CLUSTERS.iter().filter(|remote| **remote != *cluster) {
+                        let site = Command::new("kubectl")
+                            .args([
+                                "get",
+                                "gridsite",
+                                remote,
+                                "--context",
+                                &context,
+                                "-o",
+                                "jsonpath={.status.phase}",
+                            ])
+                            .output()?;
+                        active &= String::from_utf8_lossy(&site.stdout).trim() == "Active";
+                    }
+                    Ok(active.then_some(()))
+                },
+                Duration::from_secs(60),
+                Duration::from_secs(3),
+            )
+            .is_ok()
+        } else if deploy_recovered {
             poll_until(
                 || {
                     let membership_output = Command::new("kubectl")
@@ -3033,7 +3297,7 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             false
         };
 
-        let cluster_ok = deploy_recovered && swim_recovered && routing_works;
+        let cluster_ok = deploy_recovered && membership_recovered && routing_works;
         if !cluster_ok {
             all_recovered = false;
         }
@@ -3042,9 +3306,13 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             format!("{cluster}_deploy_recovered"),
             serde_json::Value::Bool(deploy_recovered),
         );
+        let membership_key = match membership() {
+            Membership::Local => "local_peers_active",
+            Membership::Swim => "swim_recovered",
+        };
         observed_facts.insert(
-            format!("{cluster}_swim_recovered"),
-            serde_json::Value::Bool(swim_recovered),
+            format!("{cluster}_{membership_key}"),
+            serde_json::Value::Bool(membership_recovered),
         );
         observed_facts.insert(
             format!("{cluster}_routing_after_restart"),
@@ -3053,11 +3321,15 @@ fn assert_operator_restart_recovery() -> AssertionResult {
     }
 
     if all_recovered {
-        Ok(proof_success(
-            "All three operators restarted sequentially with SWIM re-convergence and routing proof after each",
-            observed_facts,
-            start.elapsed(),
-        ))
+        let summary = match membership() {
+            Membership::Local => {
+                "All three operators restarted sequentially onto new pods, with declared peers Active and routing proof after each"
+            },
+            Membership::Swim => {
+                "All three operators restarted sequentially with membership re-convergence and routing proof after each"
+            },
+        };
+        Ok(proof_success(summary, observed_facts, start.elapsed()))
     } else {
         Ok(proof_failure(
             "Operator restart recovery failed on one or more clusters",
@@ -3065,6 +3337,231 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             start.elapsed(),
         ))
     }
+}
+
+/// Return a bounded summary of the Grid operator Deployment's generation and rollout conditions.
+fn operator_deployment_snapshot(context: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "deployment/grid-operator",
+            "--context",
+            context,
+            "-n",
+            "grid-system",
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get deployment/grid-operator failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&out.stderr).trim(), 512)
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+/// Return identity, termination, phase, and readiness for every selected operator pod.
+fn operator_pod_snapshot(context: &str) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "pods",
+            "--context",
+            context,
+            "-n",
+            "grid-system",
+            "-l",
+            "app.kubernetes.io/name=grid-operator,app.kubernetes.io/instance=grid-operator",
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get grid-operator pods failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&out.stderr).trim(), 512)
+        )
+        .into());
+    }
+
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let items = response
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("kubectl get grid-operator pods returned no items array")?;
+
+    Ok(items.iter().map(operator_pod_summary).collect())
+}
+
+/// Summarize a pod without including container environment values or other configuration.
+fn operator_pod_summary(pod: &serde_json::Value) -> serde_json::Value {
+    let metadata = pod.get("metadata");
+    let status = pod.get("status");
+    serde_json::json!({
+        "name": metadata.and_then(|value| value.get("name")).and_then(serde_json::Value::as_str),
+        "uid": metadata.and_then(|value| value.get("uid")).and_then(serde_json::Value::as_str),
+        "creation_timestamp": metadata.and_then(|value| value.get("creationTimestamp")).and_then(serde_json::Value::as_str),
+        "deletion_timestamp": metadata.and_then(|value| value.get("deletionTimestamp")).and_then(serde_json::Value::as_str),
+        "phase": status.and_then(|value| value.get("phase")).and_then(serde_json::Value::as_str),
+        "ready": operator_raw_pod_is_ready(pod),
+        "container_statuses": status.and_then(|value| value.get("containerStatuses")).cloned(),
+    })
+}
+
+/// Report Kubernetes readiness for an unmodified Pod API response.
+fn operator_raw_pod_is_ready(pod: &serde_json::Value) -> bool {
+    let Some(metadata) = pod.get("metadata") else {
+        return false;
+    };
+    let Some(status) = pod.get("status") else {
+        return false;
+    };
+    status.get("phase").and_then(serde_json::Value::as_str) == Some("Running")
+        && metadata.get("deletionTimestamp").is_none_or(serde_json::Value::is_null)
+        && status
+            .get("conditions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+                        && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+                })
+            })
+}
+
+/// Summarize only the Deployment generation, replica counters, and conditions needed for diagnosis.
+fn operator_deployment_summary(deployment: &serde_json::Value) -> serde_json::Value {
+    let metadata = deployment.get("metadata");
+    let spec = deployment.get("spec");
+    let status = deployment.get("status");
+    let conditions = status
+        .and_then(|value| value.get("conditions"))
+        .and_then(serde_json::Value::as_array)
+        .map(|conditions| {
+            conditions
+                .iter()
+                .map(|condition| {
+                    serde_json::json!({
+                        "type": condition.get("type"),
+                        "status": condition.get("status"),
+                        "reason": condition.get("reason"),
+                        "message": condition.get("message"),
+                        "last_update_time": condition.get("lastUpdateTime"),
+                        "last_transition_time": condition.get("lastTransitionTime"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+    serde_json::json!({
+        "generation": metadata.and_then(|value| value.get("generation")),
+        "observed_generation": status.and_then(|value| value.get("observedGeneration")),
+        "desired_replicas": spec.and_then(|value| value.get("replicas")),
+        "replicas": status.and_then(|value| value.get("replicas")),
+        "updated_replicas": status.and_then(|value| value.get("updatedReplicas")),
+        "ready_replicas": status.and_then(|value| value.get("readyReplicas")),
+        "available_replicas": status.and_then(|value| value.get("availableReplicas")),
+        "conditions": conditions,
+    })
+}
+
+/// Report whether the selected Deployment has observed its current generation and all replicas are available.
+fn operator_deployment_ready(deployment: &serde_json::Value) -> bool {
+    let Some(metadata) = deployment.get("metadata") else {
+        return false;
+    };
+    let Some(spec) = deployment.get("spec") else {
+        return false;
+    };
+    let Some(status) = deployment.get("status") else {
+        return false;
+    };
+    let Some(generation) = metadata.get("generation").and_then(serde_json::Value::as_u64) else {
+        return false;
+    };
+    let desired = spec.get("replicas").and_then(serde_json::Value::as_u64).unwrap_or(1);
+    desired > 0
+        && status
+            .get("observedGeneration")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|observed| observed >= generation)
+        && status
+            .get("updatedReplicas")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|updated| updated >= desired)
+        && status
+            .get("readyReplicas")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|ready| ready >= desired)
+        && status
+            .get("availableReplicas")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|available| available >= desired)
+}
+
+/// Return the pod UID when Kubernetes supplied one.
+fn operator_pod_uid(pod: &serde_json::Value) -> Option<&str> {
+    pod.get("uid").and_then(serde_json::Value::as_str)
+}
+
+/// Report whether a pod is Running, Ready, and no longer terminating.
+fn operator_pod_is_ready(pod: &serde_json::Value) -> bool {
+    pod.get("phase").and_then(serde_json::Value::as_str) == Some("Running")
+        && pod.get("deletion_timestamp").is_none_or(serde_json::Value::is_null)
+        && pod.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+/// Require a Ready pod with a new UID before declaring Deployment recovery.
+fn operator_has_new_ready_pod(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    after.iter().any(|pod| {
+        operator_pod_is_ready(pod)
+            && operator_pod_uid(pod)
+                .is_some_and(|uid| before.iter().all(|previous| operator_pod_uid(previous) != Some(uid)))
+    })
+}
+
+/// Ignore completed pods because rollout restart does not remove them.
+fn operator_pod_is_terminal(pod: &serde_json::Value) -> bool {
+    matches!(
+        pod.get("phase").and_then(serde_json::Value::as_str),
+        Some("Succeeded" | "Failed")
+    )
+}
+
+/// Require all pre-restart nonterminal pod UIDs to disappear, including terminating pods.
+fn operator_old_pods_terminated(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    let mut live = before.iter().filter(|pod| !operator_pod_is_terminal(pod)).peekable();
+    live.peek().is_some()
+        && live.all(|previous| {
+            operator_pod_uid(previous).is_some_and(|uid| after.iter().all(|pod| operator_pod_uid(pod) != Some(uid)))
+        })
+}
+
+/// Require a distinct Ready replacement pod and removal of all pre-restart live pods.
+fn operator_restart_state_converged(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    operator_has_new_ready_pod(before, after) && operator_old_pods_terminated(before, after)
+}
+
+/// Record a command's exit code and bounded stdout/stderr in the proof evidence.
+fn record_command_output(
+    observed_facts: &mut BTreeMap<String, serde_json::Value>,
+    prefix: &str,
+    output: &std::process::Output,
+) {
+    observed_facts.insert(
+        format!("{prefix}_exit_code"),
+        serde_json::Value::Number(output.status.code().unwrap_or(-1).into()),
+    );
+    observed_facts.insert(
+        format!("{prefix}_stdout"),
+        serde_json::Value::String(safe_truncate_str(String::from_utf8_lossy(&output.stdout).trim(), 512)),
+    );
+    observed_facts.insert(
+        format!("{prefix}_stderr"),
+        serde_json::Value::String(safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 512)),
+    );
 }
 
 /// Assert post-recovery soak period validates stability.
@@ -3825,15 +4322,16 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
     let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
+    let overlay_sync = crate::env::image_overrides::overlay_sync_image();
     let vcr = crate::env::image_overrides::sim_image();
 
-    for image in [&gateway, &operator, &vcr] {
+    for image in [&gateway, &operator, &overlay_sync, &vcr] {
         require_local_image(image)?;
         eprintln!("  verified local image: {image}");
     }
 
     for cluster in CLUSTERS {
-        for image in [&gateway, &operator, &vcr] {
+        for image in [&gateway, &operator, &overlay_sync, &vcr] {
             eprintln!("  loading {image} into {cluster}...");
             let output = super::forge_config::command(forge_bin.as_os_str(), resolved_config)?
                 .arg("--config")
@@ -4596,7 +5094,10 @@ fn render_config(
     external_site: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut config: serde_yaml::Value = serde_yaml::from_str(content)?;
-    apply_image_overrides(&mut config);
+    apply_image_overrides(&mut config)?;
+    if membership() == Membership::Local {
+        apply_local_membership(&mut config)?;
+    }
     match (external_provider, external_site) {
         (Some(ext), Some(site)) => materialize_external_provider_stack(&mut config, ext, site)?,
         (Some(_), None) => {
@@ -4605,6 +5106,78 @@ fn render_config(
         _ => {},
     }
     Ok(serde_yaml::to_string(&config)?)
+}
+
+/// Rewrite each site's operator and grid-site stacks for Local membership.
+///
+/// The operator runs no SWIM and serves signals on a LoadBalancer, and the GridNetwork
+/// declares Local with no discovery label. Peers are declared after the gateways are up.
+fn apply_local_membership(config: &mut serde_yaml::Value) -> Result<(), Box<dyn std::error::Error>> {
+    let stacks = config
+        .get_mut("spec")
+        .and_then(|spec| spec.get_mut("stacks"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or("forge config missing spec.stacks mapping")?;
+    let local: serde_yaml::Value = serde_yaml::from_str("membership: {source: Local}")?;
+
+    for cluster in CLUSTERS {
+        let operator = format!("{cluster}-operator-base");
+        for step in stack_steps(stacks, &operator)? {
+            match step.get("type").and_then(serde_yaml::Value::as_str) {
+                Some("helm") => {
+                    let values = step_values(step, &operator)?;
+                    values.insert("swim".into(), serde_yaml::from_str(&format!("siteName: {cluster}"))?);
+                    values.insert("grid".into(), local.clone());
+                    values.insert("signals".into(), serde_yaml::from_str("service: {type: LoadBalancer}")?);
+                },
+                Some("capture") => {
+                    let capture = step.as_mapping_mut().ok_or("capture step is not a mapping")?;
+                    capture.insert("resource".into(), format!("svc/{SIGNALS_SERVICE}").into());
+                    capture.insert("key".into(), "signals-lb-ip".into());
+                },
+                _ => {},
+            }
+        }
+
+        let site = format!("{cluster}-site");
+        for step in stack_steps(stacks, &site)? {
+            if step.get("type").and_then(serde_yaml::Value::as_str) != Some("helm") {
+                continue;
+            }
+            let values = step_values(step, &site)?;
+            values.remove("commonLabels");
+            if let Some(network) = values
+                .get_mut("gridNetwork")
+                .and_then(serde_yaml::Value::as_mapping_mut)
+            {
+                network.remove("swim");
+            }
+            values.insert("grid".into(), local.clone());
+        }
+    }
+    Ok(())
+}
+
+/// The steps of `name` in the Forge stacks mapping.
+fn stack_steps<'config>(
+    stacks: &'config mut serde_yaml::Mapping,
+    name: &str,
+) -> Result<&'config mut Vec<serde_yaml::Value>, Box<dyn std::error::Error>> {
+    stacks
+        .get_mut(name)
+        .and_then(|stack| stack.get_mut("steps"))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| format!("stack '{name}' has no steps").into())
+}
+
+/// The Helm values of one step in stack `name`.
+fn step_values<'step>(
+    step: &'step mut serde_yaml::Value,
+    name: &str,
+) -> Result<&'step mut serde_yaml::Mapping, Box<dyn std::error::Error>> {
+    step.get_mut("values")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| format!("stack '{name}' helm step has no values").into())
 }
 
 /// Forge stack name for the provider gateway with an external credential mount.
@@ -4721,15 +5294,18 @@ fn materialize_external_provider_stack(
     clippy::collapsible_if,
     reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
 )]
-fn apply_image_overrides(config: &mut serde_yaml::Value) {
+fn apply_image_overrides(config: &mut serde_yaml::Value) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_image = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
+    let overlay_sync_image = crate::env::image_overrides::overlay_sync_image();
     let vcr_image = crate::env::image_overrides::sim_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
+    let overlay_sync_override = std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").ok();
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
     let (operator_repo, operator_tag) = parse_image_ref(&operator_image);
+    let (overlay_sync_repo, overlay_sync_tag) = parse_image_ref(&overlay_sync_image);
 
     if let Some(spec) = config.get_mut("spec") {
         if let Some(clusters) = spec.get_mut("clusters") {
@@ -4740,12 +5316,15 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
                             let pairs = [
                                 ("gatewayImage", &gateway_image),
                                 ("operatorImage", &operator_image),
+                                ("overlaySyncImage", &overlay_sync_image),
                                 ("vcrImage", &vcr_image),
                                 ("imagePullPolicy", &image_pull_policy),
                                 ("gatewayImageRepo", &gateway_repo),
                                 ("gatewayImageTag", &gateway_tag),
                                 ("operatorImageRepo", &operator_repo),
                                 ("operatorImageTag", &operator_tag),
+                                ("overlaySyncImageRepo", &overlay_sync_repo),
+                                ("overlaySyncImageTag", &overlay_sync_tag),
                             ];
                             for (key, val) in pairs {
                                 props_map.insert(
@@ -4759,6 +5338,10 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
             }
         }
     }
+    if let Some(image) = overlay_sync_override {
+        crate::env::forge_config::apply_overlay_sync_image_values(config, &image, &image_pull_policy)?;
+    }
+    Ok(())
 }
 
 /// Parse image reference into (repo, tag) components.
@@ -5104,14 +5687,21 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
     eprintln!("  [OK] Consumer gateways deployed");
 
     eprintln!();
-    eprintln!(
-        "[SETUP {}/{}] SWIM discovery and trust authorization",
-        next(),
-        total_phases
-    );
-
-    configure_swim_peers(&context.forge_bin, &context.resolved_config)?;
-    authorize_discovered_sites()?;
+    match membership() {
+        Membership::Swim => {
+            eprintln!(
+                "[SETUP {}/{}] SWIM discovery and trust authorization",
+                next(),
+                total_phases
+            );
+            configure_swim_peers(&context.forge_bin, &context.resolved_config)?;
+            authorize_discovered_sites()?;
+        },
+        Membership::Local => {
+            eprintln!("[SETUP {}/{}] Declaring Local peers", next(), total_phases);
+            declare_local_peers()?;
+        },
+    }
 
     eprintln!();
     eprintln!(
@@ -5164,13 +5754,26 @@ fn run_quick_scenarios(
     eprintln!("[SCENARIO {}] Verify component deployment", scenario());
     run_and_insert(&mut results, "component_deployment", assert_component_deployment);
 
-    eprintln!();
-    eprintln!("[SCENARIO {}] Verify SWIM convergence", scenario());
-    run_and_insert(&mut results, "swim_convergence", assert_swim_convergence);
+    match membership() {
+        Membership::Swim => {
+            eprintln!();
+            eprintln!("[SCENARIO {}] Verify SWIM convergence", scenario());
+            run_and_insert(&mut results, "swim_convergence", assert_swim_convergence);
 
-    eprintln!();
-    eprintln!("[SCENARIO {}] Verify site auto-discovery", scenario());
-    run_and_insert(&mut results, "site_auto_discovery", assert_site_auto_discovery);
+            eprintln!();
+            eprintln!("[SCENARIO {}] Verify site auto-discovery", scenario());
+            run_and_insert(&mut results, "site_auto_discovery", assert_site_auto_discovery);
+        },
+        Membership::Local => {
+            eprintln!();
+            eprintln!("[SCENARIO {}] Verify Local membership runs no SWIM", scenario());
+            run_and_insert(&mut results, "local_membership", assert_local_membership);
+
+            eprintln!();
+            eprintln!("[SCENARIO {}] Verify declared Local peers", scenario());
+            run_and_insert(&mut results, "local_declared_peers", assert_local_declared_peers);
+        },
+    }
 
     if let (Some(site), Some(ext)) = (external_provider_site, external_provider) {
         eprintln!();
@@ -5487,8 +6090,110 @@ fn configure_swim_peers(_forge_bin: &Path, _resolved_config: &Path) -> Result<()
     Ok(())
 }
 
+/// The oldest Helm the repository supports, and the first with `--set-json`.
+const HELM_FLOOR: (u32, u32) = (3, 12);
+
+/// Refuse a Helm older than [`HELM_FLOOR`] before any peer is declared.
+fn require_helm_floor() -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("helm")
+        .args(["version", "--template", "{{.Version}}"])
+        .output()
+        .map_err(|error| format!("helm not found: {error}"))?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    eprintln!("  helm {version}");
+    match helm_minor(&version) {
+        Some(found) if found >= HELM_FLOOR => Ok(()),
+        _ => Err(format!(
+            "helm {version} is older than {}.{} or unreadable; Local peers need --set-json",
+            HELM_FLOOR.0, HELM_FLOOR.1
+        )
+        .into()),
+    }
+}
+
+/// The major and minor of a `vX.Y.Z` Helm version.
+fn helm_minor(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.strip_prefix('v')?.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// Declare every site to the other two as a Local peer.
+///
+/// Each GridSite carries the peer's provider gateway and signals addresses, pinned to its
+/// staged certificate. The signals server name is the one that certificate carries.
+fn declare_local_peers() -> Result<(), Box<dyn std::error::Error>> {
+    const PEER_TIMEOUT: Duration = Duration::from_secs(180);
+
+    require_helm_floor()?;
+
+    let mut endpoints = BTreeMap::new();
+    for cluster in CLUSTERS {
+        let gateway = read_lb_ip(cluster, PROVIDER_GATEWAY_SERVICE)?;
+        let signals = read_lb_ip(cluster, SIGNALS_SERVICE)?;
+        eprintln!("  {cluster}: gateway {gateway}, signals {signals}");
+        endpoints.insert(*cluster, (gateway, signals));
+    }
+
+    for local in CLUSTERS {
+        let mut peers = serde_json::Map::new();
+        for remote in CLUSTERS.iter().filter(|remote| *remote != local) {
+            let (gateway, signals) = endpoints.get(remote).ok_or("missing peer endpoints")?;
+            peers.insert(
+                (*remote).to_owned(),
+                serde_json::json!({
+                    "address": format!("{gateway}:{PROVIDER_GATEWAY_PORT}"),
+                    "digest": certs::site_certificate_fingerprint(remote)?,
+                    "signalsEndpoint": {
+                        "address": format!("{signals}:{SIGNALS_PORT}"),
+                        "serverName": format!("{remote}.grid.internal"),
+                    },
+                }),
+            );
+        }
+        let context = format!("kind-grid-combined-{local}");
+        let output = Command::new("helm")
+            .args([
+                "upgrade",
+                "grid-site",
+                "charts/grid-site",
+                "--version",
+                "0.1.0",
+                "--namespace",
+                GRID_SYSTEM_NS,
+                "--kube-context",
+                &context,
+                "--reuse-values",
+                "--set-json",
+            ])
+            .arg(format!("peers={}", serde_json::Value::Object(peers)))
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "{local}: declaring Local peers failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        eprintln!("  [OK] {local}: peers declared");
+    }
+
+    for local in CLUSTERS {
+        let context = format!("kind-grid-combined-{local}");
+        for remote in CLUSTERS.iter().filter(|remote| *remote != local) {
+            operator::wait_for_gridsite_phase(&context, remote, "Active", PEER_TIMEOUT)?;
+        }
+        eprintln!("  [OK] {local}: both declared peers Active");
+    }
+    Ok(())
+}
+
 /// Read the SWIM LoadBalancer IP for a cluster directly from Kubernetes.
 fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    read_lb_ip(cluster, "grid-operator-swim")
+}
+
+/// Read the ingress IP of LoadBalancer `service` in a cluster.
+fn read_lb_ip(cluster: &str, service: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = format!("kind-grid-combined-{cluster}");
     let output = Command::new("kubectl")
         .args([
@@ -5498,7 +6203,7 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
             GRID_SYSTEM_NS,
             "get",
             "svc",
-            "grid-operator-swim",
+            service,
             "-o",
             "jsonpath={.status.loadBalancer.ingress[0].ip}",
         ])
@@ -5506,7 +6211,7 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
 
     if !output.status.success() {
         return Err(format!(
-            "{cluster}: cannot read SWIM service: {}",
+            "{cluster}: cannot read Service {service}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
@@ -5514,7 +6219,7 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
 
     let ip = String::from_utf8(output.stdout)?.trim().to_owned();
     if ip.is_empty() {
-        return Err(format!("{cluster}: SWIM LoadBalancer has no ingress IP").into());
+        return Err(format!("{cluster}: LoadBalancer {service} has no ingress IP").into());
     }
 
     Ok(ip)
@@ -6779,7 +7484,7 @@ fn lifecycle_assert_global_convergence(site: &str) -> AssertionResult {
     }
 
     Ok(proof_success(
-        "secondary candidate converged on all sites via SWIM; routing verified from every consumer",
+        "secondary candidate converged on all sites; routing verified from every consumer",
         facts,
         start.elapsed(),
     ))
@@ -7406,7 +8111,14 @@ fn kind_cluster_exists(cluster_name: &str) -> Result<bool, Box<dyn std::error::E
     clippy::too_many_lines,
     reason = "main demo orchestration function with error handling; splitting obscures the complete flow"
 )]
-pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run(
+    forge_config: &Path,
+    membership: Membership,
+    options: &GlbDemoOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    MEMBERSHIP
+        .set(membership)
+        .map_err(|held| format!("combined-site membership is already {held:?}"))?;
     let mode = options.mode();
 
     // Resolve external provider (reusing GLB demo logic)
@@ -7450,6 +8162,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
             eprintln!("{OUTPUT_RULE}");
             eprintln!("Grid Combined-Site Demo");
             eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
+            eprintln!("Membership: {membership:?}");
             eprintln!("Config: {}", forge_config.display());
             eprintln!("{OUTPUT_RULE}");
 
@@ -7551,7 +8264,11 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence = Evidence {
         schema_version: EVIDENCE_SCHEMA_VERSION.to_owned(),
         mode: if mode == DemoMode::Quick { "quick" } else { "full" }.to_owned(),
-        topology: "combined-site".to_owned(),
+        topology: match membership {
+            Membership::Swim => "combined-site",
+            Membership::Local => "combined-site-local",
+        }
+        .to_owned(),
         clusters: CLUSTERS.iter().map(|&s| s.to_owned()).collect(),
         proof_results,
         images,
@@ -7942,6 +8659,194 @@ mod tests {
     fn cluster_constants() {
         assert_eq!(CLUSTERS.len(), 3);
         assert_eq!(CLUSTERS, &["west", "central", "east"]);
+    }
+
+    #[test]
+    fn restart_recovery_requires_new_ready_pod_and_old_pods_terminated() {
+        let before = vec![serde_json::json!({
+            "uid": "old-uid",
+            "phase": "Running",
+            "deletion_timestamp": null,
+            "ready": true
+        })];
+        let after = vec![serde_json::json!({
+            "uid": "new-uid",
+            "phase": "Running",
+            "deletion_timestamp": null,
+            "ready": true
+        })];
+
+        assert!(
+            operator_restart_state_converged(&before, &after),
+            "a distinct Ready replacement pod and removal of old live pods must converge"
+        );
+    }
+
+    #[test]
+    fn operator_pod_summary_reads_ready_condition_from_kubernetes_pod_json() {
+        let pod = serde_json::json!({
+            "metadata": {
+                "name": "grid-operator-new-abcde",
+                "uid": "new-uid",
+                "creationTimestamp": "2026-11-07T06:00:00Z"
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "Ready", "status": "True"}
+                ],
+                "containerStatuses": [
+                    {"name": "operator", "ready": true, "restartCount": 0}
+                ]
+            }
+        });
+
+        let summary = operator_pod_summary(&pod);
+
+        assert_eq!(
+            summary.get("name").and_then(serde_json::Value::as_str),
+            Some("grid-operator-new-abcde"),
+            "the Kubernetes Pod name must be retained in its summary"
+        );
+        assert_eq!(
+            summary.get("uid").and_then(serde_json::Value::as_str),
+            Some("new-uid"),
+            "the Kubernetes Pod UID must be retained for restart identity checks"
+        );
+        assert_eq!(
+            summary.get("ready").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a Pod with Ready=True must be summarized as ready"
+        );
+        assert!(
+            operator_pod_is_ready(&summary),
+            "a Ready, non-terminating Pod must pass the readiness predicate"
+        );
+    }
+
+    #[test]
+    fn operator_pod_summary_rejects_unready_or_terminating_kubernetes_pods() {
+        let unready = serde_json::json!({
+            "metadata": {"name": "grid-operator-unready", "uid": "unready-uid"},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "False"}]
+            }
+        });
+        let terminating = serde_json::json!({
+            "metadata": {
+                "name": "grid-operator-terminating",
+                "uid": "terminating-uid",
+                "deletionTimestamp": "2026-11-07T06:00:00Z"
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+
+        assert_eq!(
+            operator_pod_summary(&unready)
+                .get("ready")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a Pod with Ready=False must not be summarized as ready"
+        );
+        assert_eq!(
+            operator_pod_summary(&terminating)
+                .get("ready")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a terminating Pod must not be summarized as ready"
+        );
+    }
+
+    #[test]
+    fn restart_recovery_waits_for_terminating_old_pod_to_disappear() {
+        let before = vec![serde_json::json!({
+            "uid": "old-uid",
+            "phase": "Running",
+            "deletion_timestamp": null,
+            "ready": true
+        })];
+        let after = vec![
+            serde_json::json!({
+                "uid": "old-uid",
+                "phase": "Running",
+                "deletion_timestamp": "2026-11-07T06:00:00Z",
+                "ready": false
+            }),
+            serde_json::json!({
+                "uid": "new-uid",
+                "phase": "Running",
+                "deletion_timestamp": null,
+                "ready": true
+            }),
+        ];
+
+        assert!(
+            operator_has_new_ready_pod(&before, &after),
+            "the replacement Pod must be Ready and have a UID not present before restart"
+        );
+        assert!(
+            !operator_old_pods_terminated(&before, &after),
+            "a terminating pre-restart Pod must still count as present"
+        );
+        assert!(
+            !operator_restart_state_converged(&before, &after),
+            "restart convergence must wait until every pre-restart Pod disappears"
+        );
+    }
+
+    #[test]
+    fn restart_recovery_ignores_retained_terminal_pods() {
+        for phase in ["Failed", "Succeeded"] {
+            let terminal = serde_json::json!({"uid": "terminal-uid", "phase": phase, "ready": false});
+            let terminal_only = vec![terminal.clone()];
+            let before = vec![
+                terminal.clone(),
+                serde_json::json!({"uid": "old-uid", "phase": "Running", "ready": true}),
+            ];
+            let after = vec![
+                terminal,
+                serde_json::json!({"uid": "new-uid", "phase": "Running", "ready": true}),
+            ];
+            assert!(
+                operator_restart_state_converged(&before, &after),
+                "a retained {phase} pod must not block convergence after the live old pod disappears"
+            );
+            assert!(
+                !operator_old_pods_terminated(&terminal_only, &after),
+                "terminal-only history must not prove replacement of a live operator pod"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_recovery_rejects_empty_or_unready_pod_snapshots() {
+        let before = vec![serde_json::json!({
+            "uid": "old-uid",
+            "phase": "Running",
+            "deletion_timestamp": null,
+            "ready": true
+        })];
+        assert!(
+            !operator_restart_state_converged(&before, &[]),
+            "an empty post-restart Pod snapshot cannot prove a Ready replacement"
+        );
+        assert!(
+            !operator_restart_state_converged(
+                &before,
+                &[serde_json::json!({
+                "uid": "new-uid",
+                "phase": "Running",
+                "deletion_timestamp": null,
+                "ready": false
+                })]
+            ),
+            "an unready post-restart Pod cannot prove convergence"
+        );
     }
 
     fn test_overlay(sites: &[&str]) -> OverlayData {
@@ -8626,5 +9531,72 @@ spec:
             "pod label must match VCR app name for NetworkPolicy coverage",
         );
         drop((routing_cluster, label, vcr_image, image_pull_policy));
+    }
+
+    #[test]
+    fn helm_floor_reads_major_and_minor() {
+        assert_eq!(helm_minor("v3.12.0"), Some((3, 12)));
+        assert_eq!(helm_minor("v4.0.1"), Some((4, 0)));
+        assert!(helm_minor("v3.11.3") < Some(HELM_FLOOR));
+        assert_eq!(helm_minor("3.12.0"), None, "the v prefix is required");
+        assert_eq!(helm_minor(""), None);
+    }
+
+    #[test]
+    fn local_membership_rewrites_every_site_without_swim() {
+        /// The value at `path`. An absent node aborts the test.
+        fn at<'value>(value: &'value serde_yaml::Value, path: &[&str]) -> &'value serde_yaml::Value {
+            path.iter()
+                .try_fold(value, |node, key| node.get(*key))
+                .unwrap_or_else(|| std::process::abort())
+        }
+        /// The first step of `stack` of `kind`. A missing step aborts the test.
+        fn step<'value>(config: &'value serde_yaml::Value, stack: &str, kind: &str) -> &'value serde_yaml::Value {
+            at(config, &["spec", "stacks", stack, "steps"])
+                .as_sequence()
+                .and_then(|steps| {
+                    steps
+                        .iter()
+                        .find(|step| step.get("type").and_then(serde_yaml::Value::as_str) == Some(kind))
+                })
+                .unwrap_or_else(|| std::process::abort())
+        }
+
+        let source = include_str!("../../../../tests/e2e/topologies/grid-combined-site/forge.yaml");
+        let mut config: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+        apply_local_membership(&mut config).unwrap();
+        for cluster in CLUSTERS {
+            let operator = format!("{cluster}-operator-base");
+            let values = at(step(&config, &operator, "helm"), &["values"]);
+            assert_eq!(
+                at(values, &["grid", "membership", "source"]),
+                "Local",
+                "{cluster} operator runs Local"
+            );
+            let swim: serde_yaml::Value = serde_yaml::from_str(&format!("siteName: {cluster}")).unwrap();
+            assert_eq!(at(values, &["swim"]), &swim, "{cluster} keeps only its site name");
+            assert_eq!(
+                at(values, &["signals", "service", "type"]),
+                "LoadBalancer",
+                "{cluster} signals are reachable"
+            );
+            assert_eq!(
+                at(step(&config, &operator, "capture"), &["resource"]),
+                "svc/grid-operator-signals",
+                "{cluster} captures the signals Service"
+            );
+
+            let site = at(step(&config, &format!("{cluster}-site"), "helm"), &["values"]);
+            assert_eq!(
+                at(site, &["grid", "membership", "source"]),
+                "Local",
+                "{cluster} GridNetwork declares Local"
+            );
+            assert!(site.get("commonLabels").is_none(), "{cluster} has no discovery label");
+            assert!(
+                at(site, &["gridNetwork"]).get("swim").is_none(),
+                "{cluster} has no SWIM block"
+            );
+        }
     }
 }

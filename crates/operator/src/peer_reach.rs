@@ -54,6 +54,9 @@ pub const POLL_ROUND_OVERRUN: &str = "PollRoundOverrun";
 /// Its server-side apply manager.
 pub const POLLS_FIELD_MANAGER: &str = "grid-operator-peer-polls";
 
+/// Reason every peer condition carries, `Unknown`, while no peer `GridSite` is declared.
+pub const NO_DECLARED_PEERS: &str = "NoDeclaredPeers";
+
 /// Rounds in a row a reachable peer goes unanswered before it reads unreachable.
 pub const MISSES_BEFORE_UNREACHABLE: u32 = 3;
 
@@ -449,6 +452,28 @@ pub fn polls_condition(
     )
 }
 
+/// `type_` as `Unknown` with [`NO_DECLARED_PEERS`] over `current`, `None` when it already says
+/// this: with no peer declared there is nothing to judge, so no verdict either way.
+#[must_use]
+pub fn no_peers_condition(
+    type_: &str,
+    current: &[Condition],
+    now_rfc3339: &str,
+    generation: Option<i64>,
+) -> Option<Condition> {
+    stamp(
+        current,
+        (
+            type_,
+            ConditionStatus::Unknown,
+            NO_DECLARED_PEERS,
+            "no peer GridSite is declared, so none is polled".to_owned(),
+        ),
+        now_rfc3339,
+        generation,
+    )
+}
+
 /// The status apply withdrawing `type_`, which the caller's manager owns alone, from
 /// `network`, with its name; `None` when `network` holds none.
 #[must_use]
@@ -500,9 +525,9 @@ mod tests {
 
     use super::{
         AWAITING_FIRST_CHECK, CATALOG_ACCEPTED, CATALOGS, CATALOGS_REFUSED, ConditionStatus, EGRESS_ONLY,
-        MISSES_BEFORE_UNREACHABLE, Misses, NO_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_POLLS_COMPLETE,
+        MISSES_BEFORE_UNREACHABLE, Misses, NO_DECLARED_PEERS, NO_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_POLLS_COMPLETE,
         PEER_SIGNALS_REACHABLE, PEERS_UNREACHABLE, POLL_ROUND_OVERRUN, PeerReach, REACH, SIGNALS_REACHABLE,
-        polls_condition,
+        no_peers_condition, polls_condition,
     };
     use crate::{
         crd::{
@@ -883,6 +908,20 @@ mod tests {
             ("True", PEER_CATALOGS_ACCEPTED)
         );
         assert_eq!(PeerReach::none(&CATALOGS).kind().site_type, CATALOG_ACCEPTED);
+    }
+
+    #[test]
+    fn no_declared_peers_reads_unknown_and_is_written_once() {
+        let unknown =
+            no_peers_condition(PEER_SIGNALS_REACHABLE, &[], "t", Some(1)).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            (unknown.status, unknown.reason.as_str()),
+            (ConditionStatus::Unknown, NO_DECLARED_PEERS)
+        );
+        assert!(
+            no_peers_condition(PEER_SIGNALS_REACHABLE, &[unknown], "later", Some(1)).is_none(),
+            "an unchanged verdict is not rewritten"
+        );
     }
 
     #[test]

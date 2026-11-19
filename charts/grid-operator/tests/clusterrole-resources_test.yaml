@@ -34,6 +34,10 @@ tests:
             - apiGroups: [""]
               resources: ["configmaps"]
               verbs: ["get", "create", "patch", "update"]
+            - apiGroups: [""]
+              resources: ["configmaps"]
+              resourceNames: ["grid-operator-local-records"]
+              verbs: ["delete"]
   - it: grants no Deployment access of its own
     asserts:
       - notContains:
@@ -69,6 +73,22 @@ tests:
             resources: ["deployments"]
             resourceNames: ["provider-gateway"]
             verbs: ["get", "patch"]
+
+  - it: scopes ConfigMap delete to grid-operator-local-records only
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            resourceNames: ["grid-operator-local-records"]
+            verbs: ["delete"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["delete"]
 
   - it: grants no SWIM Service read under Local membership, which renders none
     set:

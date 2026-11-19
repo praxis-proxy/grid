@@ -1,12 +1,26 @@
 # cargo-deny policy for the gateway workspace. Mirrors the root deny.toml
-# (licenses, bans, registry sources) with two gateway-specific deltas: the
-# gateway depends on praxis-ai via git, and its rustls stack pulls an
-# unmaintained transitive crate the root graph does not.
+# (licenses, bans, registry sources), plus pinned Praxis git sources and
+# documented transitive advisory exceptions for the Gateway graph.
 
 [advisories]
 unmaintained = "all"
 maximum-db-staleness = "P30D"
 ignore = [
+  # Temporary acceptance of unmaintained notices, not a vulnerability waiver.
+  # Praxis core/AI/policy require chrono; AI API/store require humantime via
+  # humantime-serde. Neither advisory lists a patched version. Migration:
+  # https://github.com/praxis-proxy/grid/issues/604
+  { id = "RUSTSEC-2026-0543", reason = "chrono is transitive through Praxis core/AI/policy; migration tracked in grid#604" },
+  { id = "RUSTSEC-2026-0542", reason = "humantime is transitive through AI humantime-serde; migration tracked in grid#604" },
+  # chrono-tz is unmaintained with no patched release; cel and regorus pull it
+  # into Praxis policy builtins. Replacement is tracked in grid#604.
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz is transitive through Praxis policy builtins; no patched release; migration tracked in grid#604" },
+  # PPE 0.6.0's default builtin bundle includes Limitador 0.14, which pulls
+  # atomic-polyfill through postcard/heapless and paste through CEL 0.12.
+  # Both are unmaintained with no patched versions; replacement needs an
+  # upstream dependency change. Neither is in the Policy FIPS profiles.
+  { id = "RUSTSEC-2023-0089", reason = "unmaintained atomic-polyfill via Limitador/postcard/heapless; no patched version" },
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained paste via Limitador/CEL 0.12; no patched version" },
   # rustls-pemfile is unmaintained (RUSTSEC-2025-0134); it is a transitive
   # dependency of the gateway's rustls/Pingora TLS stack with no upstream
   # replacement wired yet.
@@ -18,6 +32,11 @@ ignore = [
   { id = "RUSTSEC-2026-0403", reason = "upstream header-serde pins zstd-safe 7; no compatible fixed release available" },
   # This allocator-shim issue is wasm32-only; grid-gateway is a native binary.
   { id = "RUSTSEC-2026-0410", reason = "wasm32-only allocator issue; grid-gateway does not target wasm32" },
+  # These are transitive dependencies of the pinned Praxis stack. The advisories
+  # mark all versions unmaintained and do not provide safe replacements.
+  { id = "RUSTSEC-2026-0542", reason = "transitive humantime dependency; no safe upgrade available" },
+  { id = "RUSTSEC-2026-0543", reason = "transitive chrono dependency; no safe upgrade available" },
+  { id = "RUSTSEC-2026-0555", reason = "transitive chrono-tz dependency; no safe upgrade available" },
 ]
 
 [licenses]

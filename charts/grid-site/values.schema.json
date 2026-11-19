@@ -55,15 +55,6 @@
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
         },
-        "swim": {
-          "type": "object",
-          "additionalProperties": true,
-          "properties": {
-            "probeInterval": { "type": "string" },
-            "suspicionTimeout": { "type": "string" },
-            "gossipNodes": { "type": "integer", "minimum": 1 }
-          }
-        },
         "tls": {
           "type": "object",
           "additionalProperties": true,

@@ -1,10 +1,12 @@
 # 0.3.x CRD Field Migration
 
-The 0.3.x release accepts both the previous and current names for CRD spec
-fields. The `grid-site` and `grid-operator` charts also translate previous
-value names when they render resources. The previous names are deprecated and
-will be removed in a later release. Migrate custom resources and Helm values before
-upgrading to 0.3.x.
+The 0.3.x release accepts both the previous and current names for the aliased
+CRD spec fields below. The `grid-site` and `grid-operator` charts also translate
+previous value names when they render resources. The SWIM field move is a
+breaking change in 0.3.0 and is documented separately below. Save existing
+SWIM seeds before applying the 0.3.0 CRD, then move them to the new field as
+soon as the CRD is applied. Update the aliased names below during the 0.3.x
+compatibility window.
 
 Do not set both names for one field. The API schema and chart reject conflicting
 old and new names.
@@ -45,8 +47,33 @@ old and new names.
 
 ## Upgrade to 0.3.x
 
-Existing CRD spec field names and chart values remain accepted in 0.3.x.
-Update manifests and Helm values to the current names when convenient.
+Existing aliased CRD spec field names and chart values remain accepted in 0.3.x.
+Update manifests and Helm values to the current names when convenient. For the
+breaking SWIM field move, record each existing `spec.seeds` list before
+applying the 0.3.0 CRD. Do not move the seeds beforehand: the old CRD prunes
+`membership.swim`, so the update would be discarded. Applying the new CRD
+prunes `spec.seeds`, so restore the saved list at the new path immediately
+after the CRD is applied:
+
+```yaml
+spec:
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - east.example:7946
+```
+
+Set `membership.mode: Swim` and restore the saved list at
+`spec.membership.swim.seeds` immediately after applying the new CRD. The old
+top-level `spec.seeds` and `spec.swim` fields are removed without aliases. The
+old `spec.swim` tuning values were not wired to the SWIM runtime and are no
+longer supported. For `membership.mode: Local`, remove the seed and tuning
+fields; Local does not use SWIM configuration.
+
+The `grid-site` chart continues to accept `gridNetwork.seeds` and renders it at
+the new field path. Remove any `gridNetwork.swim` tuning values from chart
+values.
 
 Status fields and reasons change in 0.3.x without legacy aliases. Update scripts
 and dashboards that read them during the 0.3.x upgrade, including
@@ -61,13 +88,26 @@ naming it. Under SWIM membership `fromProviders` still gates remote candidates.
 Delete or disable a provider that must not be served before upgrading. See
 [Derived endpoint topology](../architecture/consumer-config.md#derived-endpoint-topology).
 
-Upgrade in this order:
+If any `GridSite` sets `spec.sovereigntyZone`, upgrade every gateway before the
+operator that publishes the zone map. Before enabling the sovereignty fence in
+`enforce` mode, verify that every gateway has accepted a config carrying the
+expected zones. Follow the
+[sovereignty rollout procedure][sovereignty-rollout]
+as an additional prerequisite to the operator upgrade below.
 
-1. Apply the 0.3.x CRDs first. When the platform owns the CRDs, apply the
-   chart's CRD templates before installing the charts with `crds.enabled=false`.
-2. Upgrade `grid-operator`.
-3. Upgrade `grid-site`.
-4. Apply custom resources and Helm values using the current field names.
+[sovereignty-rollout]: ../architecture/routing.md#gateway-first-rollout
+
+Upgrade CRDs, custom resources, and charts in this order:
+
+1. Record existing `spec.seeds` lists, then apply the 0.3.x CRDs. When the
+   platform owns the CRDs, apply the chart's CRD templates before installing
+   the charts with `crds.enabled=false`.
+2. Immediately apply Swim `GridNetwork` resources with the saved seeds at
+   `spec.membership.swim.seeds`; do this before upgrading either chart.
+3. Upgrade `grid-operator`.
+4. Upgrade `grid-site`.
+5. Apply remaining custom resources and Helm values using the current field
+   names.
 
 For a rollback, roll back `grid-site` before `grid-operator` so the older
 operator does not receive current field names. Restore custom resources and

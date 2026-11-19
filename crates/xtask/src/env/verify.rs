@@ -327,18 +327,6 @@ impl PortForwardGuard {
         Self::start_inner(context, namespace, &resource, &mapping, Stdio::inherit())
     }
 
-    /// Start a port-forward directly to a named Deployment.
-    pub(crate) fn start_deployment_with_diagnostics(
-        context: &str,
-        namespace: &str,
-        deployment: &str,
-        local_port: u16,
-        deployment_port: u16,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (resource, mapping) = port_forward_args("deployment", deployment, local_port, deployment_port);
-        Self::start_inner(context, namespace, &resource, &mapping, Stdio::inherit())
-    }
-
     /// Spawn a port-forward with the requested stderr handling.
     fn start_inner(
         context: &str,

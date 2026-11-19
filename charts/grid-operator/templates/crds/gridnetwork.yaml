@@ -64,8 +64,7 @@ spec:
               description: |-
                 Specification for a [`GridNetwork`].
 
-                Defines the grid's seed peers, gateway associations, SWIM
-                tuning, and TLS secret references.
+                Defines the grid's gateway associations, membership, and TLS secret references.
               properties:
                 admissionPolicy:
                   description: |-
@@ -471,6 +470,37 @@ spec:
                               - intelligentRoute
                               - gridSiteRoute
                             type: string
+                          sovereignty:
+                            description: |-
+                              The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
+                              may be served in, and whether it refuses or only audits. Admission rejects it under
+                              any other router.
+
+                              Default: unset, no fence.
+                            nullable: true
+                            properties:
+                              header:
+                                description: |-
+                                  Request header naming the zones a request may be served in: one zone, or a
+                                  comma-separated list in a single header line, matched against each `GridSite`
+                                  `sovereigntyZone`. The upstream that sets it must replace, never append to, a
+                                  caller's copy.
+                                maxLength: 63
+                                pattern: ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$
+                                type: string
+                              mode:
+                                default: enforce
+                                description: |-
+                                  What the fence does with a request it does not admit.
+
+                                  Default: `enforce`.
+                                enum:
+                                  - enforce
+                                  - audit
+                                type: string
+                            required:
+                              - header
+                            type: object
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -553,6 +583,8 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-validations:
+                          - message: sovereignty is applied only by siteRouter gridSiteRoute
+                            rule: '!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == ''gridSiteRoute'')'
                           - message: set only `enabled` or `generate`, not both
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
@@ -888,6 +920,37 @@ spec:
                               - intelligentRoute
                               - gridSiteRoute
                             type: string
+                          sovereignty:
+                            description: |-
+                              The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
+                              may be served in, and whether it refuses or only audits. Admission rejects it under
+                              any other router.
+
+                              Default: unset, no fence.
+                            nullable: true
+                            properties:
+                              header:
+                                description: |-
+                                  Request header naming the zones a request may be served in: one zone, or a
+                                  comma-separated list in a single header line, matched against each `GridSite`
+                                  `sovereigntyZone`. The upstream that sets it must replace, never append to, a
+                                  caller's copy.
+                                maxLength: 63
+                                pattern: ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$
+                                type: string
+                              mode:
+                                default: enforce
+                                description: |-
+                                  What the fence does with a request it does not admit.
+
+                                  Default: `enforce`.
+                                enum:
+                                  - enforce
+                                  - audit
+                                type: string
+                            required:
+                              - header
+                            type: object
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -970,6 +1033,8 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-validations:
+                          - message: sovereignty is applied only by siteRouter gridSiteRoute
+                            rule: '!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == ''gridSiteRoute'')'
                           - message: set only `enabled` or `generate`, not both
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
@@ -1047,6 +1112,95 @@ spec:
                             - transport
                           type: object
                         type: array
+                      regionalPolicy:
+                        description: |-
+                          Regional eligibility and preference policy for this gateway's overlay.
+
+                          The policy applies to every capability rendered for this gateway. When
+                          absent, Grid preserves the existing unconstrained routing behavior.
+                          Per-route overrides are outside this contract.
+                        nullable: true
+                        properties:
+                          allowedRegions:
+                            description: |-
+                              Unordered hard region allowlist for locked mode.
+
+                              This Kubernetes set contains 1–64 non-empty values without whitespace,
+                              each at most 253 characters.
+                            items:
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^\S+$
+                              type: string
+                            maxItems: 64
+                            minItems: 1
+                            nullable: true
+                            type: array
+                            x-kubernetes-list-type: set
+                          allowedSovereigntyZones:
+                            description: |-
+                              Independent hard sovereignty-zone allowlist for either mode.
+
+                              Values use the [`GridSite`] `sovereigntyZone` token format. Matching
+                              uses the shared canonical form and is case-insensitive.
+
+                              [`GridSite`]: crate::crd::grid_site::GridSite
+                            items:
+                              maxLength: 63
+                              minLength: 1
+                              pattern: ^[A-Za-z0-9._-]+$
+                              type: string
+                            maxItems: 64
+                            minItems: 1
+                            nullable: true
+                            type: array
+                            x-kubernetes-list-type: set
+                          crossRegionFallback:
+                            description: Whether affinity routing may consider candidates outside preferred regions.
+                            enum:
+                              - allow
+                              - deny
+                            nullable: true
+                            type: string
+                          mode:
+                            description: Whether regions are preferred or form a hard eligibility boundary.
+                            enum:
+                              - affinity
+                              - locked
+                            type: string
+                          preferredRegions:
+                            description: |-
+                              Unordered preferred-region set for affinity mode.
+
+                              This Kubernetes set contains 1–64 non-empty values without whitespace,
+                              each at most 253 characters.
+
+                              When absent, the operator derives the preferred region from the trusted
+                              [`GridSite`] resolved through [`GatewayRef::site_name`].
+
+                              [`GridSite`]: crate::crd::grid_site::GridSite
+                            items:
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^\S+$
+                              type: string
+                            maxItems: 64
+                            minItems: 1
+                            nullable: true
+                            type: array
+                            x-kubernetes-list-type: set
+                        required:
+                          - mode
+                        type: object
+                        x-kubernetes-validations:
+                          - message: allowedRegions is not valid in affinity mode
+                            rule: self.mode != 'affinity' || !has(self.allowedRegions)
+                          - message: allowedRegions is required in locked mode
+                            rule: self.mode != 'locked' || has(self.allowedRegions)
+                          - message: preferredRegions is not valid in locked mode
+                            rule: self.mode != 'locked' || !has(self.preferredRegions)
+                          - message: crossRegionFallback is not valid in locked mode
+                            rule: self.mode != 'locked' || !has(self.crossRegionFallback)
                       siteName:
                         description: |-
                           Local site name for the `intelligent_route` overlay generated for this gateway.
@@ -1361,6 +1515,37 @@ spec:
                               - intelligentRoute
                               - gridSiteRoute
                             type: string
+                          sovereignty:
+                            description: |-
+                              The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
+                              may be served in, and whether it refuses or only audits. Admission rejects it under
+                              any other router.
+
+                              Default: unset, no fence.
+                            nullable: true
+                            properties:
+                              header:
+                                description: |-
+                                  Request header naming the zones a request may be served in: one zone, or a
+                                  comma-separated list in a single header line, matched against each `GridSite`
+                                  `sovereigntyZone`. The upstream that sets it must replace, never append to, a
+                                  caller's copy.
+                                maxLength: 63
+                                pattern: ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$
+                                type: string
+                              mode:
+                                default: enforce
+                                description: |-
+                                  What the fence does with a request it does not admit.
+
+                                  Default: `enforce`.
+                                enum:
+                                  - enforce
+                                  - audit
+                                type: string
+                            required:
+                              - header
+                            type: object
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -1443,6 +1628,8 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-validations:
+                          - message: sovereignty is applied only by siteRouter gridSiteRoute
+                            rule: '!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == ''gridSiteRoute'')'
                           - message: set only `enabled` or `generate`, not both
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
@@ -1762,6 +1949,37 @@ spec:
                               - intelligentRoute
                               - gridSiteRoute
                             type: string
+                          sovereignty:
+                            description: |-
+                              The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
+                              may be served in, and whether it refuses or only audits. Admission rejects it under
+                              any other router.
+
+                              Default: unset, no fence.
+                            nullable: true
+                            properties:
+                              header:
+                                description: |-
+                                  Request header naming the zones a request may be served in: one zone, or a
+                                  comma-separated list in a single header line, matched against each `GridSite`
+                                  `sovereigntyZone`. The upstream that sets it must replace, never append to, a
+                                  caller's copy.
+                                maxLength: 63
+                                pattern: ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$
+                                type: string
+                              mode:
+                                default: enforce
+                                description: |-
+                                  What the fence does with a request it does not admit.
+
+                                  Default: `enforce`.
+                                enum:
+                                  - enforce
+                                  - audit
+                                type: string
+                            required:
+                              - header
+                            type: object
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -1844,6 +2062,8 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-validations:
+                          - message: sovereignty is applied only by siteRouter gridSiteRoute
+                            rule: '!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == ''gridSiteRoute'')'
                           - message: set only `enabled` or `generate`, not both
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
@@ -1916,6 +2136,95 @@ spec:
                             - transport
                           type: object
                         type: array
+                      regionalPolicy:
+                        description: |-
+                          Regional eligibility and preference policy for this gateway's overlay.
+
+                          The policy applies to every capability rendered for this gateway. When
+                          absent, Grid preserves the existing unconstrained routing behavior.
+                          Per-route overrides are outside this contract.
+                        nullable: true
+                        properties:
+                          allowedRegions:
+                            description: |-
+                              Unordered hard region allowlist for locked mode.
+
+                              This Kubernetes set contains 1–64 non-empty values without whitespace,
+                              each at most 253 characters.
+                            items:
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^\S+$
+                              type: string
+                            maxItems: 64
+                            minItems: 1
+                            nullable: true
+                            type: array
+                            x-kubernetes-list-type: set
+                          allowedSovereigntyZones:
+                            description: |-
+                              Independent hard sovereignty-zone allowlist for either mode.
+
+                              Values use the [`GridSite`] `sovereigntyZone` token format. Matching
+                              uses the shared canonical form and is case-insensitive.
+
+                              [`GridSite`]: crate::crd::grid_site::GridSite
+                            items:
+                              maxLength: 63
+                              minLength: 1
+                              pattern: ^[A-Za-z0-9._-]+$
+                              type: string
+                            maxItems: 64
+                            minItems: 1
+                            nullable: true
+                            type: array
+                            x-kubernetes-list-type: set
+                          crossRegionFallback:
+                            description: Whether affinity routing may consider candidates outside preferred regions.
+                            enum:
+                              - allow
+                              - deny
+                            nullable: true
+                            type: string
+                          mode:
+                            description: Whether regions are preferred or form a hard eligibility boundary.
+                            enum:
+                              - affinity
+                              - locked
+                            type: string
+                          preferredRegions:
+                            description: |-
+                              Unordered preferred-region set for affinity mode.
+
+                              This Kubernetes set contains 1–64 non-empty values without whitespace,
+                              each at most 253 characters.
+
+                              When absent, the operator derives the preferred region from the trusted
+                              [`GridSite`] resolved through [`GatewayRef::site_name`].
+
+                              [`GridSite`]: crate::crd::grid_site::GridSite
+                            items:
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^\S+$
+                              type: string
+                            maxItems: 64
+                            minItems: 1
+                            nullable: true
+                            type: array
+                            x-kubernetes-list-type: set
+                        required:
+                          - mode
+                        type: object
+                        x-kubernetes-validations:
+                          - message: allowedRegions is not valid in affinity mode
+                            rule: self.mode != 'affinity' || !has(self.allowedRegions)
+                          - message: allowedRegions is required in locked mode
+                            rule: self.mode != 'locked' || has(self.allowedRegions)
+                          - message: preferredRegions is not valid in locked mode
+                            rule: self.mode != 'locked' || !has(self.preferredRegions)
+                          - message: crossRegionFallback is not valid in locked mode
+                            rule: self.mode != 'locked' || !has(self.crossRegionFallback)
                       siteName:
                         description: |-
                           Local site name for the `intelligent_route` overlay generated for this gateway.
@@ -1965,6 +2274,19 @@ spec:
                         - Swim
                         - Local
                       type: string
+                    swim:
+                      description: SWIM seed peers used when `mode` is `Swim`.
+                      nullable: true
+                      properties:
+                        seeds:
+                          default: []
+                          description: |-
+                            SWIM peer endpoints in host:port form. Literal IPv4, bracketed IPv6,
+                            and DNS hostnames are accepted.
+                          items:
+                            type: string
+                          type: array
+                      type: object
                   required:
                     - mode
                   type: object
@@ -2055,14 +2377,6 @@ spec:
                   required:
                     - strategy
                   type: object
-                seeds:
-                  default: []
-                  description: |-
-                    Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed
-                    IPv6, and DNS hostnames are accepted.
-                  items:
-                    type: string
-                  type: array
                 selectionPolicy:
                   description: |-
                     Local request distribution policy for the active selection group.
@@ -2137,28 +2451,6 @@ spec:
                   minimum: 1.0
                   nullable: true
                   type: integer
-                swim:
-                  default:
-                    gossipNodes: 3
-                    probeInterval: 5s
-                    suspicionTimeout: 10s
-                  description: SWIM protocol configuration.
-                  properties:
-                    gossipNodes:
-                      default: 3
-                      description: Fanout for indirect probes.
-                      format: uint32
-                      minimum: 0.0
-                      type: integer
-                    probeInterval:
-                      default: 5s
-                      description: WAN probe interval (e.g. "5s").
-                      type: string
-                    suspicionTimeout:
-                      default: 10s
-                      description: Suspicion timeout before declaring dead (e.g. "10s").
-                      type: string
-                  type: object
                 tls:
                   default:
                     caSecretRef: null
@@ -2286,6 +2578,8 @@ spec:
                   rule: '!has(oldSelf.gridId) || oldSelf.gridId == '''' || (has(self.gridId) && self.gridId == oldSelf.gridId)'
                 - message: membership.mode Local requires signalTransport.mode poll
                   rule: '!has(self.membership) || self.membership.mode != ''Local'' || (has(self.signalTransport) && self.signalTransport.mode == ''poll'')'
+                - message: membership.swim is only valid when membership.mode is Swim
+                  rule: '!has(self.membership) || self.membership.mode == ''Swim'' || !has(self.membership.swim)'
                 - message: set only `gatewayRefs` or `consumerGateways`, not both
                   rule: '!(has(self.gatewayRefs) && has(self.consumerGateways))'
             status:
@@ -2411,7 +2705,7 @@ spec:
                         description: Original wire flag, retained to verify exact duplicates.
                         type: boolean
                       sequence:
-                        description: Last durably accepted sequence.
+                        description: Last durably recorded sequence; live sequence watermarks are process-local.
                         format: int64
                         minimum: 1.0
                         type: integer

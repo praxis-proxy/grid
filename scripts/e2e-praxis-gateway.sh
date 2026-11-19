@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # praxis-gateway standalone e2e. Forge creates a Kind cluster with no Grid
 # components, installs charts/praxis-gateway with no values, reconfigures it
-# through praxisConfig.byo.inline, an existing ConfigMap, and the core Praxis image, and
-# checks real requests after every change. The topology and its stages live in
+# through praxisConfig.byo.inline, an existing ConfigMap, and the core Praxis image, then
+# builds grid-gateway and checks its TLS metrics authorization. The topology and its stages live in
 # tests/e2e/topologies/praxis-gateway-standalone.
 #
 # Env: FORGE_BIN           explicit executable override (default: pinned upstream Forge)
 #      STATE_DIR           Forge state directory
 #                          (default target/forge/praxis-gateway-standalone)
+#      E2E_STACK           optional Forge stack to apply (for example gateway-metrics)
+#      CORE_IMAGE_PLATFORM override the platform used for the published Praxis test images
 #      KEEP=1              leave the cluster running afterwards
 #      KIND_CREATE_PREFIX  command prefix for cluster creation, e.g. the rootless
 #                          podman wrapper: systemd-run --scope --user -p Delegate=yes
@@ -17,12 +19,56 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 CONFIG=tests/e2e/topologies/praxis-gateway-standalone/forge.yaml
 STATE_DIR=${STATE_DIR:-$ROOT/target/forge/praxis-gateway-standalone}
-CONTEXT=kind-praxis-standalone-gateway
+CLUSTER_NAME=praxis-standalone-gateway
+CONTEXT=kind-$CLUSTER_NAME
+GRID_GATEWAY_IMAGE=grid-gateway:latest
+CHART_GATEWAY_IMAGE=docker.io/library/grid-gateway:latest
 
 FORGE_BIN=$("$ROOT/scripts/forge.sh" path)
 
 forge() {
   "$FORGE_BIN" --config "$CONFIG" --state-dir "$STATE_DIR" --non-interactive "$@"
+}
+
+load_image_to_kind() {
+  local engine=$1 image=$2 archive
+  if [ "$(basename "$engine")" = podman ]; then
+    archive=$(mktemp)
+    if ! "$engine" save -o "$archive" "$image" \
+      || ! kind load image-archive "$archive" --name "$CLUSTER_NAME"; then
+      rm -f "$archive"
+      return 1
+    fi
+    rm -f "$archive"
+  else
+    kind load docker-image "$image" --name "$CLUSTER_NAME"
+  fi
+}
+
+prepare_core_images() {
+  local engine platform image
+  engine=${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}
+  [ -n "$engine" ] || { echo "No container engine found. Install podman or docker." >&2; return 1; }
+  platform=${CORE_IMAGE_PLATFORM:-}
+  if [ -z "$platform" ]; then
+    case "$(uname -m)" in
+      arm64|aarch64) platform=linux/amd64 ;;
+      *) return 0 ;;
+    esac
+  fi
+  for image in ghcr.io/praxis-proxy/ai:0.7.0 ghcr.io/praxis-proxy/praxis:0.7.1; do
+    "$engine" pull --platform "$platform" "$image" || return 1
+    load_image_to_kind "$engine" "$image" || return 1
+  done
+}
+
+build_and_load_grid_gateway() {
+  local engine
+  engine=${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}
+  [ -n "$engine" ] || { echo "No container engine found. Install podman or docker." >&2; return 1; }
+  make CONTAINER_ENGINE="$engine" gateway-image || return 1
+  "$engine" tag "$GRID_GATEWAY_IMAGE" "$CHART_GATEWAY_IMAGE" || return 1
+  load_image_to_kind "$engine" "$CHART_GATEWAY_IMAGE"
 }
 
 diagnostics() {
@@ -58,13 +104,33 @@ status=0
 # shellcheck disable=SC2086 # KIND_CREATE_PREFIX is a command prefix and must word-split
 ${KIND_CREATE_PREFIX:-} "$FORGE_BIN" --config "$CONFIG" --state-dir "$STATE_DIR" --non-interactive up || status=$?
 if [ "$status" = 0 ]; then
-  forge apply gateway || status=$?
+  if [ -z "${E2E_STACK:-}" ]; then
+    prepare_core_images || status=$?
+  fi
+fi
+if [ "$status" = 0 ]; then
+  build_and_load_grid_gateway || status=$?
+fi
+if [ "$status" = 0 ]; then
+  if [ -n "${E2E_STACK:-}" ]; then
+    forge apply gateway "$E2E_STACK" || status=$?
+  else
+    forge apply gateway || status=$?
+  fi
 fi
 cat "$PRAXIS_GATEWAY_E2E_LOG"
 # A stack that never ran leaves no checks behind, so require the last stage's,
 # and Forge keeps applying later stacks after one fails, so look for failures too.
+required_stages=(metrics-authorization)
+if [ "${E2E_STACK:-}" != gateway-metrics ]; then
+  required_stages+=(release)
+fi
+missing_stage=0
+for required_stage in "${required_stages[@]}"; do
+  grep -Fq "PASS [$required_stage]" "$PRAXIS_GATEWAY_E2E_LOG" || missing_stage=1
+done
 if [ "$status" = 0 ] && { grep -q 'FAIL \[' "$PRAXIS_GATEWAY_E2E_LOG" \
-  || ! grep -q 'PASS \[release\]' "$PRAXIS_GATEWAY_E2E_LOG"; }; then
+  || [ "$missing_stage" = 1 ]; }; then
   echo "a stage failed or never ran" >&2
   status=1
 fi

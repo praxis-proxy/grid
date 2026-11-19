@@ -221,7 +221,7 @@ tests:
             value: "swim-a.elb.example.com:7946,swim-b.elb.example.com:7946"
       - template: templates/gridnetwork.yaml
         equal:
-          path: spec.seeds
+          path: spec.membership.swim.seeds
           value: ["swim-a.elb.example.com:7946", "swim-b.elb.example.com:7946"]
 
   - it: lets explicit seeds and ranges override peers

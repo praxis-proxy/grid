@@ -393,6 +393,7 @@ mod tests {
             },
             revision_renewer: None,
             departed: crate::swim_runtime::Departed::Evict,
+            dead_member_ttl: crate::swim_runtime::DEFAULT_DEAD_MEMBER_TTL,
         })
         .await?)
     }

@@ -1,0 +1,21 @@
+[package]
+name = "grid-fips"
+description = "Startup verification of the host FIPS configuration for Grid binaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+runtime = ["dep:openssl", "dep:grid-openssl-fips"]
+
+[dependencies]
+openssl = { workspace = true, optional = true }
+grid-openssl-fips = { workspace = true, optional = true, features = ["runtime"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

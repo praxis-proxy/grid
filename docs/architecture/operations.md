@@ -106,9 +106,11 @@ The standalone install creates:
 | `NetworkPolicy` | `grid-operator` | `grid-system` (platform base only) |
 | `Deployment` | `grid-operator` | `grid-system` |
 
-The operator runs as a single binary with multiple
-controllers (one per CRD type) in the same process.  No
-SWIM runtime starts until a `GridNetwork` resource exists.
+The operator runs as a single binary with controllers for reconciled CRD types
+in the same process. `AgentToAgentProvider` is an experimental API-only
+contract, disabled from the default build and install; its controller is
+introduced by a follow-up task. No SWIM runtime starts until a `GridNetwork`
+resource exists.
 
 **Important**: AGN deploys only the operator and CRDs. Cluster lifecycle,
 Praxis AI gateways, inference runtimes, load-balancer integrations, and DNS
@@ -555,8 +557,11 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  seeds:
-    - "10.0.0.5:7946"
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - "10.0.0.5:7946"
   consumerGateways:
     - name: inference-gw
       namespace: praxis-system
@@ -579,7 +584,7 @@ The GridNetwork controller:
 
 ### CRD-driven seeds
 
-`spec.seeds` is **operator-consumed**: on every `GridNetwork` reconcile the
+`spec.membership.swim.seeds` is **operator-consumed**: on every `GridNetwork` reconcile the
 controller parses and resolves each entry independently, logs invalid or
 temporarily unresolvable entries at `warn`, retains successful addresses,
 removes the local advertise address to prevent self-announce noise,
@@ -595,7 +600,7 @@ reconcile, so dynamically added addresses take effect without an operator restar
 
 **Runtime update contract**
 
-| Change to `spec.seeds` | Effect |
+| Change to `spec.membership.swim.seeds` | Effect |
 |---|---|
 | Seed added | Announced to SWIM on the next reconcile; join initiated |
 | Seed removed | Logged; no active disconnect (SWIM failure detection ages the peer out naturally) |
@@ -612,7 +617,7 @@ membership until it stops responding to probes and is declared `Suspect` then
 
 The SWIM runtime is process-global: one UDP listener per operator process,
 shared across all `GridNetwork` reconciles.  Seeds from any
-`GridNetwork.spec.seeds` are announced to the same SWIM membership node.
+`GridNetwork.spec.membership.swim.seeds` are announced to the same SWIM membership node.
 This is site-membership bootstrap, not per-network membership isolation.
 CRDT provider records remain network-scoped separately.
 
@@ -1419,6 +1424,7 @@ Available commands:
 | `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
 | `cargo xtask env verify-swim-dns-hostnames` | Verifies hostname-based SWIM advertise/seeds, membership convergence, and CRDT provider-state propagation |
 | `cargo xtask env verify-operator-install-rbac` | Applies install manifests, runs positive/negative RBAC checks, proves minimal reconcile succeeds |
+| `cargo xtask env verify-local-site-status` | Verifies Local-membership site phase reasons (`GatewayAddressMissing`, `SignalsAddressMissing`), `NoDeclaredPeers` peer conditions, `Available=True`, `Degraded=False` rollup, condition clearing once an undialable peer is declared, then per-peer signals/catalog evidence and all five healthy network conditions from a real mTLS peer. Requires two configured kind clusters with no other operators or networks, plus a non-loopback host IPv4 address |
 | `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |
 
 ### Operator and SWIM local validation

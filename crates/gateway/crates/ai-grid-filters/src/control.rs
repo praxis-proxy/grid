@@ -160,6 +160,11 @@ impl Topology {
         let mut base = validate_serving_candidates(config.candidates.clone())?;
         for candidate in &mut base {
             candidate.dial = dials.get(&candidate.cluster).cloned();
+            candidate.sovereignty_zone = config
+                .sovereignty_zones
+                .get(&*candidate.site)
+                .and_then(|zone| grid_signals::zone::sovereignty_zone(zone))
+                .map(Arc::from);
         }
         let provider_hop_clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
         for candidate in &config.candidates {
@@ -826,10 +831,7 @@ fn identity_digest(
     identity: &GridIdentity,
     affinity: &AffinitySettings,
 ) -> [u8; 32] {
-    let mutual = dial
-        .dial
-        .values()
-        .any(|dial| matches!(dial.transport, DialTransport::MutualTls { .. }));
+    let presented = dial.dial.values().any(|dial| dial.transport.presents_identity());
     let paths: BTreeSet<&str> = config
         .peers
         .iter()
@@ -842,7 +844,7 @@ fn identity_digest(
                 .values()
                 .filter_map(|dial| dial.credential.as_ref().map(|credential| credential.path.as_str())),
         )
-        .chain(mutual.then(|| identity.paths()).into_iter().flatten())
+        .chain(presented.then(|| identity.paths()).into_iter().flatten())
         // A rotated tag key re-applies the config like a renewed certificate.
         .chain(affinity.tag_key_path.as_deref())
         .collect();
@@ -1000,6 +1002,7 @@ fn apply_file(
                 dial_bytes.map_or_else(|| Ok(DialConfig::default()), |dial| parse_dial_config(dial_path, dial))?;
             Ok((config, dial))
         });
+    let candidate_count = parsed.as_ref().ok().map(|(config, _)| config.candidates.len());
     let (result, settled) = match parsed {
         Ok((config, dial)) => {
             let mut control = control.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1017,7 +1020,31 @@ fn apply_file(
         Err(error) => (Err(error), true),
     };
     report(&result, tally, "grid: serving config reloaded");
+    // Record every valid content revision, including a semantically reused config. A
+    // projected ConfigMap can rewrite equivalent YAML with a new content digest; the
+    // control plane correctly keeps its pollers, but qualification and operators still
+    // need evidence that this revision was accepted by the gateway.
+    if result.is_ok()
+        && let Some(candidate_count) = candidate_count
+    {
+        report_serving_revision(bytes, candidate_count);
+    }
     settled
+}
+
+/// Report one serving revision after it has been accepted by the control plane.
+pub(crate) fn report_serving_revision(bytes: &[u8], candidate_count: usize) {
+    let mut revision = String::with_capacity(64);
+    for byte in certs::sha256(bytes) {
+        for nibble in [byte >> 4, byte & 0x0F] {
+            revision.push(char::from_digit(u32::from(nibble), 16).unwrap_or('0'));
+        }
+    }
+    tracing::info!(
+        revision = %revision,
+        candidate_count,
+        "grid_serving_revision_serving"
+    );
 }
 
 /// Re-apply the last good config, which restarts the pollers once its identity files change.
@@ -1198,6 +1225,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: "llama".to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
             weight: None,
@@ -1231,8 +1259,36 @@ mod tests {
             candidates: sites.iter().map(|site| candidate(site)).collect(),
             provider_hop_clusters: Vec::new(),
             provider_hop_sni: BTreeMap::new(),
+            sovereignty_zones: BTreeMap::new(),
             peers: sites.iter().map(|site| peer(site)).collect(),
         }
+    }
+
+    #[test]
+    fn each_candidate_takes_its_sites_zone_and_one_bad_zone_does_not_refuse_the_file() {
+        let mut config = config(&["east", "west", "north", "south"]);
+        config.sovereignty_zones = BTreeMap::from([
+            ("east".to_owned(), " EU ".to_owned()),
+            ("west".to_owned(), "eu west".to_owned()),
+            ("north".to_owned(), "us".to_owned()),
+            ("nowhere".to_owned(), "ch".to_owned()),
+        ]);
+        let topology = Topology::from_config(&config).expect("an invalid zone is not a config error");
+        let zones: BTreeMap<&str, Option<&str>> = topology
+            .base
+            .iter()
+            .map(|candidate| (&*candidate.site, candidate.sovereignty_zone.as_deref()))
+            .collect();
+        assert_eq!(
+            zones,
+            BTreeMap::from([
+                ("east", Some("eu")),
+                ("west", None),
+                ("north", Some("us")),
+                ("south", None),
+            ]),
+            "normalized; invalid or unlisted is none, which no fence admits"
+        );
     }
 
     #[test]
@@ -2432,6 +2488,52 @@ mod tests {
     }
 
     #[test]
+    fn a_local_tls_dial_presenting_the_identity_follows_a_rotated_identity() {
+        let dir = temp_dir("rotated-local");
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let first = write_identity(&dir, &ca);
+        let mut config = config(&["local"]);
+        config.peers.clear();
+        let mut dial = DialConfig::default();
+        dial.dial.insert(
+            "pool-local".to_owned(),
+            dial_spec(
+                "local",
+                DialTransport::Tls {
+                    ca_path: None,
+                    present_identity: true,
+                    sni: "serving.models.svc".to_owned(),
+                },
+            ),
+        );
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &dial).expect("applies");
+        let snapshot = control.snapshot();
+        let leaf = |pem: &str| {
+            rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+                .next()
+                .expect("a leaf")
+                .expect("parses")
+                .to_vec()
+        };
+        assert_eq!(
+            presented(&snapshot.load(), "pool-local"),
+            Some(leaf(&first)),
+            "a server TLS dial told to present the identity presents this site's leaf"
+        );
+
+        let renewed = write_identity(&dir, &ca);
+        let control = Mutex::new(control);
+        renew_identity(&control, &WatchCounts::default());
+        assert_eq!(
+            presented(&snapshot.load(), "pool-local"),
+            Some(leaf(&renewed)),
+            "with no mutual TLS dial in the file, the identity is still watched and the renewed leaf presented"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_dial_violating_a_trust_rule_keeps_the_last_good_config() {
         let dir = temp_dir("violation");
         write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
@@ -2565,6 +2667,7 @@ mod tests {
             "local-tls",
             DialTransport::Tls {
                 ca_path: None,
+                present_identity: false,
                 sni: "models.local.example.com".to_owned(),
             },
         );
@@ -2582,6 +2685,7 @@ mod tests {
                 "east",
                 DialTransport::Tls {
                     ca_path: None,
+                    present_identity: false,
                     sni: "east.example.com".to_owned(),
                 },
             ),

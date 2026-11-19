@@ -123,6 +123,9 @@ struct AppState {
 /// Top-level error for the sidecar binary.
 #[derive(Debug)]
 enum StartupError {
+    /// The FIPS build cannot establish the required runtime configuration.
+    #[cfg(feature = "fips")]
+    Fips(grid_fips::FipsError),
     /// Cannot create a Kubernetes client.
     KubeClient(kube::Error),
 }
@@ -130,6 +133,8 @@ enum StartupError {
 impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "fips")]
+            Self::Fips(error) => write!(f, "{error}"),
             Self::KubeClient(e) => write!(f, "cannot create Kubernetes client: {e}"),
         }
     }
@@ -144,6 +149,12 @@ async fn main() -> Result<(), StartupError> {
     let cli = Cli::parse();
     init_tracing();
     version::get().log_startup("grid-overlay-sync");
+    #[cfg(feature = "fips")]
+    grid_fips::verify()
+        .inspect_err(|error| {
+            tracing::error!(%error, "refusing to start the FIPS overlay-sync");
+        })
+        .map_err(StartupError::Fips)?;
     run(cli).await
 }
 
@@ -160,7 +171,9 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
     let (watcher_config, metrics, status) = build_config(&cli);
     ensure_output_dir(&cli.output);
     watcher::restore_last_known_good(&watcher_config, &status, &metrics);
-    let client = kube::Client::try_default().await.map_err(StartupError::KubeClient)?;
+    let client = Box::pin(kube::Client::try_default())
+        .await
+        .map_err(StartupError::KubeClient)?;
 
     if cli.once {
         watcher::initial_fetch_until_ready(&client, &watcher_config, &status, &metrics).await;

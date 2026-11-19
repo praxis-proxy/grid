@@ -133,13 +133,14 @@ tests:
           path: spec.endpoints[0].scrapeTimeout
           value: "5s"
 
-  - it: refuses the listener without the NetworkPolicy
+  - it: serves the listener without the NetworkPolicy
     template: templates/deployment.yaml
     set:
       networkPolicy.enabled: false
     asserts:
-      - failedTemplate:
-          errorPattern: "metricsListener needs networkPolicy.enabled"
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env[?(@.name == "GRID_METRICS_ADDR")].value
+          value: "0.0.0.0:9443"
 
   - it: refuses the listener without a cert
     template: templates/deployment.yaml

@@ -31,7 +31,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 mod cross_site;
-mod learned_ceiling;
+mod site_saturation;
 
 use super::{
     DemoMode, GlbDemoOptions, certs, glb, kubectl, operator,
@@ -277,8 +277,6 @@ impl ScoringFlavor {
 
 /// Demo execution context holding resolved paths.
 struct DemoContext {
-    /// Directory where this run's structured evidence is written.
-    evidence_dir: PathBuf,
     /// Path to the resolved Forge config.
     resolved_config: PathBuf,
     /// Per-run Forge state directory, kept beside the run's evidence.
@@ -481,7 +479,6 @@ pub(crate) fn run(
 
     let context = prepare_setup(
         forge_config,
-        &evidence_dir,
         &evidence_dir.join("forge-state"),
         &run_id,
         metrics_transport,
@@ -666,7 +663,6 @@ fn write_transition_timeline(
 )]
 fn prepare_setup(
     forge_config: &Path,
-    evidence_dir: &Path,
     forge_state_dir: &Path,
     run_id: &str,
     metrics_transport: MetricsTransport,
@@ -692,7 +688,6 @@ fn prepare_setup(
         .into();
 
     Ok(DemoContext {
-        evidence_dir: evidence_dir.to_path_buf(),
         resolved_config,
         forge_state_dir: forge_state_dir.to_path_buf(),
         forge_bin,
@@ -990,7 +985,8 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
         // Proof 5: EPP metrics cross the operator poll relay and drive the
         // embedded Grid Gateway's live site route without a gateway restart.
         results.insert("cross_site_signal_poll".to_owned(), cross_site::proof(context));
-        results.insert("learned_ceiling_lifecycle".to_owned(), learned_ceiling::proof(context));
+        // Proof 6: llm-d sites are read by their saturation and weighed by ready units.
+        results.insert("site_saturation".to_owned(), site_saturation::proof(context));
     }
 
     // TLS proof stages, only in mTLS mode

@@ -25,6 +25,11 @@ use tracing::info;
 mod metrics_listener;
 mod provider_preflight;
 
+/// glibc keeps freed stream buffers resident; musl returns them and needs no change.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Log line emitted once tracing is up; the startup test waits for it.
 const STARTUP_MESSAGE: &str = "starting grid-gateway";
 /// OTel-standard environment variable used as the OTLP endpoint fallback.
@@ -265,7 +270,7 @@ fn start_grid_routing(
     binding: ai_grid_filters::Binding,
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
-    let config = ai_grid_filters::load_serving_config(path)?;
+    let (config, initial_bytes) = ai_grid_filters::load_serving_config_with_bytes(path)?;
     let dial = ai_grid_filters::load_dial_config(&ai_grid_filters::dial_config_path(std::path::Path::new(path)))
         .unwrap_or_else(|error| {
             tracing::warn!(%error, "grid: dial file unreadable at startup; serving without dials");
@@ -273,6 +278,7 @@ fn start_grid_routing(
         });
     // The grid TLS mount, never the serving config: a dial presents only the identity mounted for it.
     let binding = ai_grid_filters::Binding {
+        backend_ca_base: backend_ca_base(),
         credential_base: credential_base(),
         grid_identity: grid_identity(),
         ..binding
@@ -285,6 +291,10 @@ fn start_grid_routing(
         runtime.health(),
         runtime.tuning(),
     )?;
+    // Report the exact revision already accepted by `spawn_grid_routing` before the watcher can
+    // observe a later projected ConfigMap revision. Subsequent receipts are emitted only after
+    // `apply_file` accepts their own bytes.
+    ai_grid_filters::report_serving_revision(&initial_bytes, config.candidates.len());
     // The operator rewrites the file on membership and topology changes.
     runtime
         .watch(path, SERVING_RELOAD_INTERVAL)
@@ -304,6 +314,7 @@ fn start_provider(
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<(ai_grid_filters::ProviderRuntime, String), praxis_filter::FilterError> {
     let binding = ai_grid_filters::Binding {
+        backend_ca_base: backend_ca_base(),
         credential_base: credential_base(),
         grid_identity: grid_identity(),
         // Captured once: praxis applies insecure options only at startup.
@@ -316,6 +327,11 @@ fn start_provider(
         .map_err(|err| -> praxis_filter::FilterError { format!("grid: watching {}: {err}", path.display()).into() })?;
     ai_grid_filters::register_provider_filter(registry, runtime.snapshot())?;
     Ok((runtime, grid_ca))
+}
+
+/// Where backend CA bundles are mounted: `GRID_BACKEND_CA_DIR`, else the default mount.
+fn backend_ca_base() -> std::path::PathBuf {
+    std::env::var_os("GRID_BACKEND_CA_DIR").map_or_else(|| ai_grid_filters::BACKEND_CA_BASE.into(), Into::into)
 }
 
 /// Where dial credentials are mounted: `GRID_CREDENTIAL_DIR`, else the default mount.

@@ -20,15 +20,16 @@ spec:
   gridId: {{ .Values.gridNetwork.gridId | quote }}
   membership:
     mode: {{ .Values.grid.membership.source | quote }}
+    {{- with .Values.gridNetwork.seeds }}
+    swim:
+      seeds:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
   {{- with .Values.gridNetwork.region }}
   region: {{ . | quote }}
   {{- end }}
   {{- with .Values.gridNetwork.zone }}
   zone: {{ . | quote }}
-  {{- end }}
-  {{- with .Values.gridNetwork.seeds }}
-  seeds:
-    {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- with .Values.gridNetwork.routingPolicy }}
   routingPolicy: {{ . | quote }}
@@ -73,10 +74,6 @@ spec:
   {{- end }}
   {{- with .Values.gridNetwork.budgetPolicy }}
   budgetPolicy:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- with .Values.gridNetwork.swim }}
-  swim:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- with .Values.gridNetwork.tls }}

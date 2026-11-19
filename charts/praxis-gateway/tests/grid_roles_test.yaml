@@ -37,7 +37,7 @@ tests:
           path: data["praxis.yaml"]
           pattern: '(?s)peer_identity_trust.*- filter: rate_limit\s+mode: global\s+rate: 20\s+burst: 40.*- filter: router'
 
-  - it: the router forwards only the allowed paths, matched exactly
+  - it: the static provider router forwards only configured exact paths
     template: templates/gateway-config.yaml
     set:
       praxisConfig.render.provider.allowedPaths: ["/v1/models"]

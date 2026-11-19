@@ -176,6 +176,30 @@ const (
 	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterGridSiteRoute    GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "gridSiteRoute"
 )
 
+// GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode is a string enumeration.
+type GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode string
+
+const (
+	GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyModeEnforce GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode = "enforce"
+	GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyModeAudit   GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode = "audit"
+)
+
+// GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback is a string enumeration.
+type GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback string
+
+const (
+	GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallbackAllow GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback = "allow"
+	GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallbackDeny  GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback = "deny"
+)
+
+// GridNetworkConsumerGatewaysItemRegionalPolicyMode is a string enumeration.
+type GridNetworkConsumerGatewaysItemRegionalPolicyMode string
+
+const (
+	GridNetworkConsumerGatewaysItemRegionalPolicyModeAffinity GridNetworkConsumerGatewaysItemRegionalPolicyMode = "affinity"
+	GridNetworkConsumerGatewaysItemRegionalPolicyModeLocked   GridNetworkConsumerGatewaysItemRegionalPolicyMode = "locked"
+)
+
 // GridNetworkMembershipMode is a string enumeration.
 type GridNetworkMembershipMode string
 
@@ -524,6 +548,16 @@ type GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation struct {
 	Enabled bool `json:"enabled,omitempty"`
 }
 
+// GridNetworkConsumerGatewaysItemPraxisConfigSovereignty The sovereignty fence gridSiteRoute applies: the header naming the zones a request may be served in, and whether it refuses or only audits. Admission rejects it under any other router.
+// Default: unset, no fence.
+type GridNetworkConsumerGatewaysItemPraxisConfigSovereignty struct {
+	// Request header naming the zones a request may be served in: one zone, or a comma-separated list in a single header line, matched against each GridSite sovereigntyZone. The upstream that sets it must replace, never append to, a caller's copy.
+	Header string `json:"header"`
+	// What the fence does with a request it does not admit.
+	// Default: enforce.
+	Mode GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode `json:"mode,omitempty"`
+}
+
 // GridNetworkConsumerGatewaysItemPraxisConfigTelemetry Optional OpenTelemetry exporter and sampling settings for this gateway.
 // When present, the generated Praxis configuration opts into telemetry and adds the trace_context filter for outbound W3C header propagation. Collector authentication must be provided to the gateway Deployment via OTEL_EXPORTER_OTLP_HEADERS from a Secret; credentials are never copied into this ConfigMap.
 type GridNetworkConsumerGatewaysItemPraxisConfigTelemetry struct {
@@ -580,6 +614,9 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// gridSiteRoute reads the serving config, so it needs the operator's poll signal transport. It also needs an enabled mountReconciliation, whose rollout per config revision re-reads the provider-hop backends, and an empty providerHopEndpoints, since hops follow clusterEndpoints. Every cluster is health-checked, so the gateway's readiness probe must ask Praxis /healthy: /ready fails while any one site is down.
 	// Default: intelligentRoute.
 	SiteRouter GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter `json:"siteRouter,omitempty"`
+	// The sovereignty fence gridSiteRoute applies: the header naming the zones a request may be served in, and whether it refuses or only audits. Admission rejects it under any other router.
+	// Default: unset, no fence.
+	Sovereignty *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty `json:"sovereignty,omitempty"`
 	// Declare that the running consumer has the dynamic credential_inject filter configured with the projected Secret mount root. This is a fail-closed capability gate for credential-bearing overlay revisions. Set it only after the consumer has loaded a config containing that filter; the Grid operator does not own or roll out the consumer Deployment.
 	// Default: false.
 	SupportsProjectedCredentials bool `json:"supportsProjectedCredentials,omitempty"`
@@ -607,6 +644,27 @@ type GridNetworkConsumerGatewaysItemProviderHopEndpointsItem struct {
 	Transport EndpointTransport `json:"transport"`
 }
 
+// GridNetworkConsumerGatewaysItemRegionalPolicy Regional eligibility and preference policy for this gateway's overlay.
+// The policy applies to every capability rendered for this gateway. When absent, Grid preserves the existing unconstrained routing behavior. Per-route overrides are outside this contract.
+type GridNetworkConsumerGatewaysItemRegionalPolicy struct {
+	// Unordered hard region allowlist for locked mode.
+	// This Kubernetes set contains 1–64 non-empty values without whitespace, each at most 253 characters.
+	AllowedRegions []string `json:"allowedRegions,omitempty"`
+	// Independent hard sovereignty-zone allowlist for either mode.
+	// Values use the [GridSite] sovereigntyZone token format. Matching uses the shared canonical form and is case-insensitive.
+	// [GridSite]: crate::crd::grid_site::GridSite
+	AllowedSovereigntyZones []string `json:"allowedSovereigntyZones,omitempty"`
+	// Whether affinity routing may consider candidates outside preferred regions.
+	CrossRegionFallback *GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback `json:"crossRegionFallback,omitempty"`
+	// Whether regions are preferred or form a hard eligibility boundary.
+	Mode GridNetworkConsumerGatewaysItemRegionalPolicyMode `json:"mode"`
+	// Unordered preferred-region set for affinity mode.
+	// This Kubernetes set contains 1–64 non-empty values without whitespace, each at most 253 characters.
+	// When absent, the operator derives the preferred region from the trusted [GridSite] resolved through [GatewayRef::site_name].
+	// [GridSite]: crate::crd::grid_site::GridSite
+	PreferredRegions []string `json:"preferredRegions,omitempty"`
+}
+
 // GridNetworkConsumerGatewaysItem Reference to a Praxis Gateway that participates in this grid.
 type GridNetworkConsumerGatewaysItem struct {
 	// Model-discovery contract version supported by the running gateway.
@@ -622,6 +680,9 @@ type GridNetworkConsumerGatewaysItem struct {
 	PraxisConfig *GridNetworkConsumerGatewaysItemPraxisConfig `json:"praxisConfig,omitempty"`
 	// Explicit mTLS provider-hop endpoints for the embedded grid-gateway serving config. With the default praxisConfig.siteRouter intelligentRoute this allowlist is independent of praxisConfig, so a missing or disabled generated Praxis config cannot alter embedded serving behavior. With gridSiteRoute the hops are the generated config's mutual TLS endpoints instead, and this must be empty. Every entry must declare mutual_tls and a nonblank SNI. The embedded gateway compares each declaration against the loaded Praxis load-balancer's verified mTLS backend before it sends provider-hop context. Changing Praxis backend transport requires a gateway restart while gridServing is enabled.
 	ProviderHopEndpoints []GridNetworkConsumerGatewaysItemProviderHopEndpointsItem `json:"providerHopEndpoints,omitempty"`
+	// Regional eligibility and preference policy for this gateway's overlay.
+	// The policy applies to every capability rendered for this gateway. When absent, Grid preserves the existing unconstrained routing behavior. Per-route overrides are outside this contract.
+	RegionalPolicy *GridNetworkConsumerGatewaysItemRegionalPolicy `json:"regionalPolicy,omitempty"`
 	// Local site name for the intelligent_route overlay generated for this gateway.
 	// Identifies which [GridSite] this gateway's cluster represents. Praxis uses local_site to score candidates running on the same site higher than remote candidates.
 	// When absent, the [GridNetwork] metadata name is used as a fallback. This is correct for single-site networks where the network name and site name are the same. Multi-site networks should set this to the [GridSite] name for the cluster hosting this gateway.
@@ -638,10 +699,18 @@ type GridNetworkConsumerGatewaysItem struct {
 	LocalSiteName *string `json:"localSiteName,omitempty"`
 }
 
+// GridNetworkMembershipSWIM SWIM seed peers used when mode is Swim.
+type GridNetworkMembershipSWIM struct {
+	// SWIM peer endpoints in host:port form. Literal IPv4, bracketed IPv6, and DNS hostnames are accepted.
+	Seeds []string `json:"seeds,omitempty"`
+}
+
 // GridNetworkMembership Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
 type GridNetworkMembership struct {
 	// Membership source. Local requires signalTransport.mode: poll.
 	Mode GridNetworkMembershipMode `json:"mode"`
+	// SWIM seed peers used when mode is Swim.
+	SWIM *GridNetworkMembershipSWIM `json:"swim,omitempty"`
 }
 
 // GridNetworkPeerTrust Grid-wide peer trust: signals-path mode, pin when absent, read at operator start; signed state, read each reconcile.
@@ -682,16 +751,6 @@ type GridNetworkSignalTransport struct {
 	Mode SignalMode `json:"mode"`
 }
 
-// GridNetworkSWIM SWIM protocol configuration.
-type GridNetworkSWIM struct {
-	// Fanout for indirect probes.
-	GossipNodes *int64 `json:"gossipNodes,omitempty"`
-	// WAN probe interval (e.g. "5s").
-	ProbeInterval *string `json:"probeInterval,omitempty"`
-	// Suspicion timeout before declaring dead (e.g. "10s").
-	SuspicionTimeout *string `json:"suspicionTimeout,omitempty"`
-}
-
 // GridNetworkTLS TLS secret references for grid certificate management.
 type GridNetworkTLS struct {
 	// Secret storing the grid CA certificate and key.
@@ -705,7 +764,7 @@ type GridNetworkTLS struct {
 }
 
 // GridNetworkSpec Specification for a [GridNetwork].
-// Defines the grid's seed peers, gateway associations, SWIM tuning, and TLS secret references.
+// Defines the grid's gateway associations, membership, and TLS secret references.
 type GridNetworkSpec struct {
 	// Provider admission and pressure-recovery policy.
 	// When omitted, Grid preserves the historical instantaneous admission behaviour and providers without metrics remain eligible. Stabilized pressure transitions require an active metrics scoring strategy and a matching provider signal name. Without those, the observation is NotConfigured and the provider remains new_and_existing; the missingMetrics policy applies only after a configured signal is missing or stale.
@@ -737,8 +796,6 @@ type GridNetworkSpec struct {
 	// **Default (absent):** the noMetrics strategy is used.
 	// See [ScoringStrategy] for the available provider-level strategies.
 	ScoringPolicy *GridNetworkScoringPolicy `json:"scoringPolicy,omitempty"`
-	// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed IPv6, and DNS hostnames are accepted.
-	Seeds []string `json:"seeds,omitempty"`
 	// Local request distribution policy for the active selection group.
 	// This is independent of scoring. When absent, the overlay carries no selection override and Praxis uses deterministic selection.
 	SelectionPolicy *GridNetworkSelectionPolicy `json:"selectionPolicy,omitempty"`
@@ -753,8 +810,6 @@ type GridNetworkSpec struct {
 	// **Minimum value:** 1 second. The generated CRD schema rejects 0. The controller still treats an internally observed 0 as absent defensively, avoiding accidental immediate eviction if malformed data is deserialized outside the Kubernetes API path.
 	// A conservative starting value for production is 3600 (one hour), which allows short failures to recover without overlay churn while still bounding accumulation of truly dead peers.
 	StaleCandidateTTLSeconds *int64 `json:"staleCandidateTtlSeconds,omitempty"`
-	// SWIM protocol configuration.
-	SWIM *GridNetworkSWIM `json:"swim,omitempty"`
 	// TLS secret references for grid certificate management.
 	TLS *GridNetworkTLS `json:"tls,omitempty"`
 	// Availability zone.
@@ -789,7 +844,7 @@ type GridNetworkGatewayAgeReportsItem struct {
 	Replica string `json:"replica"`
 	// Original wire flag, retained to verify exact duplicates.
 	ReportedRejected bool `json:"reportedRejected"`
-	// Last durably accepted sequence.
+	// Last durably recorded sequence; live sequence watermarks are process-local.
 	Sequence int64 `json:"sequence"`
 	// Cumulative skew rejection count.
 	Skew int64 `json:"skew"`
@@ -966,7 +1021,7 @@ type GridSiteSpec struct {
 	// Where this site serves its signals, where its gateway endpoint does not say.
 	// Absent, signals are polled at the gateway endpoint's host under the server name <site>-signals.grid.internal, at the operator's signals port setting or the gateway's.
 	SignalsEndpoint *GridSiteSignalsEndpoint `json:"signalsEndpoint,omitempty"`
-	// Sovereignty zone for data residency constraints.
+	// Sovereignty zone for data residency constraints, matched case-insensitively by a grid_site_route fence. Every provider on the site is in it.
 	SovereigntyZone *string `json:"sovereigntyZone,omitempty"`
 	// Trust policy for this site.
 	// When configured, the operator verifies the received public certificate against this policy before promoting the site to Active. If absent, the site remains Connecting with reason TrustMaterialMissing regardless of certificate material.

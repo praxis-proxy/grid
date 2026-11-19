@@ -12,9 +12,29 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
 {{- $hasBatchSize := and (hasKey $telemetry "batchSize") (ne $telemetry.batchSize nil) }}
 {{- $hasTelemetryValues := or $telemetry.otlpEndpoint $hasSamplingRate $telemetry.serviceName $telemetry.serviceVersion $telemetry.environment $hasBatchInterval $hasBatchSize }}
   praxis.yaml: |
-    {{- with $.Values.upstreamCA.secretName }}
+    {{- $runtime := $cfg.runtime | default dict }}
+    {{- if or $.Values.upstreamCA.secretName $runtime.upstreamKeepalivePoolSize }}
     runtime:
+      {{- with $.Values.upstreamCA.secretName }}
       upstream_ca_file: {{ printf "%s/%s" $.Values.upstreamCA.mountPath ($.Values.upstreamCA.key | default "ca.crt") | quote }}
+      {{- end }}
+      {{- with $runtime.upstreamKeepalivePoolSize }}
+      upstream_keepalive_pool_size: {{ . | int64 }}
+      {{- end }}
+    {{- end }}
+    {{- with $cfg.bodyLimits }}
+    {{- if or .maxRequestBytes .maxResponseBytes .maxBufferBytes }}
+    body_limits:
+      {{- with .maxRequestBytes }}
+      max_request_bytes: {{ . | int64 }}
+      {{- end }}
+      {{- with .maxResponseBytes }}
+      max_response_bytes: {{ . | int64 }}
+      {{- end }}
+      {{- with .maxBufferBytes }}
+      max_buffer_bytes: {{ . | int64 }}
+      {{- end }}
+    {{- end }}
     {{- end }}
     {{- if $telemetry.enabled }}
     telemetry:
@@ -91,7 +111,11 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- /* First, and the only filter that picks an upstream: the gateway refuses to start otherwise. */}}
           - filter: grid_provider
             allowed_paths:
-              {{- range (($cfg.provider).allowedPaths | default (list "/v1/chat/completions" "/v1/completions" "/v1/models" "/v1/embeddings")) }}
+              {{- range (($cfg.provider).allowedPaths | default (list "/v1/chat/completions" "/v1/completions" "/v1/models" "/v1/embeddings" "/v1/messages" "/v1/responses" "/v1/conversations")) }}
+              - {{ . | quote }}
+              {{- end }}
+            allowed_path_prefixes:
+              {{- range (($cfg.provider).allowedPathPrefixes | default (list "/v1/conversations/")) }}
               - {{ . | quote }}
               {{- end }}
           {{- with ($cfg.peerTrust).rateLimit }}
@@ -132,10 +156,11 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
             conditions:
               - unless:
                   methods: [GET, POST]
-          # Exact paths: a traversal or a longer path never matches, so it gets a 404.
+          # The static provider admits only exact paths. The operator-managed
+          # `grid_provider` filter owns and validates Conversation prefixes.
           - filter: router
             routes:
-              {{- range (($cfg.provider).allowedPaths | default (list "/v1/chat/completions" "/v1/completions" "/v1/models" "/v1/embeddings")) }}
+              {{- range (($cfg.provider).allowedPaths | default (list "/v1/chat/completions" "/v1/completions" "/v1/models" "/v1/embeddings" "/v1/messages" "/v1/responses" "/v1/conversations")) }}
               - path: {{ . | quote }}
                 cluster: {{ (first $cfg.backends).cluster | quote }}
               {{- end }}
@@ -170,6 +195,13 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
               {{- else }} []
               {{- end }}
             {{- with ($.Values.praxisConfig.render.gridServing).siteRoute }}
+            {{- with .sovereignty }}
+            {{- if .header }}
+            sovereignty:
+              header: {{ .header | quote }}
+              mode: {{ .mode | default "enforce" }}
+            {{- end }}
+            {{- end }}
             {{- with .availability }}
             availability:
               {{- toYaml . | nindent 14 }}
@@ -193,7 +225,7 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           - filter: load_balancer
             clusters:
               {{- range $i, $backend := $cfg.backends }}
-              {{- include "praxis-gateway.backendCluster" (dict "root" $ "i" $i "b" $backend) | trim | nindent 14 }}
+              {{- include "praxis-gateway.backendCluster" (dict "root" $ "i" $i "b" $backend "inline" true) | trim | nindent 14 }}
               {{- end }}
           {{- end }}
   {{- if $apiKey }}
@@ -291,6 +323,7 @@ load_balancer, which selects by the same name and endpoint order.
   {{- with $total }}
   total_connection_timeout_ms: {{ . }}
   {{- end }}
+  {{- if not (.inline | default false) }}
   health_check:
     {{- /* TLS backends default to a tcp probe. The active http probe is plaintext and cannot reach a TLS peer. A tcp connect works and still satisfies the present-health_check SSRF-skip guard. */}}
     {{- $hcType := $hc.type | default (ternary "http" "tcp" (eq $mode "plaintext")) }}
@@ -305,4 +338,5 @@ load_balancer, which selects by the same name and endpoint order.
     {{- /* Passive checks mark an endpoint that refuses or fails requests down within a few of them. */}}
     passive_unhealthy_threshold: {{ $hc.passiveUnhealthyThreshold | default 2 }}
     passive_healthy_threshold: {{ $hc.passiveHealthyThreshold | default 2 }}
+  {{- end }}
 {{- end }}

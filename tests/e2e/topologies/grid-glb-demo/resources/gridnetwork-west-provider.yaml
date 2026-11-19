@@ -8,14 +8,13 @@ spec:
   gridId: grid-glb-demo-v1
   region: west
   zone: west-provider-1
-  seeds:
-    - "{{ captures.east-edge.swim-lb-ip }}:7946"
-    - "{{ captures.east-provider.swim-lb-ip }}:7946"
-    - "{{ captures.west-edge.swim-lb-ip }}:7946"
-  swim:
-    probeInterval: "5s"
-    suspicionTimeout: "15s"
-    gossipNodes: 3
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - "{{ captures.east-edge.swim-lb-ip }}:7946"
+        - "{{ captures.east-provider.swim-lb-ip }}:7946"
+        - "{{ captures.west-edge.swim-lb-ip }}:7946"
   tls:
     caSecretRef: null
     siteSecretRef:

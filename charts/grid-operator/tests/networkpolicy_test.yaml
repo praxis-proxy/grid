@@ -101,9 +101,26 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: refuses an empty peer list, which would admit every pod
+  - it: falls back to the OpenShift monitoring namespaces when forced on with no metricsFrom
     set:
       networkPolicy.enabled: true
-      networkPolicy.metricsFrom: []
     asserts:
-      - failedTemplate: {}
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: openshift-user-workload-monitoring } }
+            - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: openshift-monitoring } }
+            - podSelector: { matchLabels: { app.kubernetes.io/instance: gop, app.kubernetes.io/component: helm-test } }
+
+  - it: keeps a custom selector on OpenShift instead of the default
+    capabilities:
+      apiVersions: [security.openshift.io/v1]
+    set:
+      networkPolicy.metricsFrom:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+    asserts:
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+            - podSelector: { matchLabels: { app.kubernetes.io/instance: gop, app.kubernetes.io/component: helm-test } }

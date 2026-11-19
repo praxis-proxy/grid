@@ -200,8 +200,16 @@ mod tests {
                 "request-derived site: {series}"
             );
             assert!(
-                ["routed", "fallback", "not_ready", "no_route", "bad_request", "shed"]
-                    .contains(&label("reason").as_str()),
+                [
+                    "routed",
+                    "fallback",
+                    "not_ready",
+                    "no_route",
+                    "bad_request",
+                    "shed",
+                    "fenced"
+                ]
+                .contains(&label("reason").as_str()),
                 "reason outside the closed set: {series}"
             );
         }

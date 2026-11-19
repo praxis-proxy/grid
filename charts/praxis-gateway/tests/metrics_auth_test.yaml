@@ -1,0 +1,146 @@
+suite: metrics authorization resources
+templates:
+  - templates/metrics-auth.yaml
+  - templates/deployment.yaml
+  - templates/rolebinding.yaml
+  - templates/servicemonitor.yaml
+release:
+  name: gw
+  namespace: grid
+set:
+  image.flavor: grid-gateway
+  metricsListener.enabled: true
+  metricsListener.existingSecret: gateway-metrics-tls
+  metricsListener.serviceMonitor.enabled: true
+  metricsListener.serviceMonitor.caConfigMap.name: service-ca
+  metricsListener.serviceMonitor.caConfigMap.key: service-ca.crt
+tests:
+  - it: renders the authorization and scraper resources with shared names
+    asserts:
+      - hasDocuments:
+          count: 7
+        template: templates/metrics-auth.yaml
+      - isKind:
+          of: ServiceAccount
+        documentIndex: 0
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: metadata.name
+          value: gw-praxis-gateway-metrics-auth
+        documentIndex: 0
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: metadata.name
+          value: gw-praxis-gateway-metrics-scraper
+        documentIndex: 1
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: metadata.name
+          value: gw-praxis-gateway-metrics-token
+        documentIndex: 2
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: metadata.annotations["kubernetes.io/service-account.name"]
+          value: gw-praxis-gateway-metrics-scraper
+        documentIndex: 2
+        template: templates/metrics-auth.yaml
+      - isKind:
+          of: ClusterRole
+        documentIndex: 3
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [authentication.k8s.io]
+              resources: [tokenreviews]
+              verbs: [create]
+            - apiGroups: [authorization.k8s.io]
+              resources: [subjectaccessreviews]
+              verbs: [create]
+        documentIndex: 3
+        template: templates/metrics-auth.yaml
+      - isKind:
+          of: ClusterRoleBinding
+        documentIndex: 4
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: roleRef.name
+          value: gw-praxis-gateway-metrics-auth-1516de05
+        documentIndex: 4
+        template: templates/metrics-auth.yaml
+      - isKind:
+          of: Role
+        documentIndex: 5
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: metadata.name
+          value: gw-praxis-gateway-metrics-scrape
+        documentIndex: 5
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: rules[0].resources
+          value: [scrapes]
+        documentIndex: 5
+        template: templates/metrics-auth.yaml
+      - isKind:
+          of: RoleBinding
+        documentIndex: 6
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: roleRef.name
+          value: gw-praxis-gateway-metrics-scrape
+        documentIndex: 6
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: subjects[0].name
+          value: gw-praxis-gateway-metrics-scraper
+        documentIndex: 6
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: gw-praxis-gateway-metrics-auth
+        template: templates/deployment.yaml
+      - equal:
+          path: spec.endpoints[0].authorization.credentials.name
+          value: gw-praxis-gateway-metrics-token
+        template: templates/servicemonitor.yaml
+
+  - it: preserves suffixes and DNS length limits for long release names
+    set:
+      fullnameOverride: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      overlay.configMapName: gateway-overlay
+      grid.networkName: test-network
+      grid.siteName: test-site
+    asserts:
+      - equal:
+          path: metadata.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-metrics-auth
+        documentIndex: 0
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: metadata.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-metrics-scraper
+        documentIndex: 1
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: metadata.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-metrics-token
+        documentIndex: 2
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: metadata.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-metrics-scrape
+        documentIndex: 5
+        template: templates/metrics-auth.yaml
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-metrics-auth
+        template: templates/deployment.yaml
+      - equal:
+          path: spec.endpoints[0].authorization.credentials.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-metrics-token
+        template: templates/servicemonitor.yaml
+      - equal:
+          path: subjects[0].name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-metrics-auth
+        template: templates/rolebinding.yaml
