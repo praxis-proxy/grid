@@ -80,8 +80,8 @@ prefix_affinity:
 | `exploration` | 0.02 | Share of requests that skip affinity. Higher spreads a shared prompt sooner and costs more cache misses. |
 | `capacity` | 16384 | Maximum entries in each backend cluster's LRU, per gateway replica. Must be a positive integer. See [Memory sizing](#memory-sizing). |
 | `ttl_secs` | 600 | Lifetime after a successful response confirms an entry, in seconds. Must be a positive integer. |
-| `prefill_tokens_per_second` | 10000 | Prices the prefill a match saves. Lower makes a match worth more queue. |
-| `queued_request_seconds` | 2 | Seconds one queued request adds to a new request's wait. Lower lets a sticky site queue deeper. |
+| `prefill_tokens_per_second` | 10000 | Prices the prefill a match saves. Lower makes a match worth more queue. Use a finite value greater than zero. |
+| `queued_request_seconds` | 2 | Estimated wait added per queued request. Set to zero to skip the queue-cost comparison during prefix-affinity routing. Zero can keep a prefix match even when queue depth is unknown. Eligibility, admission and pressure tiers still apply. Use a finite value of zero or greater. |
 | `tag_key_path` | none | A file holding at least 32 bytes that authenticate stored-state tags. Set it in production. A changed file re-applies the config. |
 
 Each backend cluster has its own LRU, so traffic to one cluster cannot evict

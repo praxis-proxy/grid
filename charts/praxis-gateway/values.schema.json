@@ -1020,7 +1020,9 @@
                           "type": "number"
                         },
                         "queued_request_seconds": {
-                          "type": "number"
+                          "type": "number",
+                          "minimum": 0,
+                          "description": "Seconds added per queued request. Set to zero to skip the queue-cost comparison during prefix-affinity routing."
                         },
                         "tag_key_path": {
                           "type": [
