@@ -16,6 +16,12 @@ pub const VERSION_HEADER: &str = "x-grid-providers-version";
 /// Header naming the providers body's contract version on a providers answer.
 pub const CONTRACT_HEADER: &str = "x-grid-providers-contract";
 
+/// Header naming the additive source-ranked provider-admission contract.
+pub const ADMISSION_CONTRACT_HEADER: &str = "x-grid-provider-admission-contract";
+
+/// Source-ranked provider-admission extension understood by this release.
+pub const ADMISSION_CONTRACT_VERSION: u32 = 1;
+
 /// The providers contract this build writes, and the only major it reads.
 pub const CONTRACT_VERSION: u32 = 1;
 
@@ -83,6 +89,22 @@ pub struct WireProvider {
     pub match_labels: BTreeMap<String, String>,
     /// Monotonic per-site revision.
     pub revision: u64,
+    /// Kubernetes spec generation bound to the provider's signal samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_generation: Option<u64>,
+    /// Immutable serving-site order, absent on legacy or incomplete provider records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_rank: Option<AdmissionRank>,
+}
+
+/// Durable source identity used to select providers independently of receiver history.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionRank {
+    /// Kubernetes creation time in Unix nanoseconds.
+    pub created_at_ns: i128,
+    /// Immutable Kubernetes object UID.
+    pub uid: String,
 }
 
 impl From<crdt::ProviderState> for WireProvider {
@@ -98,11 +120,27 @@ impl From<crdt::ProviderState> for WireProvider {
             phase: state.phase,
             match_labels: state.access_policy.match_labels,
             revision: state.revision,
+            spec_generation: None,
+            admission_rank: None,
         }
     }
 }
 
 impl WireProvider {
+    /// Attach this provider's Kubernetes creation time and UID as its immutable source rank.
+    #[must_use]
+    pub fn ranked(mut self, rank: AdmissionRank) -> Self {
+        self.admission_rank = Some(rank);
+        self
+    }
+
+    /// Bind this provider's source-ranked catalog record to its signal generation.
+    #[must_use]
+    pub fn with_spec_generation(mut self, generation: u64) -> Self {
+        self.spec_generation = Some(generation);
+        self
+    }
+
     /// The provider state `site` serves, `None` for a record no candidate can use.
     #[must_use]
     pub fn into_state(self, site: &str) -> Option<crdt::ProviderState> {
@@ -175,6 +213,12 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The version value used to identify an exact provider body.
+#[must_use]
+pub fn body_version(body: &[u8]) -> String {
+    digest(body)
+}
+
 /// Who is reading this site's providers.
 #[derive(Clone, Copy, Debug)]
 pub enum Reader<'labels> {
@@ -210,15 +254,30 @@ pub struct Rendered {
     pub body: bytes::Bytes,
     /// A digest of exactly `body`.
     pub version: String,
+    /// The source-ranked admission extension, absent when any visible record lacks a rank.
+    pub admission_contract: Option<u32>,
+}
+
+/// Catalog body and its ranked-admission capability.
+struct RenderedBody {
+    /// The JSON body.
+    body: String,
+    /// The extension is present only when every visible source record is ranked.
+    admission_contract: Option<u32>,
 }
 
 /// Readers whose bodies are kept rendered; past it the kept ones are dropped and rendered again.
 const MAX_RENDERED: usize = 1024;
 
 impl LocalProviders {
-    /// Replace what `network` serves, ordered by provider so a capped body keeps the same records.
+    /// Replace what `network` serves, ordered by source rank and identity for stable capped bodies.
     pub fn replace(&self, network: &str, mut providers: Vec<WireProvider>) {
-        providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+        providers.sort_by(|a, b| {
+            a.admission_rank
+                .cmp(&b.admission_rank)
+                .then_with(|| a.network_id.cmp(&b.network_id))
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+        });
         let serialized = {
             let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
             if held.networks.get(network) == Some(&providers) {
@@ -273,8 +332,9 @@ impl LocalProviders {
         } else {
             let body = render_from(&held.networks, reader)?;
             let rendered = Rendered {
-                version: digest(body.as_bytes()),
-                body: bytes::Bytes::from(body),
+                version: digest(body.body.as_bytes()),
+                body: bytes::Bytes::from(body.body),
+                admission_contract: body.admission_contract,
             };
             if kept.len() >= MAX_RENDERED {
                 kept.clear();
@@ -307,7 +367,7 @@ impl LocalProviders {
 
 /// The JSON body `reader` is served from `held`, within [`MAX_PROVIDERS`] and
 /// [`MAX_BODY_BYTES`], `None` when nothing is published.
-fn render_from(held: &BTreeMap<String, Vec<WireProvider>>, reader: Reader<'_>) -> Option<String> {
+fn render_from(held: &BTreeMap<String, Vec<WireProvider>>, reader: Reader<'_>) -> Option<RenderedBody> {
     let mut body = String::from(r#"{"providers":["#);
     if held.is_empty() {
         return None;
@@ -318,15 +378,24 @@ fn render_from(held: &BTreeMap<String, Vec<WireProvider>>, reader: Reader<'_>) -
     });
     let mut count = 0;
     let mut truncated = false;
+    let mut all_ranked = true;
     for provider in visible {
+        all_ranked &= provider.admission_rank.is_some()
+            && provider
+                .spec_generation
+                .is_some_and(|generation| generation > 0 && generation <= grid_signals::revision::MAX_GENERATION);
+        if truncated {
+            continue;
+        }
         let Ok(record) = serde_json::to_string(provider) else {
+            truncated = true;
             continue;
         };
         // The truncated close is counted with each record, so the cap holds for the whole body.
         let full = body.len() + record.len() + usize::from(count > 0) + TRUNCATED_CLOSE.len() > MAX_BODY_BYTES;
         if count == MAX_PROVIDERS || full {
             truncated = true;
-            break;
+            continue;
         }
         if count > 0 {
             body.push(',');
@@ -335,7 +404,10 @@ fn render_from(held: &BTreeMap<String, Vec<WireProvider>>, reader: Reader<'_>) -
         count += 1;
     }
     body.push_str(if truncated { TRUNCATED_CLOSE } else { "]}" });
-    Some(body)
+    Some(RenderedBody {
+        body,
+        admission_contract: all_ranked.then_some(ADMISSION_CONTRACT_VERSION),
+    })
 }
 
 /// Every network's providers, one from each in turn, so a body cut at its bound keeps a share
@@ -492,6 +564,17 @@ impl PeerProviders {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(site)
+    }
+
+    /// The exact provider records held from `site`, `None` until its first accepted catalog.
+    #[must_use]
+    pub fn providers_for(&self, site: &str) -> Option<Vec<WireProvider>> {
+        self.0
+            .held
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(site)
+            .cloned()
     }
 
     /// [`Self::admit`] with no cluster bound to a site.
@@ -926,7 +1009,18 @@ mod tests {
             phase: crdt::ProviderPhase::Available,
             match_labels: labels.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
             revision: 3,
+            spec_generation: None,
+            admission_rank: None,
         }
+    }
+
+    fn ranked(id: &str, created_at_ns: i128) -> WireProvider {
+        wire(id, &[])
+            .ranked(AdmissionRank {
+                created_at_ns,
+                uid: format!("uid-{id}"),
+            })
+            .with_spec_generation(1)
     }
 
     #[test]
@@ -1158,6 +1252,135 @@ mod tests {
             kept.first().map(|p| p.provider_id.as_str()),
             Some("0000"),
             "kept in provider order"
+        );
+    }
+
+    #[test]
+    fn a_new_early_name_does_not_displace_older_source_ranked_records() {
+        let mut records: Vec<_> = (0..MAX_PROVIDERS)
+            .map(|index| {
+                ranked(
+                    &format!("p{index:03}"),
+                    i128::try_from(index).unwrap_or_else(|_| std::process::abort()),
+                )
+            })
+            .collect();
+        records.push(ranked(
+            "a000",
+            i128::try_from(MAX_PROVIDERS).unwrap_or_else(|_| std::process::abort()),
+        ));
+
+        let first = LocalProviders::default();
+        first.replace("net", records.clone());
+        let rendered = first.rendered(Reader::Local).unwrap_or_else(|| std::process::abort());
+        let text = std::str::from_utf8(&rendered.body).unwrap_or_else(|_| std::process::abort());
+        let served = parse(text).unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(rendered.admission_contract, Some(ADMISSION_CONTRACT_VERSION));
+        assert_eq!(served.len(), MAX_PROVIDERS, "the record bound stays enforced");
+        assert_eq!(
+            served.first().map(|provider| provider.provider_id.as_str()),
+            Some("p000")
+        );
+        assert!(
+            served.iter().all(|provider| provider.provider_id != "a000"),
+            "a later provider whose name sorts first waits for a slot"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&rendered.body).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(value.get("truncated").and_then(serde_json::Value::as_bool), Some(true));
+
+        let restarted = LocalProviders::default();
+        records.reverse();
+        restarted.replace("net", records);
+        let after_restart = restarted
+            .rendered(Reader::Local)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            after_restart.version, rendered.version,
+            "immutable source ranks recreate the same catalog"
+        );
+    }
+
+    #[test]
+    fn deleting_an_older_provider_opens_its_slot_for_the_next_source_rank() {
+        let mut records: Vec<_> = (0..MAX_PROVIDERS)
+            .map(|index| {
+                ranked(
+                    &format!("p{index:03}"),
+                    i128::try_from(index).unwrap_or_else(|_| std::process::abort()),
+                )
+            })
+            .collect();
+        records.push(ranked(
+            "a000",
+            i128::try_from(MAX_PROVIDERS).unwrap_or_else(|_| std::process::abort()),
+        ));
+
+        let local = LocalProviders::default();
+        local.replace("net", records.clone());
+        let before = local.rendered(Reader::Local).unwrap_or_else(|| std::process::abort());
+        let before = std::str::from_utf8(&before.body).unwrap_or_else(|_| std::process::abort());
+        let before = parse(before).unwrap_or_else(|| std::process::abort());
+        assert!(
+            before.iter().all(|provider| provider.provider_id != "a000"),
+            "the newest provider waits while all earlier ranked slots are occupied"
+        );
+
+        records.retain(|provider| provider.provider_id != "p000");
+        local.replace("net", records);
+        let after = local.rendered(Reader::Local).unwrap_or_else(|| std::process::abort());
+        let after = std::str::from_utf8(&after.body).unwrap_or_else(|_| std::process::abort());
+        let after = parse(after).unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(after.len(), MAX_PROVIDERS, "the response cap remains enforced");
+        assert!(
+            after.iter().all(|provider| provider.provider_id != "p000"),
+            "the deleted provider is no longer admitted"
+        );
+        assert!(
+            after.iter().any(|provider| provider.provider_id == "a000"),
+            "the next source-ranked provider fills the released slot even when its name sorts first"
+        );
+    }
+
+    #[test]
+    fn an_unranked_visible_record_does_not_advertise_source_admission() {
+        let local = LocalProviders::default();
+        local.replace("net", vec![ranked("ranked", 1), wire("unranked", &[])]);
+
+        assert_eq!(
+            local
+                .rendered(Reader::Local)
+                .map(|rendered| rendered.admission_contract),
+            Some(None),
+            "incomplete provider identity retains the legacy contract"
+        );
+    }
+
+    #[test]
+    fn an_unranked_record_beyond_the_response_cap_withholds_the_extension() {
+        let mut records: Vec<_> = (0..MAX_PROVIDERS)
+            .map(|index| {
+                ranked(
+                    &format!("p{index:03}"),
+                    i128::try_from(index).unwrap_or_else(|_| std::process::abort()),
+                )
+            })
+            .collect();
+        records.push(wire("unranked-tail", &[]));
+        let held = BTreeMap::from([("net".to_owned(), records)]);
+
+        let rendered = render_from(&held, Reader::Local).unwrap_or_else(|| std::process::abort());
+        let served = parse(&rendered.body).unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(served.len(), MAX_PROVIDERS, "the record limit remains enforced");
+        assert_eq!(
+            rendered.admission_contract, None,
+            "the extension is absent when any visible source record is unranked"
+        );
+        assert!(
+            rendered.body.ends_with(TRUNCATED_CLOSE),
+            "omitted records are disclosed"
         );
     }
 

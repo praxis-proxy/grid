@@ -9,8 +9,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    io::Write as _,
+    process::{Command, Stdio},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -70,6 +74,8 @@ type ServingCandidatePair = (String, String);
 type ServingCandidatePairsResult = Result<BTreeSet<ServingCandidatePair>, Box<dyn std::error::Error>>;
 /// Process-wide request counter so separate routing samples never reuse a session identifier.
 static SITE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Short-lived token for the run-owned Gateway metrics scraper ServiceAccount.
+static GATEWAY_METRICS_BEARER_TOKEN: OnceLock<String> = OnceLock::new();
 
 /// One exact node attachment to the run-owned cross-cluster Docker network.
 struct NetworkAttachment {
@@ -480,6 +486,279 @@ pub(super) fn proof(context: &DemoContext) -> ProofResult {
     }
 }
 
+/// Reject a changed remote fingerprint without replacing the last trusted remote signal.
+fn verify_invalid_peer_identity(
+    context: &DemoContext,
+    mtls: bool,
+    local_context: &str,
+    remote_site: &str,
+    wrong_pin: &str,
+    operator_metrics_port: u16,
+    peer_operator_metrics_port: u16,
+    gateway_http_port: u16,
+    observations: &mut Vec<String>,
+    attribution: &mut RoutingAttributionDiagnostics,
+    pool_b_before_bad_pin: f64,
+    pool_b_origin_before: f64,
+    poll_failures_before_bad_pin: PeerPollFailureCounts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    record(
+        observations,
+        "injecting invalid pool-b fingerprint on pool-a".to_owned(),
+    );
+    patch_site_pins(local_context, remote_site, &[wrong_pin.to_owned()])?;
+    if read_site_pins(local_context, remote_site)? != [wrong_pin.to_owned()] {
+        return Err("pool-a did not retain the injected invalid pool-b fingerprint".into());
+    }
+    record(
+        observations,
+        "pool-a GridSite for pool-b now contains the injected invalid fingerprint".to_owned(),
+    );
+    let poll_failures_after_bad_pin = wait_for_peer_identity_rejection(
+        operator_metrics_port,
+        "pool-b",
+        poll_failures_before_bad_pin,
+        Duration::from_secs(60),
+    )?;
+    record(
+        observations,
+        format!(
+            "pool-a rejected the changed pool-b identity; peer-poll outcome deltas: {}",
+            poll_failures_after_bad_pin.delta_from(poll_failures_before_bad_pin)
+        ),
+    );
+
+    let (phase_during_rejection, reason_during_rejection, site_resource_version) = wait_for_gridsite_phase_and_reason(
+        local_context,
+        remote_site,
+        "Connecting",
+        "PinMismatch",
+        Duration::from_secs(30),
+    )?;
+    record(
+        observations,
+        format!(
+            "pool-b became ineligible after failed identity verification: GridSite phase={phase_during_rejection}, reason={reason_during_rejection}, resourceVersion={site_resource_version}"
+        ),
+    );
+
+    let connected_sites_during_tls_rejection = read_connected_sites(local_context)?;
+    if !has_connected_swim_peer(connected_sites_during_tls_rejection) {
+        return Err(format!("SWIM membership did not remain connected during peer-signal TLS rejection: connectedSites={connected_sites_during_tls_rejection}").into());
+    }
+
+    // The remote endpoint advertises a lower load that would otherwise
+    // change the pressure order. While its peer certificate is rejected,
+    // pool-a must keep the exact trusted sample. The same failed identity
+    // probe makes the remote GridSite Connecting, so fail-closed routing
+    // must keep requests on pool-a until trust is restored.
+    set_cross_site_waiting_requests("pool-a", WRONG_PIN_LOCAL_WAITING_REQUESTS, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
+    let pool_b_origin = wait_for_signal_decrease(
+        peer_operator_metrics_port,
+        "pool-b",
+        pool_b_origin_before,
+        Duration::from_secs(90),
+    )?;
+    record(
+        observations,
+        format!(
+            "pool-b origin published the changed lower-pressure sample: {pool_b_origin} (trusted baseline was {pool_b_origin_before})"
+        ),
+    );
+    let poll_failures_before_updated_signal =
+        peer_poll_failure_counts(&read_operator_metrics(operator_metrics_port)?, "pool-b");
+    let poll_failures_after_updated_signal = wait_for_peer_identity_rejection(
+        operator_metrics_port,
+        "pool-b",
+        poll_failures_before_updated_signal,
+        Duration::from_secs(30),
+    )?;
+    record(
+        observations,
+        format!(
+            "pool-a continued rejecting the changed pool-b identity; peer-poll outcome deltas after the origin update: {}",
+            poll_failures_after_updated_signal.delta_from(poll_failures_before_updated_signal)
+        ),
+    );
+    let wrong_pin_window = wait_for_wrong_pin_signal_window(
+        operator_metrics_port,
+        peer_operator_metrics_port,
+        "pool-b",
+        pool_b_origin_before,
+        pool_b_before_bad_pin,
+        Duration::from_secs(30),
+    );
+    record(
+        observations,
+        format!(
+            "wrong-peer-pin pressure observation: stable={}, local pool-a={:?}, accepted pool-b={:?}, pool-b origin={:?}, trusted sample changed={}",
+            wrong_pin_window.stable,
+            wrong_pin_window.local_a,
+            wrong_pin_window.trusted_b,
+            wrong_pin_window.origin_b,
+            wrong_pin_window.trusted_changed
+        ),
+    );
+    if !wrong_pin_window.stable {
+        record(
+            observations,
+            "[PRECONDITION][FAIL] changed remote signal did not establish a stable ordering that would prefer pool-b within 30 seconds".to_owned(),
+        );
+    }
+    let remote_matches_trusted_baseline = wrong_pin_window
+        .trusted_b
+        .is_some_and(|value| (value - pool_b_before_bad_pin).abs() <= f64::EPSILON);
+    let trusted_sample_keeps_pool_a_preferred = wrong_pin_window
+        .trusted_b
+        .zip(wrong_pin_window.local_a)
+        .is_some_and(|(trusted, local)| trusted > local);
+    let changed_origin_would_prefer_pool_b = wrong_pin_window
+        .origin_b
+        .zip(wrong_pin_window.local_a)
+        .is_some_and(|(origin, local)| origin < local);
+
+    // Always execute the original routing assertion, even when the signal
+    // ordering precondition failed. This preserves routing evidence while
+    // still failing the proof below if the stimulus was insufficient.
+    let wrong_pin_route = wait_for_site_distribution(
+        gateway_http_port,
+        "pool-a",
+        "wrong-peer-pin-routing",
+        attribution,
+        Duration::from_secs(30),
+    );
+    if let Ok(distribution) = &wrong_pin_route {
+        record(
+            observations,
+            format!(
+                "wrong peer pin left routing on pool-a while pool-b was ineligible (phase={phase_during_rejection}, reason={reason_during_rejection}): {distribution}; SWIM connectedSites={connected_sites_during_tls_rejection}"
+            ),
+        );
+    }
+
+    let mut assertion_errors = Vec::new();
+    if !wrong_pin_window.stable {
+        assertion_errors.push("wrong-pin pressure precondition did not stabilize within 30 seconds".to_owned());
+    }
+    if wrong_pin_window.trusted_changed
+        || !remote_matches_trusted_baseline
+        || !trusted_sample_keeps_pool_a_preferred
+        || !changed_origin_would_prefer_pool_b
+    {
+        assertion_errors.push(format!("pool-a did not preserve the exact trusted pool-b sample while rejecting a changed signal that would otherwise prefer pool-b: local pool-a={:?}, current pool-b sample={:?}, trusted pool-b baseline={pool_b_before_bad_pin}, rejected pool-b origin={:?}, trusted signal ever changed={}", wrong_pin_window.local_a, wrong_pin_window.trusted_b, wrong_pin_window.origin_b, wrong_pin_window.trusted_changed));
+    }
+    if let Err(error) = wrong_pin_route {
+        assertion_errors.push(format!("original wrong-pin routing assertion failed: {error}"));
+    }
+    if !assertion_errors.is_empty() {
+        return Err(assertion_errors.join("; ").into());
+    }
+    record(
+        observations,
+        format!(
+            "pool-a retained the exact trusted pool-b value during the rejected update: local pool-a={:?}, trusted pool-b={:?}, rejected origin={:?} would prefer pool-b",
+            wrong_pin_window.local_a, wrong_pin_window.trusted_b, wrong_pin_window.origin_b
+        ),
+    );
+    Ok(())
+}
+
+/// Restore the trusted peer signal and finish the network partition/reconvergence proof.
+fn finish_peer_identity_recovery(
+    context: &DemoContext,
+    mtls: bool,
+    local_context: &str,
+    remote_site: &str,
+    operator_metrics_port: u16,
+    gateway_http_port: u16,
+    gateway_metrics_port: u16,
+    gateway_uid: &str,
+    pool_b_before_bad_pin: f64,
+    observations: &mut Vec<String>,
+    attribution: &mut RoutingAttributionDiagnostics,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (phase_after_restore, reason_after_restore, restored_site_resource_version) =
+        wait_for_gridsite_phase_and_reason(
+            local_context,
+            remote_site,
+            "Active",
+            "TlsVerified",
+            Duration::from_secs(90),
+        )?;
+    record(
+        observations,
+        format!(
+            "pool-b GridSite returned to an eligible state after restoring its trusted identity: phase={phase_after_restore}, reason={reason_after_restore}, resourceVersion={restored_site_resource_version}"
+        ),
+    );
+    wait_for_relay_samples(operator_metrics_port, Duration::from_secs(90))?;
+    let pool_b_restored = wait_for_signal_decrease(
+        operator_metrics_port,
+        "pool-b",
+        pool_b_before_bad_pin,
+        Duration::from_secs(90),
+    )?;
+    wait_for_pressure_order_recorded(
+        operator_metrics_port,
+        "pool-b",
+        Duration::from_secs(90),
+        observations,
+        "pool-a operator observed the recovered pressure order",
+    )?;
+    verify_weighted_site_distribution(
+        gateway_http_port,
+        gateway_metrics_port,
+        "pool-b",
+        true,
+        "restored-peer-identity-routing",
+        attribution,
+        Duration::from_secs(120),
+    )
+    .map(|distribution| {
+        record(
+            observations,
+            format!("restored peer identity and lower-pressure pool-b routing: {distribution}"),
+        );
+    })?;
+    record(
+        observations,
+        format!("pool-a accepted the restored peer's lower-pressure signal: {pool_b_restored}"),
+    );
+    prove_network_partition(
+        context,
+        gateway_http_port,
+        gateway_metrics_port,
+        operator_metrics_port,
+        mtls,
+        gateway_uid,
+        attribution,
+        observations,
+    )?;
+    if gateway_pod_uid(local_context)? != gateway_uid {
+        return Err("Grid Gateway pod changed during the cross-site signal proof".into());
+    }
+
+    let gateway_metrics = read_gateway_metrics(gateway_metrics_port)?;
+    record(
+        observations,
+        format!(
+            "Grid Gateway route decision samples: pool-a={}, pool-b={}",
+            metric_counter(
+                &gateway_metrics,
+                "grid_route_decisions_total",
+                &[("site", "pool-a"), ("reason", "routed")]
+            ),
+            metric_counter(
+                &gateway_metrics,
+                "grid_route_decisions_total",
+                &[("site", "pool-b"), ("reason", "routed")]
+            )
+        ),
+    );
+    Ok(())
+}
+
 /// Execute the ordered signal, routing, outage, recovery, and identity checks.
 #[expect(
     clippy::too_many_lines,
@@ -514,7 +793,8 @@ fn run(
         &format!("{GRID_SERVING_GATEWAY}-metrics"),
         GRID_SERVING_METRICS_PORT,
     )?;
-    let (operator_metrics_port, _operator_metrics_forward) =
+    initialize_gateway_metrics_token(&local_context)?;
+    let (mut operator_metrics_port, mut operator_metrics_forward) =
         start_ready_port_forward(&local_context, "grid-operator-metrics", OPERATOR_METRICS_PORT)?;
     let peer_context = kind_context("pool-b");
     let (peer_operator_metrics_port, _peer_operator_metrics_forward) =
@@ -579,6 +859,15 @@ fn run(
         Duration::from_secs(120),
     )
     .map(|distribution| record(observations, format!("lower-pressure baseline: {distribution}")))?;
+    prove_operator_restart_preserves_candidates(
+        &local_context,
+        gateway_http_port,
+        gateway_metrics_port,
+        &mut operator_metrics_port,
+        &mut operator_metrics_forward,
+        observations,
+        attribution,
+    )?;
     let gateway_uid = gateway_pod_uid(&local_context)?;
     let gateway_reloads_before_shift = applied_gateway_reload_count(gateway_metrics_port)?;
 
@@ -761,169 +1050,21 @@ fn run(
             "wrong-peer-pin phase starting: trusted pool-a sample={local_a_before_bad_pin}, trusted pool-b sample={pool_b_before_bad_pin}, pool-b origin sample={pool_b_origin_before}"
         ),
     );
-    let invalid_identity_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        record(
-            observations,
-            "injecting invalid pool-b fingerprint on pool-a".to_owned(),
-        );
-        patch_site_pins(&local_context, &remote_site, &[wrong_pin.to_owned()])?;
-        if read_site_pins(&local_context, &remote_site)? != [wrong_pin.to_owned()] {
-            return Err("pool-a did not retain the injected invalid pool-b fingerprint".into());
-        }
-        record(
-            observations,
-            "pool-a GridSite for pool-b now contains the injected invalid fingerprint".to_owned(),
-        );
-        let poll_failures_after_bad_pin = wait_for_peer_identity_rejection(
-            operator_metrics_port,
-            "pool-b",
-            poll_failures_before_bad_pin,
-            Duration::from_secs(60),
-        )?;
-        record(
-            observations,
-            format!(
-                "pool-a rejected the changed pool-b identity; peer-poll outcome deltas: {}",
-                poll_failures_after_bad_pin.delta_from(poll_failures_before_bad_pin)
-            ),
-        );
-
-        let (phase_during_rejection, reason_during_rejection, site_resource_version) =
-            wait_for_gridsite_phase_and_reason(
-                &local_context,
-                &remote_site,
-                "Connecting",
-                "PinMismatch",
-                Duration::from_secs(30),
-            )?;
-        record(
-            observations,
-            format!(
-                "pool-b became ineligible after failed identity verification: GridSite phase={phase_during_rejection}, reason={reason_during_rejection}, resourceVersion={site_resource_version}"
-            ),
-        );
-
-        let connected_sites_during_tls_rejection = read_connected_sites(&local_context)?;
-        if !has_connected_swim_peer(connected_sites_during_tls_rejection) {
-            return Err(format!("SWIM membership did not remain connected during peer-signal TLS rejection: connectedSites={connected_sites_during_tls_rejection}").into());
-        }
-
-        // The remote endpoint advertises a lower load that would otherwise
-        // change the pressure order. While its peer certificate is rejected,
-        // pool-a must keep the exact trusted sample. The same failed identity
-        // probe makes the remote GridSite Connecting, so fail-closed routing
-        // must keep requests on pool-a until trust is restored.
-        set_cross_site_waiting_requests("pool-a", WRONG_PIN_LOCAL_WAITING_REQUESTS, context.scoring_flavor, mtls)?;
-        set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
-        let pool_b_origin = wait_for_signal_decrease(
-            peer_operator_metrics_port,
-            "pool-b",
-            pool_b_origin_before,
-            Duration::from_secs(90),
-        )?;
-        record(
-            observations,
-            format!(
-                "pool-b origin published the changed lower-pressure sample: {pool_b_origin} (trusted baseline was {pool_b_origin_before})"
-            ),
-        );
-        let poll_failures_before_updated_signal =
-            peer_poll_failure_counts(&read_operator_metrics(operator_metrics_port)?, "pool-b");
-        let poll_failures_after_updated_signal = wait_for_peer_identity_rejection(
-            operator_metrics_port,
-            "pool-b",
-            poll_failures_before_updated_signal,
-            Duration::from_secs(30),
-        )?;
-        record(
-            observations,
-            format!(
-                "pool-a continued rejecting the changed pool-b identity; peer-poll outcome deltas after the origin update: {}",
-                poll_failures_after_updated_signal.delta_from(poll_failures_before_updated_signal)
-            ),
-        );
-        let wrong_pin_window = wait_for_wrong_pin_signal_window(
-            operator_metrics_port,
-            peer_operator_metrics_port,
-            "pool-b",
-            pool_b_origin_before,
-            pool_b_before_bad_pin,
-            Duration::from_secs(30),
-        );
-        record(
-            observations,
-            format!(
-                "wrong-peer-pin pressure observation: stable={}, local pool-a={:?}, accepted pool-b={:?}, pool-b origin={:?}, trusted sample changed={}",
-                wrong_pin_window.stable,
-                wrong_pin_window.local_a,
-                wrong_pin_window.trusted_b,
-                wrong_pin_window.origin_b,
-                wrong_pin_window.trusted_changed
-            ),
-        );
-        if !wrong_pin_window.stable {
-            record(
-                observations,
-                "[PRECONDITION][FAIL] changed remote signal did not establish a stable ordering that would prefer pool-b within 30 seconds".to_owned(),
-            );
-        }
-        let remote_matches_trusted_baseline = wrong_pin_window
-            .trusted_b
-            .is_some_and(|value| (value - pool_b_before_bad_pin).abs() <= f64::EPSILON);
-        let trusted_sample_keeps_pool_a_preferred = wrong_pin_window
-            .trusted_b
-            .zip(wrong_pin_window.local_a)
-            .is_some_and(|(trusted, local)| trusted > local);
-        let changed_origin_would_prefer_pool_b = wrong_pin_window
-            .origin_b
-            .zip(wrong_pin_window.local_a)
-            .is_some_and(|(origin, local)| origin < local);
-
-        // Always execute the original routing assertion, even when the signal
-        // ordering precondition failed. This preserves routing evidence while
-        // still failing the proof below if the stimulus was insufficient.
-        let wrong_pin_route = wait_for_site_distribution(
-            gateway_http_port,
-            "pool-a",
-            "wrong-peer-pin-routing",
-            attribution,
-            Duration::from_secs(30),
-        );
-        if let Ok(distribution) = &wrong_pin_route {
-            record(
-                observations,
-                format!(
-                    "wrong peer pin left routing on pool-a while pool-b was ineligible (phase={phase_during_rejection}, reason={reason_during_rejection}): {distribution}; SWIM connectedSites={connected_sites_during_tls_rejection}"
-                ),
-            );
-        }
-
-        let mut assertion_errors = Vec::new();
-        if !wrong_pin_window.stable {
-            assertion_errors.push("wrong-pin pressure precondition did not stabilize within 30 seconds".to_owned());
-        }
-        if wrong_pin_window.trusted_changed
-            || !remote_matches_trusted_baseline
-            || !trusted_sample_keeps_pool_a_preferred
-            || !changed_origin_would_prefer_pool_b
-        {
-            assertion_errors.push(format!("pool-a did not preserve the exact trusted pool-b sample while rejecting a changed signal that would otherwise prefer pool-b: local pool-a={:?}, current pool-b sample={:?}, trusted pool-b baseline={pool_b_before_bad_pin}, rejected pool-b origin={:?}, trusted signal ever changed={}", wrong_pin_window.local_a, wrong_pin_window.trusted_b, wrong_pin_window.origin_b, wrong_pin_window.trusted_changed));
-        }
-        if let Err(error) = wrong_pin_route {
-            assertion_errors.push(format!("original wrong-pin routing assertion failed: {error}"));
-        }
-        if !assertion_errors.is_empty() {
-            return Err(assertion_errors.join("; ").into());
-        }
-        record(
-            observations,
-            format!(
-                "pool-a retained the exact trusted pool-b value during the rejected update: local pool-a={:?}, trusted pool-b={:?}, rejected origin={:?} would prefer pool-b",
-                wrong_pin_window.local_a, wrong_pin_window.trusted_b, wrong_pin_window.origin_b
-            ),
-        );
-        Ok(())
-    })();
+    let invalid_identity_result = verify_invalid_peer_identity(
+        context,
+        mtls,
+        &local_context,
+        &remote_site,
+        wrong_pin,
+        operator_metrics_port,
+        peer_operator_metrics_port,
+        gateway_http_port,
+        observations,
+        attribution,
+        pool_b_before_bad_pin,
+        pool_b_origin_before,
+        poll_failures_before_bad_pin,
+    );
     record(
         observations,
         "restoring the original pool-b fingerprint on pool-a".to_owned(),
@@ -950,84 +1091,19 @@ fn run(
         },
     }
 
-    let (phase_after_restore, reason_after_restore, restored_site_resource_version) =
-        wait_for_gridsite_phase_and_reason(
-            &local_context,
-            &remote_site,
-            "Active",
-            "TlsVerified",
-            Duration::from_secs(90),
-        )?;
-    record(
-        observations,
-        format!(
-            "pool-b GridSite returned to an eligible state after restoring its trusted identity: phase={phase_after_restore}, reason={reason_after_restore}, resourceVersion={restored_site_resource_version}"
-        ),
-    );
-    wait_for_relay_samples(operator_metrics_port, Duration::from_secs(90))?;
-    let pool_b_restored = wait_for_signal_decrease(
-        operator_metrics_port,
-        "pool-b",
-        pool_b_before_bad_pin,
-        Duration::from_secs(90),
-    )?;
-    wait_for_pressure_order_recorded(
-        operator_metrics_port,
-        "pool-b",
-        Duration::from_secs(90),
-        observations,
-        "pool-a operator observed the recovered pressure order",
-    )?;
-    verify_weighted_site_distribution(
-        gateway_http_port,
-        gateway_metrics_port,
-        "pool-b",
-        true,
-        "restored-peer-identity-routing",
-        attribution,
-        Duration::from_secs(120),
-    )
-    .map(|distribution| {
-        record(
-            observations,
-            format!("restored peer identity and lower-pressure pool-b routing: {distribution}"),
-        );
-    })?;
-    record(
-        observations,
-        format!("pool-a accepted the restored peer's lower-pressure signal: {pool_b_restored}"),
-    );
-    prove_network_partition(
+    finish_peer_identity_recovery(
         context,
+        mtls,
+        &local_context,
+        &remote_site,
+        operator_metrics_port,
         gateway_http_port,
         gateway_metrics_port,
-        operator_metrics_port,
-        mtls,
         &gateway_uid,
+        pool_b_before_bad_pin,
+        observations,
         attribution,
-        observations,
     )?;
-    if gateway_pod_uid(&local_context)? != gateway_uid {
-        return Err("Grid Gateway pod changed during the cross-site signal proof".into());
-    }
-
-    let gateway_metrics = read_gateway_metrics(gateway_metrics_port)?;
-    record(
-        observations,
-        format!(
-            "Grid Gateway route decision samples: pool-a={}, pool-b={}",
-            metric_counter(
-                &gateway_metrics,
-                "grid_route_decisions_total",
-                &[("site", "pool-a"), ("reason", "routed")]
-            ),
-            metric_counter(
-                &gateway_metrics,
-                "grid_route_decisions_total",
-                &[("site", "pool-b"), ("reason", "routed")]
-            )
-        ),
-    );
     Ok(())
 }
 
@@ -1663,6 +1739,140 @@ fn serving_candidate_pairs(context: &str) -> ServingCandidatePairsResult {
         pairs.insert((site.to_owned(), cluster.to_owned()));
     }
     Ok(pairs)
+}
+
+/// Restart the task-owned receiver operator and require its same two-provider signal view back.
+fn prove_operator_restart_preserves_candidates(
+    context: &str,
+    gateway_http_port: u16,
+    gateway_metrics_port: u16,
+    operator_metrics_port: &mut u16,
+    operator_metrics_forward: &mut PortForwardGuard,
+    observations: &mut Vec<String>,
+    attribution: &mut RoutingAttributionDiagnostics,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = BTreeSet::from([
+        ("pool-a".to_owned(), POOL_A_PROVIDER.to_owned()),
+        ("pool-b".to_owned(), "llmd-pool-b-provider".to_owned()),
+    ]);
+    let before = serving_candidate_pairs(context)?;
+    if before != expected {
+        return Err(
+            format!("restart precondition candidate set differs from the two task providers: {before:?}").into(),
+        );
+    }
+    let previous_uid = operator_pod_uid(GRID_SERVING_SITE)?;
+    restart_operator(GRID_SERVING_SITE)?;
+    let restarted_uid = wait_for_operator_replacement(GRID_SERVING_SITE, &previous_uid, Duration::from_secs(90))?;
+
+    operator_metrics_forward.stop();
+    let (port, forward) = start_ready_port_forward(context, "grid-operator-metrics", OPERATOR_METRICS_PORT)?;
+    *operator_metrics_port = port;
+    *operator_metrics_forward = forward;
+    let catalog_pair = wait_for_source_ranked_catalog_pair(port, "pool-b", Duration::from_secs(120))?;
+    wait_for_relay_samples(port, Duration::from_secs(120))?;
+    wait_for_grid_serving_snapshot(Duration::from_secs(120))?;
+    let after = serving_candidate_pairs(context)?;
+    if after != before {
+        return Err(
+            format!("operator restart changed the serving candidate set: before={before:?}, after={after:?}").into(),
+        );
+    }
+    let distribution = verify_weighted_site_distribution(
+        gateway_http_port,
+        gateway_metrics_port,
+        "pool-a",
+        false,
+        "operator-restart-same-provider-set",
+        attribution,
+        Duration::from_secs(120),
+    )?;
+    record(
+        observations,
+        format!(
+            "receiver operator restart {previous_uid}->{restarted_uid} reported source-ranked catalog stage and promotion after a matching signals digest ({catalog_pair}); relayed samples returned; the current serving config still lists the same candidates {after:?}; attributed traffic: {distribution}; no new serving-config revision is claimed because the semantic candidate set was unchanged"
+        ),
+    );
+    Ok(())
+}
+
+/// One current Grid operator pod UID at a task-owned site.
+fn operator_pod_uid(site: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let pods = super::capture_pod_snapshots(site, "app.kubernetes.io/name=grid-operator");
+    match pods.as_slice() {
+        [pod] => Ok(pod.uid.clone()),
+        _ => Err(format!("{site} has {} Grid operator pods, expected one", pods.len()).into()),
+    }
+}
+
+/// Wait until the task-owned operator Deployment has replaced the captured pod.
+fn wait_for_operator_replacement(
+    site: &str,
+    previous_uid: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::from("operator pod unavailable");
+    while Instant::now() < deadline {
+        match operator_pod_uid(site) {
+            Ok(uid) if uid != previous_uid => return Ok(uid),
+            Ok(uid) => last = uid,
+            Err(error) => last = error.to_string(),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err(format!("Grid operator pod did not change from {previous_uid} within {timeout:?}; last state: {last}").into())
+}
+
+/// Source-ranked catalogs must be staged and then promoted after a matching signal digest.
+fn source_ranked_catalog_pair_counts(metrics: &str, peer: &str) -> Option<(f64, f64)> {
+    let staged = metric_counter(
+        metrics,
+        "grid_peer_catalog_total",
+        &[("peer", peer), ("outcome", "staged")],
+    );
+    let replaced = metric_counter(
+        metrics,
+        "grid_peer_catalog_total",
+        &[("peer", peer), ("outcome", "replaced")],
+    );
+    (staged >= 1.0 && replaced >= 1.0).then_some((staged, replaced))
+}
+
+/// Require a source-ranked catalog stage and promotion in the restarted poller process.
+fn wait_for_source_ranked_catalog_pair(
+    port: u16,
+    peer: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::from("operator metrics unavailable");
+    while Instant::now() < deadline {
+        match read_operator_metrics(port) {
+            Ok(metrics) => {
+                let staged_before = metric_counter(
+                    &metrics,
+                    "grid_peer_catalog_total",
+                    &[("peer", peer), ("outcome", "staged")],
+                );
+                let promoted_before = metric_counter(
+                    &metrics,
+                    "grid_peer_catalog_total",
+                    &[("peer", peer), ("outcome", "replaced")],
+                );
+                last = format!("staged={staged_before}, replaced={promoted_before}");
+                if let Some((staged_total, promoted_total)) = source_ranked_catalog_pair_counts(&metrics, peer) {
+                    return Ok(format!("staged={staged_total}, promoted={promoted_total}"));
+                }
+            },
+            Err(error) => last = error.to_string(),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err(format!(
+        "restarted poller did not stage and promote {peer}'s source-ranked catalog after a matching signals digest within {timeout:?}; last counts: {last}"
+    )
+    .into())
 }
 
 /// Require the deployed Gateway to expose the metrics produced by an active EPP reading.
@@ -2822,16 +3032,23 @@ fn parse_site_route_response(raw: &str) -> SiteRouteResponse {
 
 /// Read an operator's `/metrics` through the run-owned Service.
 pub(super) fn read_operator_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, true)
+    read_metrics_url(port, true, None)
 }
 
 /// Read the Grid Gateway's TLS-only `/metrics` endpoint.
 pub(super) fn read_gateway_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, false)
+    let token = GATEWAY_METRICS_BEARER_TOKEN
+        .get()
+        .ok_or("Grid Gateway metrics token was not initialized for this run")?;
+    read_metrics_url(port, false, Some(token))
 }
 
 /// Fetch Prometheus exposition over the forwarded service port.
-fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std::error::Error>> {
+fn read_metrics_url(
+    port: u16,
+    tls_fallback: bool,
+    bearer_token: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let schemes = if tls_fallback {
         ["https", "http"]
     } else {
@@ -2840,9 +3057,27 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
     let mut last_error = String::from("no HTTP response");
     for scheme in schemes {
         let url = format!("{scheme}://127.0.0.1:{port}/metrics");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--insecure", "--max-time", "5", &url])
-            .output()?;
+        let mut command = Command::new("curl");
+        command.args(["--silent", "--show-error", "--insecure", "--max-time", "5"]);
+        if bearer_token.is_some() {
+            command.args(["--config", "-"]);
+        }
+        let mut child = command
+            .arg(&url)
+            .stdin(if bearer_token.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(token) = bearer_token {
+            let config = curl_bearer_config(token)?;
+            let mut stdin = child.stdin.take().ok_or("curl stdin was not piped for metrics auth")?;
+            stdin.write_all(config.as_bytes())?;
+        }
+        let output = child.wait_with_output()?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
@@ -2853,6 +3088,54 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
     Err(format!("could not read metrics service: {last_error}").into())
 }
 
+/// Mint a short-lived metrics scrape token for the release-scoped scraper identity.
+fn create_gateway_metrics_token(context: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let service_account = format!("{GRID_SERVING_GATEWAY}-metrics-scraper");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "token",
+            &service_account,
+            "--duration=1h",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not mint the task-owned Gateway metrics scrape token: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let token = String::from_utf8(output.stdout)?.trim().to_owned();
+    curl_bearer_config(&token)?;
+    Ok(token)
+}
+
+/// Initialize the process-local scrape token without keeping it in the proof's large stack frame.
+fn initialize_gateway_metrics_token(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let token = create_gateway_metrics_token(context)?;
+    GATEWAY_METRICS_BEARER_TOKEN
+        .set(token)
+        .map_err(|_token| "Grid Gateway metrics token was initialized more than once")?;
+    Ok(())
+}
+
+/// Render a safe curl config header without putting the bearer token in argv or logs.
+fn curl_bearer_config(token: &str) -> Result<String, &'static str> {
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err("metrics scrape token has an unsupported character");
+    }
+    Ok(format!("header = \"Authorization: Bearer {token}\"\n"))
+}
+
 /// Return the counter value matching a metric name and its required labels.
 pub(super) fn metric_counter(text: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
     sample_value(text, name, labels).unwrap_or(0.0)
@@ -2861,8 +3144,9 @@ pub(super) fn metric_counter(text: &str, name: &str, labels: &[(&str, &str)]) ->
 #[cfg(test)]
 mod serving_peer_tests {
     use super::{
-        MEASURED_SITE_GAUGES, POOL_A_PROVIDER, applied_gateway_reload_count_from_text, is_expected_local_operator_peer,
-        measured_site_gauges_are_cleared, require_active_signal_gauges, reused_gateway_config_count_from_text,
+        MEASURED_SITE_GAUGES, POOL_A_PROVIDER, applied_gateway_reload_count_from_text, curl_bearer_config,
+        is_expected_local_operator_peer, measured_site_gauges_are_cleared, require_active_signal_gauges,
+        reused_gateway_config_count_from_text, source_ranked_catalog_pair_counts,
     };
 
     #[test]
@@ -2928,6 +3212,36 @@ mod serving_peer_tests {
         assert!((applied_gateway_reload_count_from_text(metrics) - 2.0).abs() < f64::EPSILON);
         assert!((reused_gateway_config_count_from_text(metrics) - 3.0).abs() < f64::EPSILON);
         assert!(reused_gateway_config_count_from_text("").abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gateway_metrics_bearer_config_uses_a_validated_header() {
+        assert_eq!(
+            curl_bearer_config("header.payload-signature_123"),
+            Ok("header = \"Authorization: Bearer header.payload-signature_123\"\n".to_owned())
+        );
+        assert_eq!(
+            curl_bearer_config("header\ninjected"),
+            Err("metrics scrape token has an unsupported character")
+        );
+        assert_eq!(
+            curl_bearer_config("header\"injected"),
+            Err("metrics scrape token has an unsupported character")
+        );
+    }
+
+    #[test]
+    fn restart_requires_source_ranked_catalog_staging_and_matching_promotion() {
+        let only_replaced = "grid_peer_catalog_total{peer=\"pool-b\",outcome=\"replaced\"} 1\n";
+        assert_eq!(source_ranked_catalog_pair_counts(only_replaced, "pool-b"), None);
+
+        let only_staged = "grid_peer_catalog_total{peer=\"pool-b\",outcome=\"staged\"} 1\n";
+        assert_eq!(source_ranked_catalog_pair_counts(only_staged, "pool-b"), None);
+
+        let matched = "grid_peer_catalog_total{peer=\"pool-b\",outcome=\"staged\"} 2\n\
+                       grid_peer_catalog_total{peer=\"pool-b\",outcome=\"replaced\"} 1\n";
+        assert_eq!(source_ranked_catalog_pair_counts(matched, "pool-b"), Some((2.0, 1.0)));
+        assert_eq!(source_ranked_catalog_pair_counts(matched, "another-peer"), None);
     }
 
     #[test]

@@ -45,6 +45,26 @@ Peers are dialled directly. The signals and providers path reads no
 TLS through untouched, and an egress proxy that terminates TLS breaks the
 mutual TLS the path depends on.
 
+## Provider admission with polled signals
+
+In poll mode, a peer also serves its bounded provider catalog at
+`/v1/site/providers`. New operators can use source-ranked admission when the
+catalog and signals response both advertise the supported
+`x-grid-provider-admission-contract` and name the same provider-body digest in
+`x-grid-providers-version`. The catalog records carry each visible Kubernetes
+provider's immutable creation time and UID. The serving site orders its bounded
+provider set by that rank, so new receivers derive the same set after restart
+instead of rebuilding independent slot histories.
+
+The extension applies only to the exact authenticated source, catalog digest,
+and access-filtered reader view. A reader keeps its last accepted catalog and
+signals together while a changed catalog awaits a signals response naming the
+same digest. Unsupported or incomplete ranked catalogs do not opt in. Older
+peers continue using receiver-local slot retention, including its 12-answer
+release rule. The source catalog and relay remain bounded; this contract does
+not guarantee that an arbitrary number of providers or signal rows fits in one
+response.
+
 ## Gateway ingest feedback
 
 The local gateway reports completed ingests with an empty-body

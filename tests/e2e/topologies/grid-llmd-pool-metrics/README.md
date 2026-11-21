@@ -18,6 +18,20 @@ a Gateway restart. It also checks that a stale local signal is excluded while
 SWIM remains connected and that a peer with the wrong pinned identity cannot
 replace an accepted signal.
 
+The full cross-site proof restarts the task-owned receiving operator after the
+two-provider candidate set is active. In the restarted process it requires a
+source-ranked catalog to be staged and then promoted after a matching signals
+digest, relayed samples to return, the same exact serving candidate set to be
+present in the current serving config, and attributed baseline traffic to
+succeed. The catalog counters establish the source-ranked staging and
+promotion, but the evidence does not capture raw endpoint header values or
+digest strings. It also does not establish that the serving config received a
+new revision. Because the semantic candidate set is unchanged, this proof does
+not claim a new serving-config revision. It is integration coverage for a small
+two-provider topology; it does not exercise the 256-provider limit or divergent
+receiver histories or provider UID recreation, which remain controlled operator
+tests.
+
 Build the Grid operator and Gateway from this checkout before a full local run:
 
 ```console

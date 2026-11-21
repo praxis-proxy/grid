@@ -247,6 +247,8 @@ pub struct Stamp {
     pub providers_version: Option<String>,
     /// Its providers contract version, on a providers answer.
     pub providers_contract: Option<String>,
+    /// Its source-ranked provider-admission extension, on a signals or providers answer.
+    pub providers_admission_contract: Option<String>,
 }
 
 /// GET `url` over `transport`, presenting `bearer` when given.
@@ -420,6 +422,7 @@ async fn read_response(
         membership: known_membership(header(crate::signals::MEMBERSHIP_HEADER)),
         providers_version: header(crate::site_providers::VERSION_HEADER).map(|version| version.trim().to_owned()),
         providers_contract: header(crate::site_providers::CONTRACT_HEADER).map(str::to_owned),
+        providers_admission_contract: header(crate::site_providers::ADMISSION_CONTRACT_HEADER).map(str::to_owned),
     };
 
     let body_bytes = Limited::new(response.into_body(), max_body)

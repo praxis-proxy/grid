@@ -661,6 +661,12 @@ impl OperatorCtx {
         self.peer_slots.clone()
     }
 
+    /// The one network this operator has selected for ordered signal publication, if selected.
+    #[must_use]
+    pub fn signal_network_name(&self) -> Option<&str> {
+        self.signal_network.get().map(String::as_str)
+    }
+
     /// A handle to who may read, for the signals listener and poller.
     #[must_use]
     pub fn peer_identities(&self) -> signals::PeerIdentities {
@@ -6875,13 +6881,54 @@ fn local_wire_providers(
     let inference = providers
         .iter()
         .filter(|provider| provider.spec.grid_network_ref == network_name)
-        .filter_map(|provider| provider_state_from_kube(provider, network_name, "", None, served_model_store));
+        .filter_map(|provider| {
+            let state = provider_state_from_kube(provider, network_name, "", None, served_model_store)?;
+            let wire = site_providers::WireProvider::from(state);
+            Some(
+                match (
+                    provider_admission_rank(&provider.metadata),
+                    provider_spec_generation(&provider.metadata),
+                ) {
+                    (Some(rank), Some(generation)) => wire.ranked(rank).with_spec_generation(generation),
+                    _ => wire,
+                },
+            )
+        });
     let tools = tool_providers
         .iter()
         .filter(|provider| provider.spec.grid_network_ref == network_name)
-        .filter_map(|provider| tool_provider_state_from_kube(provider, network_name, ""))
-        .filter(|state| !state.tools.is_empty());
-    inference.chain(tools).map(site_providers::WireProvider::from).collect()
+        .filter_map(|provider| {
+            let state = tool_provider_state_from_kube(provider, network_name, "")?;
+            if state.tools.is_empty() {
+                return None;
+            }
+            let wire = site_providers::WireProvider::from(state);
+            Some(
+                match (
+                    provider_admission_rank(&provider.metadata),
+                    provider_spec_generation(&provider.metadata),
+                ) {
+                    (Some(rank), Some(generation)) => wire.ranked(rank).with_spec_generation(generation),
+                    _ => wire,
+                },
+            )
+        });
+    inference.chain(tools).collect()
+}
+
+/// Immutable rank for a persisted Kubernetes provider identity, absent before it is stored.
+fn provider_admission_rank(
+    metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+) -> Option<site_providers::AdmissionRank> {
+    let uid = metadata.uid.as_ref().filter(|uid| !uid.trim().is_empty())?.clone();
+    let created_at_ns = metadata.creation_timestamp.as_ref()?.0.as_nanosecond();
+    Some(site_providers::AdmissionRank { created_at_ns, uid })
+}
+
+/// Spec generation carried by a source-ranked provider, absent when its revision is unsupported.
+fn provider_spec_generation(metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> Option<u64> {
+    let generation = u64::try_from(metadata.generation?).ok()?;
+    (generation > 0 && generation <= grid_signals::revision::MAX_GENERATION).then_some(generation)
 }
 
 /// Associate a Kubernetes provider UID with the identity published in CRDT state.
@@ -15354,6 +15401,77 @@ mod tests {
             ["pool-a", "tool/mcp"],
             "another network's provider and a tool provider with no discovered tools are not served"
         );
+    }
+
+    #[test]
+    fn local_wire_provider_uses_the_kubernetes_creation_rank() {
+        let mut provider = make_provider_with_routing_ref("pool", "net", "pool");
+        provider.metadata.uid = Some("provider-uid".to_owned());
+        provider.metadata.generation = Some(8);
+        provider.metadata.creation_timestamp = Some(
+            serde_json::from_value::<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>(serde_json::json!(
+                "2026-01-01T00:00:00Z"
+            ))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+        let wire = local_wire_providers("net", &[provider], &[], &served_models::ServedModelStore::new())
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(
+            wire.admission_rank.map(|rank| rank.uid),
+            Some("provider-uid".to_owned()),
+            "the source catalog carries the Kubernetes object identity"
+        );
+        assert_eq!(
+            wire.spec_generation,
+            Some(8),
+            "the catalog binds the provider's signal rows to the exact spec generation"
+        );
+    }
+
+    #[test]
+    fn source_admission_rank_is_immutable_creation_time_then_uid() {
+        let metadata = |uid: &str, creation_timestamp: &str| {
+            serde_json::from_value::<k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta>(serde_json::json!({
+                "name": "same-provider-name",
+                "uid": uid,
+                "generation": 1,
+                "creationTimestamp": creation_timestamp
+            }))
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let first = provider_admission_rank(&metadata("uid-a", "2026-01-01T00:00:00Z"))
+            .unwrap_or_else(|| std::process::abort());
+        let recreated = provider_admission_rank(&metadata("uid-b", "2026-01-01T00:00:00Z"))
+            .unwrap_or_else(|| std::process::abort());
+        let later = provider_admission_rank(&metadata("uid-0", "2026-01-02T00:00:00Z"))
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            first < recreated,
+            "the UID settles providers created at the same timestamp"
+        );
+        assert!(recreated < later, "creation time precedes the UID tie-breaker");
+        assert!(
+            provider_admission_rank(&metadata("", "2026-01-01T00:00:00Z")).is_none(),
+            "an empty object UID cannot provide a durable identity"
+        );
+    }
+
+    #[test]
+    fn source_spec_generation_is_required_and_bounded() {
+        let metadata = |generation| k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            generation,
+            ..Default::default()
+        };
+
+        assert_eq!(provider_spec_generation(&metadata(Some(8))), Some(8));
+        assert!(provider_spec_generation(&metadata(None)).is_none());
+        assert!(provider_spec_generation(&metadata(Some(0))).is_none());
+        assert!(provider_spec_generation(&metadata(Some(-1))).is_none());
+        assert!(provider_spec_generation(&metadata(Some(i64::MAX))).is_none());
     }
 
     #[test]
