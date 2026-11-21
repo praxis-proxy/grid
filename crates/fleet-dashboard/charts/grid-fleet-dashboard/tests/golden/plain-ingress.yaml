@@ -6,10 +6,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.1"
+    app.kubernetes.io/version: "v0.3.2"
     app.kubernetes.io/managed-by: Helm
 ---
 # Source: grid-fleet-dashboard/templates/configmap.yaml
@@ -19,10 +19,10 @@ metadata:
   name: fleet-config
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.1"
+    app.kubernetes.io/version: "v0.3.2"
     app.kubernetes.io/managed-by: Helm
 data:
   config.yaml: |
@@ -56,10 +56,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.1"
+    app.kubernetes.io/version: "v0.3.2"
     app.kubernetes.io/managed-by: Helm
 rules:
   - apiGroups: [""]
@@ -73,10 +73,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.1"
+    app.kubernetes.io/version: "v0.3.2"
     app.kubernetes.io/managed-by: Helm
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -94,10 +94,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.1"
+    app.kubernetes.io/version: "v0.3.2"
     app.kubernetes.io/managed-by: Helm
 spec:
   type: ClusterIP
@@ -117,10 +117,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.1"
+    app.kubernetes.io/version: "v0.3.2"
     app.kubernetes.io/managed-by: Helm
 spec:
   replicas: 1
@@ -134,7 +134,7 @@ spec:
         app.kubernetes.io/name: grid-fleet-dashboard
         app.kubernetes.io/instance: grid-fleet-dashboard
       annotations:
-        checksum/config: 51a555aac7c5d8128394e5c8b3c252267f18dcc8ef356bb8c53e21b9bff61539
+        checksum/config: 729ea4d8eee6cefb285ed7b171920a4a91338cf01f45d210a05cf55d9599f0d8
     spec:
       serviceAccountName: grid-fleet-dashboard
       securityContext:
@@ -143,7 +143,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: dashboard
-          image: "ghcr.io/praxis-proxy/grid-fleet-dashboard:v0.3.1"
+          image: "ghcr.io/praxis-proxy/grid-fleet-dashboard:v0.3.2"
           imagePullPolicy: IfNotPresent
           args:
             - --listen=:8080
@@ -203,10 +203,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.1"
+    app.kubernetes.io/version: "v0.3.2"
     app.kubernetes.io/managed-by: Helm
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt
