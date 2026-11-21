@@ -13,18 +13,28 @@ It learns a soft bound from the most held with nothing waiting and a hard bound
 from the least held at a demonstrated limit. Saturation (rho) combines in-flight
 load relative to that ceiling with direct KV-cache pressure.
 
-Pressure tiers precede prefix affinity. Selection prefers queue-free sites with
-room, then queued sites with room, then sites not marked full. If none remain,
-all healthy sites are eligible. Entirely missing telemetry stays a fallback.
-Affinity narrows only within the selected tier.
+Pressure tiers precede prefix affinity. Selection prefers queue-free, non-full
+sites with measured pressure or an explicit empty-queue reading, then queued
+sites with room, then sites not marked full. If none remain, all healthy sites
+are eligible. Entirely missing telemetry stays a fallback. Affinity narrows
+only within the selected tier.
+Within the preferred queue-free tier, a finite `rho` crossing `1` alone does
+not remove a non-full site. When every remaining site has fresh, finite rho,
+measured saturation is a soft preference. A site marked full or backlogged
+remains in the established fallback tier while an eligible queue-free site
+exists.
 
-Within either tier with room, selection uses pressure when every
-remaining site has fresh rho, even if capacity is unknown. With three or more
-sites, it draws two by capacity and moves from the first to the second in proportion
-to the extra headroom the second has. With two, weights are capacity over 1 + rho, with each share bounded to
-10–90 percent. Unknown capacity receives the mean known capacity, or equal weights
-when all capacities are unknown. Missing rho uses capacity-weighted selection.
-Queue-only and saturated selection retain sites tied on the least queue depth.
+Within the preferred tier, selection uses pressure when every remaining site has
+fresh, finite rho, even if capacity is unknown. A site's pressure preference is
+`1 / (1 + rho)`, so a larger rho reduces but does not zero its share. With three
+or more sites, the gateway draws two by configured capacity and weight, then
+uses their relative pressure preferences to decide whether to move the request
+to the second site. With two sites, it weights each by configured capacity and
+weight times `1 / (1 + rho)`, with each share bounded to 10–90 percent. Unknown
+capacity receives the mean known capacity, or equal weights when all capacities
+are unknown. Missing or unusable rho uses the existing capacity/score fallback.
+The gateway does not maintain a global in-flight reservation across requests or
+gateway replicas; selection responds to the latest coherent sampled snapshot.
 Selection excludes unready sites. A site demoted by gateway health checks is a last
 resort if it remains admitted.
 

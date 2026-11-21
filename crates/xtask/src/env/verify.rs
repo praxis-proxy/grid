@@ -315,6 +315,18 @@ impl PortForwardGuard {
         Self::start_inner(context, NAMESPACE, &resource, &mapping, Stdio::null())
     }
 
+    /// Start a port-forward to a resource in an explicit namespace.
+    pub(crate) fn start_resource(
+        context: &str,
+        namespace: &str,
+        resource: &str,
+        local_port: u16,
+        target_port: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mapping = format!("{local_port}:{target_port}");
+        Self::start_inner(context, namespace, resource, &mapping, Stdio::null())
+    }
+
     /// Start a port-forward with child diagnostics inherited by the xtask log.
     pub(crate) fn start_with_diagnostics(
         context: &str,

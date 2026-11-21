@@ -442,8 +442,8 @@ impl GridSiteRouteFilter {
         tuning.set(cfg.availability, cfg.prefix_affinity);
         let declared = cfg.clusters;
         tracing::info!(
-            "grid_site_route: choosing sites by the nearer measured capacity or provider-reported limit: two choices among 3 or \
-             more sites with room, a weighted pick between 2, and a capacity-weighted pick when none has room"
+            "grid_site_route: choosing sites by measured capacity and soft pressure: two choices among 3 or more candidates, \
+             a weighted pick between 2, and a capacity-weighted fallback when no candidate has a usable pressure sample"
         );
         Ok(Box::new(Self {
             snapshot,
@@ -1521,11 +1521,10 @@ impl<'snap> Sites<'snap> {
 /// Choose a site for `name` among the admitted, `routable` matches.
 ///
 /// The lowest operator-assigned selection group with a candidate that can
-/// accept new work is an eligibility boundary. Within that group, choose a
-/// pressure tier before affinity, keeping entirely missing telemetry as
-/// fallback. Spread observed room by pressure. Unknown capacity uses
-/// mean-known weights. Queue-only and saturated tiers retain least-queue
-/// routing.
+/// accept new work is an eligibility boundary. Within that group, sustained-full
+/// and backlogged candidates stay in their established fallback tiers, while a
+/// non-full candidate's measured saturation is a soft preference on either side
+/// of one. Unknown telemetry keeps the capacity fallback.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request path passes its inputs directly rather than build a struct per request"
@@ -1563,13 +1562,11 @@ pub(crate) fn select_spread<'snap>(
                 .iter()
                 .all(|(candidate, ..)| !candidate.publishes_load && *candidate.site != *snapshot.local_site));
     let healthy = if live.len > 0 { live } else { healthy };
-    let room = Sites::gather(
-        healthy
-            .iter()
-            .filter(|(candidate, ..)| has_room(candidate) && candidate.backlog != Some(true)),
-    );
+    let room = Sites::gather(healthy.iter().filter(|(candidate, ..)| has_soft_room(candidate)));
     let eligible = if room.len > 0 { room } else { overflow(&healthy) };
-    let spread = eligible.iter().all(|(candidate, ..)| has_room(candidate));
+    let spread = eligible
+        .iter()
+        .all(|(candidate, ..)| has_soft_pressure(candidate) || has_observed_room_without_rho(candidate));
     let kept = narrowed(&eligible, narrow);
     let pressure_known = kept.iter().all(|(candidate, ..)| candidate.rho.is_some());
     let pool = if !spread || kept.iter().all(|(candidate, ..)| candidate.rho.is_none()) {
@@ -1668,6 +1665,32 @@ fn has_room(candidate: &RouteCandidate) -> bool {
         && (candidate.rho.is_some() || candidate.backlog.is_some())
 }
 
+/// Whether a fresh, non-full candidate can join the soft pressure spread, including at `rho >= 1`.
+fn has_soft_room(candidate: &RouteCandidate) -> bool {
+    let valid_rho = |rho: f64| rho.is_finite() && rho >= 0.0;
+    candidate.full != Some(true)
+        && candidate.backlog != Some(true)
+        && (candidate.rho.is_some_and(valid_rho) || (candidate.rho.is_none() && candidate.backlog == Some(false)))
+}
+
+/// Whether this candidate's pressure is known well enough to use the soft spread curve.
+fn has_soft_pressure(candidate: &RouteCandidate) -> bool {
+    candidate.full != Some(true)
+        && candidate
+            .rho
+            .is_some_and(|rho| rho.is_finite() && rho >= 0.0 && (rho < 1.0 || candidate.backlog != Some(true)))
+}
+
+/// Keep a freshly observed empty queue in the ordinary capacity spread when `rho` is unknown.
+fn has_observed_room_without_rho(candidate: &RouteCandidate) -> bool {
+    candidate.full != Some(true) && candidate.rho.is_none() && candidate.backlog == Some(false)
+}
+
+/// Positive, monotone preference retained on both sides of the saturation boundary.
+fn soft_preference(rho: f64) -> f64 {
+    1.0 / (1.0 + rho)
+}
+
 /// The sites `narrow` keeps of `room`, or all of them when it keeps none.
 fn narrowed<'snap>(room: &Sites<'snap>, narrow: &impl Narrow) -> Sites<'snap> {
     let view = |(candidate, _, queue): Site<'snap>| SiteView { candidate, queue };
@@ -1700,25 +1723,27 @@ fn mean_capacity(sites: &Sites<'_>) -> f64 {
     if count > 0.0 { sum / count } else { 1.0 }
 }
 
-/// A pick between two sites by weighted capacity over 1 + rho, each share clamped to 0.1..0.9.
+/// A pick between two sites by weighted capacity times soft pressure preference, clamped to 0.1..0.9.
 fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize, unpublished: f64) -> Site<'snap> {
     let rate = |candidate: &RouteCandidate| {
-        candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight) / (1.0 + candidate.rho.unwrap_or(0.0))
+        candidate.capacity.unwrap_or(unpublished)
+            * f64::from(candidate.weight)
+            * soft_preference(candidate.rho.unwrap_or(0.0))
     };
     let share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
     if unit(turn, SALTS.0) < share { first } else { second }
 }
 
 /// Two distinct picks from `sites` by capacity; the request moves to the second only in
-/// proportion to the extra headroom it has, so a tie never moves.
+/// proportion to its greater soft pressure preference, so a tie never moves.
 ///
 /// Taking the lighter outright sends every request to the same site until the next sample.
 fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize, unpublished: f64) -> Option<Site<'snap>> {
     let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight);
     let first = weighted(sites, unit(turn, SALTS.0), None, capacity)?;
     let second = weighted(sites, unit(turn, SALTS.1), Some(first.0), capacity).unwrap_or(first);
-    let headroom = |candidate: &RouteCandidate| (1.0 - candidate.rho.unwrap_or(0.0)).max(0.0);
-    let (kept, other) = (headroom(first.0), headroom(second.0));
+    let preference = |candidate: &RouteCandidate| soft_preference(candidate.rho.unwrap_or(0.0));
+    let (kept, other) = (preference(first.0), preference(second.0));
     let moved = if other > kept { 1.0 - kept / other } else { 0.0 };
     Some(if unit(turn, SALTS.2) < moved { second } else { first })
 }
@@ -2871,14 +2896,20 @@ pub(crate) mod tests {
 
     #[test]
     fn two_choices_prefer_the_lighter_site_and_never_a_full_one() {
-        let snapshot = loaded(&[
+        let mut snapshot = loaded(&[
             ("a", Some(2.0), Some(10.0)),
             ("b", Some(8.0), Some(10.0)),
             ("c", Some(5.0), Some(10.0)),
             ("d", Some(10.0), Some(10.0)),
         ]);
+        let full = snapshot
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.site.as_ref() == "d")
+            .expect("site d is present");
+        full.full = Some(true);
         let taken = shares(&snapshot, 3_000, &KeepAll);
-        assert_eq!(taken.get("d"), None, "rho 1 has no room");
+        assert_eq!(taken.get("d"), None, "a sustained-full site stays out of the room tier");
         let (a, b, c) = (taken["a"], taken["b"], taken["c"]);
         assert!(a > c && c > b, "the lighter site takes more: a {a}, c {c}, b {b}");
         assert!(b > 0, "the heaviest with room takes the least, not nothing: {b}");
@@ -2898,6 +2929,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_soft_saturation_crossing_one_keeps_a_bounded_positive_share() {
+        const REQUESTS: usize = 40_000;
+        let mut observed = Vec::new();
+        for rho in [0.99, 1.0, 1.01] {
+            let mut snapshot = reading(&[("a", 0.0), ("b", rho)]);
+            for candidate in &mut snapshot.candidates {
+                candidate.full = Some(false);
+                candidate.backlog = Some(false);
+            }
+            let taken = shares(&snapshot, REQUESTS, &KeepAll);
+            let share = f64::from(u32::try_from(taken.get("b").copied().unwrap_or_default()).unwrap_or(u32::MAX))
+                / f64::from(u32::try_from(REQUESTS).unwrap_or(u32::MAX));
+            assert!(share > 0.0, "site b remains selectable at rho={rho}: {taken:?}");
+            observed.push(share);
+        }
+        for (from, to) in observed.iter().zip(observed.iter().skip(1)) {
+            assert!(
+                (from - to).abs() <= 0.05,
+                "crossing rho=1 must not create a sample-wide selection cliff: {observed:?}"
+            );
+        }
+        let preferences = [0.99, 1.0, 1.01].map(soft_preference);
+        assert!(
+            preferences[0] > preferences[1] && preferences[1] > preferences[2],
+            "the soft preference decreases with pressure on both sides of one: {preferences:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_choice_path_keeps_a_soft_saturated_site_in_the_draw() {
+        const REQUESTS: usize = 60_000;
+        let mut observed = Vec::new();
+        for rho in [0.99, 1.0, 1.01] {
+            let mut snapshot = reading(&[("a", 0.0), ("b", rho), ("c", 0.0)]);
+            for candidate in &mut snapshot.candidates {
+                candidate.full = Some(false);
+                candidate.backlog = Some(false);
+            }
+            let taken = shares(&snapshot, REQUESTS, &KeepAll);
+            let share = f64::from(u32::try_from(taken.get("b").copied().unwrap_or_default()).unwrap_or(u32::MAX))
+                / f64::from(u32::try_from(REQUESTS).unwrap_or(u32::MAX));
+            assert!(
+                share > 0.0,
+                "the two-choice path retains site b at rho={rho}: {taken:?}"
+            );
+            observed.push(share);
+        }
+        for (from, to) in observed.iter().zip(observed.iter().skip(1)) {
+            assert!(
+                (from - to).abs() <= 0.03,
+                "the two-choice path must not cliff at rho=1: {observed:?}"
+            );
+        }
+        let preferences = [0.99, 1.0, 1.01].map(soft_preference);
+        assert!(
+            preferences[0] > preferences[1] && preferences[1] > preferences[2],
+            "the two-choice pressure preference falls as rho rises: {preferences:?}"
+        );
+    }
+
+    #[test]
     fn a_leftover_saturation_does_not_starve_a_site_among_idle_ones() {
         for rhos in [
             [("a", 0.0), ("b", 1e-12), ("c", 0.0)],
@@ -2914,18 +3006,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_second_pick_gains_only_by_the_headroom_it_has_over_the_first() {
-        // Of six equally likely ordered pairs, `a` keeps the two it leads and takes half of the
-        // two where it follows a site with half its headroom: a half in all, not two thirds.
+    fn three_site_spread_moves_by_relative_soft_pressure_preference() {
         let taken = shares(&reading(&[("a", 0.0), ("b", 0.5), ("c", 0.5)]), 3_000, &KeepAll);
-        assert!((1_350..=1_650).contains(&taken["a"]), "a takes about a half: {taken:?}");
+        assert!((1_250..=1_450).contains(&taken["a"]), "a takes about 44%: {taken:?}");
         for site in ["b", "c"] {
-            assert!(
-                (600..=900).contains(&taken[site]),
-                "{site} keeps about a quarter: {taken:?}"
-            );
+            assert!((700..=950).contains(&taken[site]), "{site} keeps about 28%: {taken:?}");
         }
-        let near = shares(&reading(&[("a", 0.90), ("b", 0.93), ("c", 0.96)]), 3_000, &KeepAll);
+        let near = shares(&reading(&[("a", 0.5), ("b", 0.9), ("c", 1.1)]), 30_000, &KeepAll);
         assert!(
             near["a"] > near["b"] && near["b"] > near["c"] && near["c"] > 0,
             "near the ceiling the lighter takes more and none is shut out: {near:?}"
@@ -3010,13 +3097,22 @@ pub(crate) mod tests {
 
     #[test]
     fn a_lone_site_with_room_takes_every_request() {
-        let snapshot = loaded(&[("a", Some(12.0), Some(10.0)), ("b", Some(3.0), Some(10.0))]);
+        let mut snapshot = loaded(&[("a", Some(12.0), Some(10.0)), ("b", Some(3.0), Some(10.0))]);
+        snapshot
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.site.as_ref() == "a")
+            .expect("site a is present")
+            .full = Some(true);
         assert_eq!(shares(&snapshot, 200, &KeepAll).get("b"), Some(&200));
     }
 
     #[test]
     fn with_no_room_anywhere_the_overflow_draws_by_capacity() {
-        let snapshot = loaded(&[("a", Some(30.0), Some(30.0)), ("b", Some(10.0), Some(10.0))]);
+        let mut snapshot = loaded(&[("a", Some(30.0), Some(30.0)), ("b", Some(10.0), Some(10.0))]);
+        for candidate in &mut snapshot.candidates {
+            candidate.full = Some(true);
+        }
         let taken = shares(&snapshot, 4_000, &KeepAll);
         assert!(
             (2_700..=3_300).contains(&taken["a"]),
@@ -3067,11 +3163,17 @@ pub(crate) mod tests {
 
     #[test]
     fn a_narrowing_stage_can_only_remove_sites_and_clearing_all_keeps_all() {
-        let snapshot = loaded(&[
+        let mut snapshot = loaded(&[
             ("a", Some(1.0), Some(10.0)),
             ("b", Some(5.0), Some(10.0)),
             ("c", Some(12.0), Some(10.0)),
         ]);
+        snapshot
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.site.as_ref() == "c")
+            .expect("site c is present")
+            .full = Some(true);
         assert_eq!(shares(&snapshot, 300, &Only { all: false }).get("b"), Some(&300));
         let taken = shares(&snapshot, 300, &Only { all: true });
         assert_eq!(taken.get("c"), None, "a full site is never added back");
@@ -3082,7 +3184,6 @@ pub(crate) mod tests {
     fn pressure_tiers_precede_even_a_strong_warm_affinity() {
         for (rho, backlog, full) in [
             (Some(0.3), Some(true), Some(false)),
-            (Some(1.0), Some(false), None),
             (None, Some(true), None),
             (Some(0.3), Some(false), Some(true)),
         ] {
@@ -3104,20 +3205,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_backlogged_pool_precedes_a_queue_free_but_kv_saturated_pool() {
+    fn a_queue_free_not_full_pool_at_one_stays_eligible() {
         let mut snapshot = loaded(&[("a", None, None), ("b", Some(3.0), Some(10.0))]);
         for candidate in &mut snapshot.candidates {
             let saturated = candidate.site.as_ref() == "a";
             candidate.rho = Some(if saturated { 1.0 } else { 0.3 });
             candidate.backlog = Some(!saturated);
         }
-        snapshot.scores = vec![0.0, 2.0];
-        assert_eq!(shares(&snapshot, 300, &KeepAll).get("b"), Some(&300));
+        snapshot.scores = vec![0.0; 2];
+        assert_eq!(shares(&snapshot, 300, &KeepAll).get("a"), Some(&300));
         let filter = filter(snapshot, steady());
         assert_eq!(
             pick_for_a_prompt(&filter).as_deref(),
-            Some("b"),
-            "affinity cannot restore the KV-full pool"
+            Some("a"),
+            "rho=1 alone no longer removes a non-full candidate from the affinity set"
         );
     }
 
@@ -3410,7 +3511,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pressure_tiers_match_an_exhaustive_pairwise_oracle() {
+    fn soft_saturation_preserves_hard_pressure_tiers_pairwise() {
         let states: Vec<_> = [None, Some(0.3), Some(1.0)]
             .into_iter()
             .flat_map(|rho| {
@@ -3421,6 +3522,29 @@ pub(crate) mod tests {
                 })
             })
             .collect();
+        let soft_room = |state: &(Option<f64>, Option<bool>, Option<bool>)| {
+            let (rho, backlog, full) = *state;
+            full != Some(true)
+                && backlog != Some(true)
+                && (rho.is_some_and(|rho| rho.is_finite() && rho >= 0.0) || (rho.is_none() && backlog == Some(false)))
+        };
+        let fallback_room = |state: &(Option<f64>, Option<bool>, Option<bool>)| {
+            let (rho, backlog, full) = *state;
+            full != Some(true) && rho.is_none_or(|rho| rho < 1.0) && (rho.is_some() || backlog.is_some())
+        };
+        let open = |state: &(Option<f64>, Option<bool>, Option<bool>)| state.2 != Some(true);
+        let tier = |state: &(Option<f64>, Option<bool>, Option<bool>),
+                    other: &(Option<f64>, Option<bool>, Option<bool>)| {
+            if soft_room(state) || soft_room(other) {
+                if soft_room(state) { 0 } else { 1 }
+            } else if fallback_room(state) || fallback_room(other) {
+                if fallback_room(state) { 0 } else { 1 }
+            } else if open(state) || open(other) {
+                if open(state) { 0 } else { 1 }
+            } else {
+                0
+            }
+        };
         for left in &states {
             for right in &states {
                 let mut snapshot = loaded(&[("a", None, None), ("b", None, None)]);
@@ -3430,14 +3554,8 @@ pub(crate) mod tests {
                     candidate.full = full;
                 }
                 snapshot.scores = vec![0.0; 2];
-                let priority =
-                    |&(rho, backlog, full): &(Option<f64>, Option<bool>, Option<bool>)| match (full, rho, backlog) {
-                        (Some(true), ..) => 3,
-                        (_, Some(1.0), _) | (_, None, None) => 2,
-                        (_, _, Some(true)) => 1,
-                        _ => 0,
-                    };
-                let best = priority(left).min(priority(right));
+                let left_tier = tier(left, right);
+                let right_tier = tier(right, left);
                 for turn in 0..32 {
                     let chosen = select_spread(
                         &snapshot,
@@ -3453,7 +3571,12 @@ pub(crate) mod tests {
                     } else {
                         right
                     };
-                    assert_eq!(priority(state), best, "left={left:?}, right={right:?}, turn={turn}");
+                    let expected_tier = if std::ptr::eq(state, left) {
+                        left_tier
+                    } else {
+                        right_tier
+                    };
+                    assert_eq!(expected_tier, 0, "left={left:?}, right={right:?}, turn={turn}");
                 }
             }
         }

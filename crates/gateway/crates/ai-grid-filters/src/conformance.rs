@@ -1000,22 +1000,21 @@ mod tests {
         );
     }
 
-    /// The sharp end of the same defect: at the moment every site holds exactly what
-    /// it admits, the honest sites report rho 1.0 and leave the draw while the
-    /// overdeclared one reports 0.5 and keeps all of it.
-    ///
-    /// The third assertion names the mechanism. With saturation off the wire the same
-    /// grid spreads, so what concentrates the traffic is the denominator rho is
-    /// computed against, not the draw's weight. That is the number to fix.
+    /// When every site holds exactly what it admits, the honest sites report rho
+    /// 1.0 without a backlog. They must remain in the draw even though the
+    /// overdeclared hub reports lower rho and still receives a larger capacity
+    /// weight. Without saturation on the wire, the same grid also spreads.
     #[test]
-    fn an_overdeclared_site_takes_the_whole_grid_when_every_site_is_full() {
+    fn an_overdeclared_site_does_not_exclude_soft_saturated_peers() {
         let observed = dispatch(&OVERDECLARED_FULL, &Run::fresh(0..DRAWS));
-        assert!(
-            spreads(&observed, CEILING).is_err(),
-            "the full grid spread, so either rho is no longer computed against the \
-             declared capacity, in which case invert this assertion, or the scenario \
-             no longer fills the sites"
-        );
+        spreads(&observed, CEILING).expect("rho=1 peers without backlog stay in the draw");
+        for peer in &observed[1..] {
+            assert!(
+                peer.dispatched > 0,
+                "{} is soft-saturated without backlog and must retain traffic: {observed:?}",
+                peer.site
+            );
+        }
 
         let honest = dispatch(&HONEST_FULL, &Run::fresh(0..DRAWS));
         spreads(&honest, CEILING).expect("an honest full grid keeps spreading");
@@ -1900,10 +1899,15 @@ mod tests {
                                 assert_eq!(candidate.full, None, "partial signals cannot authorize shedding");
                                 assert_eq!(candidate.relieved, None);
                                 let draws = routed_to(&snapshot, &candidate.site);
-                                if waiting || kv == Some(1.0) || (queue.is_none() && kv.is_none()) {
-                                    assert_eq!(draws, 0, "known pressure is avoided beside a clear pool");
+                                if waiting {
+                                    assert_eq!(draws, 0, "backlog remains excluded beside a clear pool");
+                                } else if queue.is_none() && kv.is_none() {
+                                    assert_eq!(draws, 0, "no telemetry remains a fallback beside a clear pool");
                                 } else {
-                                    assert!(draws > 0, "unknown capacity must not prevent participation");
+                                    assert!(
+                                        draws > 0,
+                                        "known pressure without backlog remains eligible; unknown capacity must not prevent participation"
+                                    );
                                 }
                             }
                             let availability = AvailabilitySettings {
@@ -1921,6 +1925,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A measured clear queue with unknown rho keeps the pre-existing capacity spread.
+    #[test]
+    fn partial_queue_without_rho_keeps_capacity_weighted_routing() {
+        let sites = &EQUAL_CAPACITY[..2];
+        let mut grid = Harness::new(WINDOW_MS);
+        publish_cool(&grid, &sites[..1], NOW_MS, 20.0, 0.0);
+        publish_partial(&grid, &sites[1], NOW_MS, Some(0.5), None, None, None);
+        let snapshot = grid.order(sites, NOW_MS);
+        let subject = snapshot
+            .candidates
+            .iter()
+            .find(|candidate| candidate.site.as_ref() == sites[1].site)
+            .expect("the candidate remains configured");
+
+        assert_eq!(subject.capacity, None, "missing concurrency cannot invent capacity");
+        assert_eq!(subject.rho, None, "queue-only telemetry need not establish rho");
+        assert_eq!(subject.backlog, Some(false), "the queue is below the full threshold");
+        assert!(
+            routed_to(&snapshot, sites[1].site) > 0,
+            "the unknown-rho candidate stays in the ordinary capacity-weighted spread"
+        );
+    }
+
+    /// Soft saturation without backlog remains eligible, while an actual backlog excludes it.
+    #[test]
+    fn soft_saturation_stays_eligible_but_backlog_remains_excluded() {
+        let sites = &EQUAL_CAPACITY[..2];
+        let mut grid = Harness::new(WINDOW_MS);
+        publish_cool(&grid, &sites[..1], NOW_MS, 20.0, 0.0);
+        publish_partial(&grid, &sites[1], NOW_MS, Some(0.0), Some(0.0), Some(1.0), Some(1.0));
+
+        let soft = grid.order(sites, NOW_MS);
+        let soft_candidate = soft
+            .candidates
+            .iter()
+            .find(|candidate| candidate.site.as_ref() == sites[1].site)
+            .expect("the candidate remains configured");
+        assert!(soft_candidate.rho.is_some_and(|rho| rho > 1.0));
+        assert_eq!(soft_candidate.backlog, Some(false));
+        assert_ne!(soft_candidate.full, Some(true));
+        assert!(
+            routed_to(&soft, sites[1].site) > 0,
+            "soft saturation keeps a positive share"
+        );
+
+        let backlog_at = NOW_MS + REFRESH_MS;
+        publish_cool(&grid, &sites[..1], backlog_at, 20.0, 0.0);
+        publish_partial(&grid, &sites[1], backlog_at, Some(1.0), Some(0.0), Some(1.0), Some(1.0));
+        let backlogged = grid.order(sites, backlog_at);
+        let backlog_candidate = backlogged
+            .candidates
+            .iter()
+            .find(|candidate| candidate.site.as_ref() == sites[1].site)
+            .expect("the candidate remains configured");
+        assert_eq!(backlog_candidate.backlog, Some(true));
+        assert_eq!(routed_to(&backlogged, sites[1].site), 0, "backlog remains excluded");
     }
 
     #[test]
@@ -1947,8 +2009,8 @@ mod tests {
                     let high = routed_to(&snapshot, sites[0].site);
                     assert!(low > middle && middle > high, "two choices must favor lower pressure");
                     assert!(
-                        (1..DRAWS / 20).contains(&high),
-                        "the highest pressure keeps a sliver, got {high}/{DRAWS}"
+                        high > 0,
+                        "the highest pressure keeps a positive reduced share under the soft preference, got {high}/{DRAWS}"
                     );
                 }
                 snapshot.candidates.reverse();
@@ -1967,16 +2029,37 @@ mod tests {
             publish_cool(&grid, &sites[..1], NOW_MS, 20.0, 0.0);
             publish_partial(&grid, &sites[1], NOW_MS, Some(queue), None, Some(kv), Some(1.0));
             let pressured = grid.order(sites, NOW_MS);
-            assert_eq!(routed_to(&pressured, sites[1].site), 0);
+            let pressured_candidate = pressured
+                .candidates
+                .iter()
+                .find(|candidate| candidate.site.as_ref() == sites[1].site)
+                .expect("the candidate remains configured");
+            let draws = routed_to(&pressured, sites[1].site);
+            if pressured_candidate.backlog == Some(true) {
+                assert_eq!(draws, 0, "a backlogged candidate remains excluded");
+            } else {
+                assert!(
+                    pressured_candidate.rho.is_some_and(|rho| rho >= 1.0),
+                    "this branch exercises soft saturation without backlog: {pressured_candidate:?}"
+                );
+                assert!(draws > 0, "rho >= 1 without backlog keeps a positive share");
+            }
             let expired_at = NOW_MS + WINDOW_MS + 1;
             publish_cool(&grid, &sites[..1], expired_at, 20.0, 0.0);
             let expired = grid.order(sites, expired_at);
-            let subject = expired
+            let expired_candidate = expired
                 .candidates
                 .iter()
                 .find(|c| c.site.as_ref() == sites[1].site)
                 .unwrap();
-            assert_eq!((subject.capacity, subject.rho, subject.backlog), (None, None, None));
+            assert_eq!(
+                (
+                    expired_candidate.capacity,
+                    expired_candidate.rho,
+                    expired_candidate.backlog
+                ),
+                (None, None, None)
+            );
             assert_eq!(
                 routed_to(&expired, sites[1].site),
                 0,
@@ -2055,7 +2138,16 @@ mod tests {
             Some(1.0),
             "5 waiting per unit is the comparator's full point"
         );
-        assert_eq!(routed_to(&snapshot, sites[1].site), 0, "a full comparator has no room");
+        assert_eq!(
+            subject.backlog,
+            Some(false),
+            "the configured threshold allows no backlog"
+        );
+        assert_eq!(subject.full, None, "instantaneous rho is not sustained fullness");
+        assert!(
+            routed_to(&snapshot, sites[1].site) > 0,
+            "rho=1 without backlog keeps a positive soft-saturation share"
+        );
     }
 
     /// Clearing recent pressure restores participation before the long queue window expires.

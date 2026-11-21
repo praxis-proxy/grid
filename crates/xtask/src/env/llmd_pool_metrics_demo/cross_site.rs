@@ -2,15 +2,20 @@
 
 #![expect(
     clippy::disallowed_methods,
+    clippy::large_stack_frames,
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "This synchronous Kind proof owns bounded polling and one ordered live-signal lifecycle"
+    reason = "This synchronous Kind proof owns bounded polling, ordered lifecycle phases, and their bounded diagnostic state"
 )]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    io::Write as _,
+    process::{Command, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -64,12 +69,96 @@ const ACTIVE_SIGNAL_GAUGES: [&str; 3] = [
 ];
 /// The operator's serving-config builder currently polls its local peer every second.
 const EXPECTED_GATEWAY_POLL_INTERVAL_MS: u64 = 1_000;
+/// Scraper identity authorized by the Grid Gateway metrics listener chart.
+const GRID_SERVING_GATEWAY_METRICS_SCRAPER_SA: &str = "grid-serving-gateway-metrics-scraper";
+/// Delimiter separating curl's response body from its HTTP status.
+const METRICS_HTTP_STATUS_MARKER: &str = "\n__GRID_METRICS_HTTP_STATUS__=";
 /// Site and cluster identity in the Gateway's serving topology.
 type ServingCandidatePair = (String, String);
 /// Parsed site/cluster pairs from the operator-generated serving configuration.
 type ServingCandidatePairsResult = Result<BTreeSet<ServingCandidatePair>, Box<dyn std::error::Error>>;
 /// Process-wide request counter so separate routing samples never reuse a session identifier.
 static SITE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Short-lived credential for the run-owned Gateway metrics listener.
+///
+/// The Gateway chart requires a Kubernetes-authorized scraper token. Keep the token in
+/// memory and out of command-line arguments, logs, and evidence files.
+pub(super) struct GatewayMetricsReader {
+    /// Kubernetes context used to refresh the scraper token after expiry.
+    context: String,
+    /// Short-lived credential kept in memory and refreshed on an unauthorized response.
+    token: Mutex<String>,
+    /// Local forwarded port for the run-owned Gateway metrics listener.
+    port: u16,
+}
+
+impl GatewayMetricsReader {
+    /// Mint a short-lived token for the chart's metrics-scraper ServiceAccount.
+    pub(super) fn for_context(context: &str, port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        let token = mint_metrics_scraper_token(context)?;
+        Ok(Self {
+            context: context.to_owned(),
+            token: Mutex::new(token),
+            port,
+        })
+    }
+
+    /// Fetch authenticated Gateway metrics, refreshing the token once after expiry.
+    pub(super) fn read(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let current_token_guard = self
+            .token
+            .lock()
+            .map_err(|error| std::io::Error::other(format!("Gateway metrics token lock failed: {error}")))?;
+        let token = current_token_guard.clone();
+        drop(current_token_guard);
+        match read_metrics_url(self.port, false, Some(&token)) {
+            Ok(metrics) => Ok(metrics),
+            Err(read_error) if read_error.to_string().contains("HTTP 401") => {
+                let refreshed_token = mint_metrics_scraper_token(&self.context)?;
+                let mut refreshed_token_guard = self.token.lock().map_err(|lock_error| {
+                    std::io::Error::other(format!("Gateway metrics token lock failed: {lock_error}"))
+                })?;
+                refreshed_token_guard.clone_from(&refreshed_token);
+                drop(refreshed_token_guard);
+                read_metrics_url(self.port, false, Some(&refreshed_token))
+            },
+            Err(read_error) => Err(read_error),
+        }
+    }
+}
+
+/// Mint and validate a short-lived token without including it in command arguments or diagnostics.
+fn mint_metrics_scraper_token(context: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "token",
+            GRID_SERVING_GATEWAY_METRICS_SCRAPER_SA,
+            "--duration=10m",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not mint Gateway metrics-scraper token: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let token = String::from_utf8(output.stdout)?.trim().to_owned();
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-=".contains(&byte))
+    {
+        return Err("kubectl returned an invalid Gateway metrics-scraper token".into());
+    }
+    Ok(token)
+}
 
 /// One exact node attachment to the run-owned cross-cluster Docker network.
 struct NetworkAttachment {
@@ -514,6 +603,7 @@ fn run(
         &format!("{GRID_SERVING_GATEWAY}-metrics"),
         GRID_SERVING_METRICS_PORT,
     )?;
+    let gateway_metrics_reader = Box::new(GatewayMetricsReader::for_context(&local_context, gateway_metrics_port)?);
     let (operator_metrics_port, _operator_metrics_forward) =
         start_ready_port_forward(&local_context, "grid-operator-metrics", OPERATOR_METRICS_PORT)?;
     let peer_context = kind_context("pool-b");
@@ -525,7 +615,7 @@ fn run(
         observations,
         format!("Grid Gateway serving config names its local operator poll target: {serving_peer}"),
     );
-    wait_for_gateway_config_observed(gateway_metrics_port, Duration::from_secs(90))?;
+    wait_for_gateway_config_observed(&gateway_metrics_reader, Duration::from_secs(90))?;
     record(
         observations,
         "Grid Gateway watcher observed its mounted serving configuration".to_owned(),
@@ -571,7 +661,7 @@ fn run(
 
     verify_weighted_site_distribution(
         gateway_http_port,
-        gateway_metrics_port,
+        &gateway_metrics_reader,
         "pool-a",
         false,
         "lower-pressure-baseline",
@@ -580,7 +670,7 @@ fn run(
     )
     .map(|distribution| record(observations, format!("lower-pressure baseline: {distribution}")))?;
     let gateway_uid = gateway_pod_uid(&local_context)?;
-    let gateway_reloads_before_shift = applied_gateway_reload_count(gateway_metrics_port)?;
+    let gateway_reloads_before_shift = applied_gateway_reload_count(&gateway_metrics_reader)?;
 
     set_cross_site_waiting_requests(
         "pool-a",
@@ -598,7 +688,7 @@ fn run(
     )?;
     verify_weighted_site_distribution(
         gateway_http_port,
-        gateway_metrics_port,
+        &gateway_metrics_reader,
         "pool-b",
         true,
         "live-pressure-shift",
@@ -613,7 +703,7 @@ fn run(
         )
         .into());
     }
-    if (applied_gateway_reload_count(gateway_metrics_port)? - gateway_reloads_before_shift).abs() > f64::EPSILON {
+    if (applied_gateway_reload_count(&gateway_metrics_reader)? - gateway_reloads_before_shift).abs() > f64::EPSILON {
         return Err("Grid Gateway reloaded serving configuration during the signal-only pressure shift".into());
     }
     record(
@@ -621,7 +711,7 @@ fn run(
         format!("Grid Gateway pod UID remained {gateway_uid}; its serving-config reload count stayed unchanged"),
     );
 
-    let metrics_before_signal_loss = read_gateway_metrics(gateway_metrics_port)?;
+    let metrics_before_signal_loss = gateway_metrics_reader.read()?;
     let active_site_metrics = require_active_signal_gauges(&metrics_before_signal_loss, "pool-a", POOL_A_PROVIDER)?;
     if !serving_candidate_pairs(&local_context)?.contains(&("pool-a".to_owned(), POOL_A_PROVIDER.to_owned())) {
         return Err("pool-a provider is absent before the stale-signal gauge proof".into());
@@ -681,7 +771,7 @@ fn run(
         );
     })?;
     let cleared_site_metrics = wait_for_measured_site_gauges_cleared(
-        gateway_metrics_port,
+        &gateway_metrics_reader,
         "pool-a",
         POOL_A_PROVIDER,
         Duration::from_secs(90),
@@ -704,7 +794,7 @@ fn run(
     wait_for_relay_samples(operator_metrics_port, Duration::from_secs(120))?;
     verify_weighted_site_distribution(
         gateway_http_port,
-        gateway_metrics_port,
+        &gateway_metrics_reader,
         "pool-a",
         true,
         "signal-and-route-recovery",
@@ -733,7 +823,7 @@ fn run(
     )?;
     let pre_pin_route = verify_weighted_site_distribution(
         gateway_http_port,
-        gateway_metrics_port,
+        &gateway_metrics_reader,
         "pool-a",
         true,
         "pre-pin-pressure-baseline",
@@ -980,7 +1070,7 @@ fn run(
     )?;
     verify_weighted_site_distribution(
         gateway_http_port,
-        gateway_metrics_port,
+        &gateway_metrics_reader,
         "pool-b",
         true,
         "restored-peer-identity-routing",
@@ -1000,7 +1090,7 @@ fn run(
     prove_network_partition(
         context,
         gateway_http_port,
-        gateway_metrics_port,
+        &gateway_metrics_reader,
         operator_metrics_port,
         mtls,
         &gateway_uid,
@@ -1011,7 +1101,7 @@ fn run(
         return Err("Grid Gateway pod changed during the cross-site signal proof".into());
     }
 
-    let gateway_metrics = read_gateway_metrics(gateway_metrics_port)?;
+    let gateway_metrics = gateway_metrics_reader.read()?;
     record(
         observations,
         format!(
@@ -1135,7 +1225,7 @@ pub(super) fn start_ready_port_forward(
 fn prove_network_partition(
     context: &DemoContext,
     gateway_port: u16,
-    gateway_metrics_port: u16,
+    gateway_metrics: &GatewayMetricsReader,
     operator_port: u16,
     mtls: bool,
     expected_gateway_uid: &str,
@@ -1158,7 +1248,7 @@ fn prove_network_partition(
     )?;
     verify_weighted_site_distribution(
         gateway_port,
-        gateway_metrics_port,
+        gateway_metrics,
         "pool-b",
         true,
         "network-partition-precondition",
@@ -1189,7 +1279,7 @@ fn prove_network_partition(
 
     let degradation_result = wait_for_partition_degradation(
         gateway_port,
-        gateway_metrics_port,
+        gateway_metrics,
         &local_context,
         remote_cluster,
         Duration::from_secs(180),
@@ -1231,7 +1321,7 @@ fn prove_network_partition(
     )?;
     verify_weighted_site_distribution(
         gateway_port,
-        gateway_metrics_port,
+        gateway_metrics,
         "pool-b",
         true,
         "network-partition-recovery",
@@ -1253,7 +1343,7 @@ fn prove_network_partition(
 /// Send requests during a partition until SWIM membership is lost and real traffic falls back locally.
 fn wait_for_partition_degradation(
     gateway_port: u16,
-    gateway_metrics_port: u16,
+    gateway_metrics: &GatewayMetricsReader,
     local_context: &str,
     remote_cluster: &str,
     timeout: Duration,
@@ -1299,7 +1389,7 @@ fn wait_for_partition_degradation(
 
         let connected = read_connected_sites(local_context);
         let overlay_fresh = read_overlay_candidate_fresh(GRID_SERVING_SITE, remote_cluster);
-        let gateway_metrics = read_gateway_metrics(gateway_metrics_port);
+        let gateway_metrics = gateway_metrics.read();
         let (signal_silent, last_sample_age) = gateway_metrics.as_ref().map_or((None, None), |metrics| {
             (
                 gateway_site_signal_silent(metrics, remote_site, remote_cluster),
@@ -1704,7 +1794,7 @@ fn measured_site_gauge_summary(metrics: &str, site: &str, cluster: &str) -> Stri
 
 /// Wait for every measured gauge to clear while the candidate remains published.
 fn wait_for_measured_site_gauges_cleared(
-    port: u16,
+    gateway_metrics: &GatewayMetricsReader,
     site: &str,
     cluster: &str,
     timeout: Duration,
@@ -1712,7 +1802,7 @@ fn wait_for_measured_site_gauges_cleared(
     let deadline = Instant::now() + timeout;
     let mut last = String::from("Gateway metrics unavailable");
     while Instant::now() < deadline {
-        match read_gateway_metrics(port) {
+        match gateway_metrics.read() {
             Ok(metrics) => {
                 last = measured_site_gauge_summary(&metrics, site, cluster);
                 if measured_site_gauges_are_cleared(&metrics, site, cluster) {
@@ -1756,12 +1846,15 @@ fn is_expected_local_operator_peer(peer: &serde_json::Value) -> bool {
 }
 
 /// Wait until the deployed gateway watcher applies or reuses its mounted serving config.
-fn wait_for_gateway_config_observed(port: u16, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_gateway_config_observed(
+    gateway_metrics: &GatewayMetricsReader,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     let mut applied = 0.0;
     let mut reused = 0.0;
     while Instant::now() < deadline {
-        if let Ok(metrics) = read_gateway_metrics(port) {
+        if let Ok(metrics) = gateway_metrics.read() {
             applied = applied_gateway_reload_count_from_text(&metrics);
             reused = reused_gateway_config_count_from_text(&metrics);
             if applied + reused > 0.0 {
@@ -1777,8 +1870,8 @@ fn wait_for_gateway_config_observed(port: u16, timeout: Duration) -> Result<(), 
 }
 
 /// Return the gateway's accepted serving-config reload count.
-fn applied_gateway_reload_count(port: u16) -> Result<f64, Box<dyn std::error::Error>> {
-    Ok(applied_gateway_reload_count_from_text(&read_gateway_metrics(port)?))
+fn applied_gateway_reload_count(gateway_metrics: &GatewayMetricsReader) -> Result<f64, Box<dyn std::error::Error>> {
+    Ok(applied_gateway_reload_count_from_text(&gateway_metrics.read()?))
 }
 
 /// Parse the accepted serving-config reload counter from gateway metrics.
@@ -1956,7 +2049,7 @@ fn weighted_selector_sample_delta(
 /// Wait for Gateway pressure metrics, then compare one attributed sample to the merged weighted selector.
 fn verify_weighted_site_distribution(
     gateway_port: u16,
-    metrics_port: u16,
+    gateway_metrics: &GatewayMetricsReader,
     expected_site: &str,
     require_strict_pressure_preference: bool,
     phase: &str,
@@ -1975,7 +2068,7 @@ fn verify_weighted_site_distribution(
     let mut pre_sample_retries = 0_u32;
     let mut metric_observations = 0_u32;
     while Instant::now() < deadline {
-        match read_gateway_metrics(metrics_port).and_then(|metrics| {
+        match gateway_metrics.read().and_then(|metrics| {
             weighted_route_metrics(&metrics, expected_site, require_strict_pressure_preference).map_err(Into::into)
         }) {
             Ok(current) => {
@@ -1988,8 +2081,8 @@ fn verify_weighted_site_distribution(
                 last = format!("metrics={current:?}; consecutive stable observations={stable_samples}");
                 previous = Some(current);
                 if stable_samples >= 2 {
-                    let before_snapshot: Result<_, Box<dyn std::error::Error>> = read_gateway_metrics(metrics_port)
-                        .and_then(|metrics| {
+                    let before_snapshot: Result<_, Box<dyn std::error::Error>> =
+                        gateway_metrics.read().and_then(|metrics| {
                             let state =
                                 weighted_route_metrics(&metrics, expected_site, require_strict_pressure_preference)
                                     .map_err(Box::<dyn std::error::Error>::from)?;
@@ -2035,12 +2128,12 @@ fn verify_weighted_site_distribution(
                     let mut after_metrics = None;
                     while requests_remaining > 0 {
                         let batch_requests = requests_remaining.min(WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS);
-                        let before_metrics = read_gateway_metrics(metrics_port)?;
+                        let before_metrics = gateway_metrics.read()?;
                         let before_batch =
                             weighted_route_metrics(&before_metrics, expected_site, require_strict_pressure_preference)?;
                         let batch = route_distribution(gateway_port, batch_requests, phase, attribution)?;
                         distribution.merge(batch);
-                        let current_metrics = read_gateway_metrics(metrics_port)?;
+                        let current_metrics = gateway_metrics.read()?;
                         let after_batch = weighted_route_metrics(
                             &current_metrics,
                             expected_site,
@@ -2105,7 +2198,7 @@ fn verify_weighted_site_distribution(
                 }
             },
             Err(error) => {
-                let telemetry = read_gateway_metrics(metrics_port).map_or_else(
+                let telemetry = gateway_metrics.read().map_or_else(
                     |metrics_error| format!("Gateway telemetry unavailable: {metrics_error}"),
                     |metrics| route_metric_diagnostics(&metrics),
                 );
@@ -2120,6 +2213,58 @@ fn verify_weighted_site_distribution(
         "Gateway did not expose a stable queue-score and pressure order with {expected_site} preferred within {timeout:?} after {metric_observations} valid metric observations: {last}"
     )
     .into())
+}
+
+/// Collect an attributed request sample while the caller verifies signal windows independently.
+pub(super) fn verify_attributed_site_sample(
+    gateway_port: u16,
+    gateway_metrics: &GatewayMetricsReader,
+    phase: &str,
+    request_count: usize,
+    attribution: &mut RoutingAttributionDiagnostics,
+    mut validate_window: impl FnMut(&str, &str) -> Result<(), String>,
+) -> Result<(RouteDistribution, String), Box<dyn std::error::Error>> {
+    let warmup = route_distribution(gateway_port, 1, phase, attribution)?;
+    if warmup.sites.values().sum::<usize>() != 1 {
+        return Err(format!("{phase} route warmup did not return one attributed response: {warmup}").into());
+    }
+
+    let before_metrics = gateway_metrics.read()?;
+    let before_counts = route_selection_counts(&before_metrics)?;
+    let mut distribution = RouteDistribution::default();
+    let mut metric_windows = Vec::new();
+    let mut requests_remaining = request_count;
+    while requests_remaining > 0 {
+        let batch_requests = requests_remaining.min(WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS);
+        let batch_before_metrics = gateway_metrics.read()?;
+        let batch = route_distribution(gateway_port, batch_requests, phase, attribution)?;
+        distribution.merge(batch);
+        let batch_after_metrics = gateway_metrics.read()?;
+        validate_window(&batch_before_metrics, &batch_after_metrics)
+            .map_err(|error| format!("{phase} route sample crossed a signal window: {error}"))?;
+        metric_windows.push(format!(
+            "{batch_requests} requests: before={}, after={}",
+            route_metric_diagnostics(&batch_before_metrics),
+            route_metric_diagnostics(&batch_after_metrics)
+        ));
+        requests_remaining -= batch_requests;
+    }
+
+    let after_metrics = gateway_metrics.read()?;
+    let after_counts = route_selection_counts(&after_metrics)?;
+    let selector_evidence = weighted_selector_sample_delta(before_counts, after_counts, request_count)
+        .map_err(|error| format!("{error}; {distribution}"))?;
+    let total = distribution.sites.values().sum::<usize>();
+    if total != request_count {
+        return Err(format!(
+            "{phase} returned {total} attributed HTTP 200 responses, expected {request_count}; {selector_evidence}; {distribution}"
+        )
+        .into());
+    }
+    Ok((
+        distribution,
+        format!("{selector_evidence}; signal windows={metric_windows:?}"),
+    ))
 }
 
 /// Read the expected two-site selection share from the Gateway's current route snapshot metrics.
@@ -2530,6 +2675,8 @@ pub(super) struct RouteDistribution {
     pub(super) backends: BTreeMap<String, usize>,
     /// Requests whose response came from the trusted provider gateway at each site.
     pub(super) provider_gateways: BTreeMap<String, usize>,
+    /// Responses whose provider-gateway marker did not match the Grid backend header.
+    pub(super) provider_backend_mismatches: usize,
 }
 
 impl RouteDistribution {
@@ -2541,12 +2688,26 @@ impl RouteDistribution {
         })?;
         *self.sites.entry(site).or_default() += 1;
         if let Some(provider_site) = provider_site {
+            let expected_backend = format!("llmd-{provider_site}-provider");
+            if response.backend.as_deref() != Some(expected_backend.as_str()) {
+                self.provider_backend_mismatches += 1;
+            }
             *self.provider_gateways.entry(provider_site).or_default() += 1;
         }
         if let Some(backend) = &response.backend {
             *self.backends.entry(backend.clone()).or_default() += 1;
         }
         Ok(())
+    }
+
+    /// Whether each provider marker's requests also name the matching Grid backend.
+    pub(super) fn has_consistent_backends(&self) -> bool {
+        self.provider_backend_mismatches == 0
+            && self.provider_gateways.iter().all(|(site, count)| {
+                let expected_backend = format!("llmd-{site}-provider");
+                self.backends.get(&expected_backend) == Some(count)
+            })
+            && self.backends.values().sum::<usize>() == self.provider_gateways.values().sum::<usize>()
     }
 
     /// Add counts from another attributed request batch.
@@ -2560,6 +2721,7 @@ impl RouteDistribution {
         for (site, count) in other.provider_gateways {
             *self.provider_gateways.entry(site).or_default() += count;
         }
+        self.provider_backend_mismatches += other.provider_backend_mismatches;
     }
 
     /// Whether enough responses name the expected site through a trusted provider marker or both Grid headers.
@@ -2576,15 +2738,15 @@ impl std::fmt::Display for RouteDistribution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "sites={:?}, backends={:?}, provider_gateways={:?}",
-            self.sites, self.backends, self.provider_gateways
+            "sites={:?}, backends={:?}, provider_gateways={:?}, provider_backend_mismatches={}",
+            self.sites, self.backends, self.provider_gateways, self.provider_backend_mismatches
         )
     }
 }
 
 /// Response-header contract observed on successfully routed Gateway requests.
 #[derive(Default)]
-struct RoutingAttributionDiagnostics {
+pub(super) struct RoutingAttributionDiagnostics {
     /// Number of successful responses inspected.
     responses: usize,
     /// Successful responses without the documented `x-grid-site` header.
@@ -2630,7 +2792,7 @@ impl RoutingAttributionDiagnostics {
     }
 
     /// Explain a missing or inconsistent documented response attribution contract.
-    fn contract_error(&self) -> Option<String> {
+    pub(super) fn contract_error(&self) -> Option<String> {
         (self.missing_site_header > 0 || self.missing_backend_header > 0 || self.site_mismatches > 0).then(|| {
             format!(
                 "Grid Gateway returned {} successful responses with missing or inconsistent attribution headers: missing x-grid-site={}, missing x-grid-backend={}, site mismatches={}",
@@ -2822,16 +2984,15 @@ fn parse_site_route_response(raw: &str) -> SiteRouteResponse {
 
 /// Read an operator's `/metrics` through the run-owned Service.
 pub(super) fn read_operator_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, true)
+    read_metrics_url(port, true, None)
 }
 
-/// Read the Grid Gateway's TLS-only `/metrics` endpoint.
-pub(super) fn read_gateway_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, false)
-}
-
-/// Fetch Prometheus exposition over the forwarded service port.
-fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std::error::Error>> {
+/// Fetch Prometheus exposition over the forwarded service port and require a successful HTTP response.
+fn read_metrics_url(
+    port: u16,
+    tls_fallback: bool,
+    bearer_token: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let schemes = if tls_fallback {
         ["https", "http"]
     } else {
@@ -2840,17 +3001,74 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
     let mut last_error = String::from("no HTTP response");
     for scheme in schemes {
         let url = format!("{scheme}://127.0.0.1:{port}/metrics");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--insecure", "--max-time", "5", &url])
-            .output()?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        let mut command = Command::new("curl");
+        command.args([
+            "--silent",
+            "--show-error",
+            "--insecure",
+            "--max-time",
+            "5",
+            "--write-out",
+            "\n__GRID_METRICS_HTTP_STATUS__=%{http_code}\n",
+        ]);
+        if bearer_token.is_some() {
+            command.args(["--config", "-"]);
+        }
+        command.arg(&url);
+        let output = if let Some(token) = bearer_token {
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let mut stdin = child.stdin.take().ok_or("curl config stdin was unavailable")?;
+            writeln!(stdin, "header = \"Authorization: Bearer {token}\"")?;
+            drop(stdin);
+            child.wait_with_output()?
+        } else {
+            command.output()?
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains(METRICS_HTTP_STATUS_MARKER) {
+            if stdout
+                .rsplit_once(METRICS_HTTP_STATUS_MARKER)
+                .is_some_and(|(_, status)| status.trim() == "000")
+            {
+                String::from_utf8_lossy(&output.stderr)
+                    .trim()
+                    .clone_into(&mut last_error);
+                continue;
+            }
+            return parse_metrics_response(
+                &stdout,
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stderr),
+            )
+            .map_err(Into::into);
         }
         String::from_utf8_lossy(&output.stderr)
             .trim()
             .clone_into(&mut last_error);
     }
     Err(format!("could not read metrics service: {last_error}").into())
+}
+
+/// Separate the HTTP status from curl's response body and reject every non-2xx response.
+fn parse_metrics_response(stdout: &str, curl_succeeded: bool, stderr: &str) -> Result<String, String> {
+    let (body, status_text) = stdout
+        .rsplit_once(METRICS_HTTP_STATUS_MARKER)
+        .ok_or_else(|| format!("curl did not report an HTTP status: {stderr}"))?;
+    let status = status_text
+        .trim()
+        .parse::<u16>()
+        .map_err(|error| format!("curl returned an invalid HTTP status: {error}"))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("metrics endpoint returned HTTP {status}: {}", body.trim()));
+    }
+    if !curl_succeeded {
+        return Err(format!("curl could not read metrics service: {stderr}"));
+    }
+    Ok(body.to_owned())
 }
 
 /// Return the counter value matching a metric name and its required labels.
@@ -3176,6 +3394,27 @@ fn kubectl_patch_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_reader_rejects_unauthorized_http_body_even_when_curl_succeeds() {
+        let result = parse_metrics_response("unauthorized\n__GRID_METRICS_HTTP_STATUS__=401\n", true, "");
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("HTTP 401") && error.contains("unauthorized")
+        ));
+    }
+
+    #[test]
+    fn metrics_reader_returns_only_the_body_for_http_success() {
+        let result = parse_metrics_response(
+            "grid_route_site_rho{site=\"pool-a\"} 0\n__GRID_METRICS_HTTP_STATUS__=200\n",
+            true,
+            "",
+        );
+
+        assert_eq!(result.as_deref(), Ok("grid_route_site_rho{site=\"pool-a\"} 0"));
+    }
 
     #[test]
     fn cross_site_pressure_keeps_queue_depth_and_gateway_saturation_explicit() {
@@ -3669,6 +3908,74 @@ grid_route_site_silent{site="pool-c",cluster="llmd-pool-c-provider"} NaN
 
         assert!(matches!(distribution.observe(&response), Ok(())));
         assert!(distribution.proves_site("pool-a", 1));
+    }
+
+    #[test]
+    fn provider_gateway_attribution_requires_the_matching_backend_receipt() {
+        let matching = [
+            SiteRouteResponse {
+                status: 200,
+                site: Some("pool-a".to_owned()),
+                backend: Some("llmd-pool-a-provider".to_owned()),
+                provider_site: Some("pool-a".to_owned()),
+                raw_header_names: Vec::new(),
+            },
+            SiteRouteResponse {
+                status: 200,
+                site: Some("pool-b".to_owned()),
+                backend: Some("llmd-pool-b-provider".to_owned()),
+                provider_site: Some("pool-b".to_owned()),
+                raw_header_names: Vec::new(),
+            },
+        ];
+        let mut complete = RouteDistribution::default();
+        for response in &matching {
+            assert!(matches!(complete.observe(response), Ok(())));
+        }
+        assert!(complete.has_consistent_backends());
+
+        let mismatched = SiteRouteResponse {
+            status: 200,
+            site: Some("pool-a".to_owned()),
+            backend: Some("llmd-pool-b-provider".to_owned()),
+            provider_site: Some("pool-a".to_owned()),
+            raw_header_names: Vec::new(),
+        };
+        let mut incomplete = RouteDistribution::default();
+        assert!(matches!(incomplete.observe(&mismatched), Ok(())));
+        assert!(!incomplete.has_consistent_backends());
+    }
+
+    #[test]
+    fn swapped_provider_markers_and_backend_receipts_do_not_cancel_in_aggregate() {
+        let responses = [
+            SiteRouteResponse {
+                status: 200,
+                site: Some("pool-a".to_owned()),
+                backend: Some("llmd-pool-b-provider".to_owned()),
+                provider_site: Some("pool-a".to_owned()),
+                raw_header_names: Vec::new(),
+            },
+            SiteRouteResponse {
+                status: 200,
+                site: Some("pool-b".to_owned()),
+                backend: Some("llmd-pool-a-provider".to_owned()),
+                provider_site: Some("pool-b".to_owned()),
+                raw_header_names: Vec::new(),
+            },
+        ];
+        let mut distribution = RouteDistribution::default();
+        for response in &responses {
+            let mut batch = RouteDistribution::default();
+            assert!(matches!(batch.observe(response), Ok(())));
+            distribution.merge(batch);
+        }
+
+        assert_eq!(distribution.backends.get("llmd-pool-a-provider"), Some(&1));
+        assert_eq!(distribution.backends.get("llmd-pool-b-provider"), Some(&1));
+        assert_eq!(distribution.provider_gateways.get("pool-a"), Some(&1));
+        assert_eq!(distribution.provider_gateways.get("pool-b"), Some(&1));
+        assert!(!distribution.has_consistent_backends());
     }
 
     #[test]

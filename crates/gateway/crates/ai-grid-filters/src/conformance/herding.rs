@@ -50,6 +50,42 @@ struct Serving {
     waiting: usize,
 }
 
+/// One site as it was routed and read at a snapshot boundary.
+#[derive(serde::Serialize)]
+struct SiteInterval {
+    site: &'static str,
+    running: usize,
+    waiting: usize,
+    kv_cache: Option<f64>,
+    rho: Option<f64>,
+    backlog: Option<bool>,
+    full: Option<bool>,
+    dispatched: usize,
+}
+
+/// Load and dispatches accumulated between two gateway snapshots.
+#[derive(serde::Serialize)]
+struct Interval {
+    since_start_ms: i64,
+    offered: usize,
+    completed: usize,
+    sites: Vec<SiteInterval>,
+}
+
+/// Reproducible evidence from one deterministic starting phase.
+#[derive(serde::Serialize)]
+struct RunEvidence {
+    first_turn: usize,
+    offered: usize,
+    completed: usize,
+    final_running: usize,
+    final_waiting: usize,
+    peak_waiting: usize,
+    mean_waiting: f64,
+    p95_waiting: usize,
+    intervals: Vec<Interval>,
+}
+
 /// What a site publishes about its load, which decides how the gateway reads it.
 #[derive(Clone, Copy)]
 enum Publish {
@@ -97,27 +133,46 @@ impl Scenario {
 
     /// The most requests waiting at any one site over [`PHASES`] starting points.
     fn peak_waiting(&self, sites: &[SiteSpec]) -> usize {
-        (0..PHASES)
-            .map(|phase| self.run(sites, phase * 7_919))
+        self.phases(sites)
+            .iter()
+            .map(|phase| phase.peak_waiting)
             .max()
             .unwrap_or(0)
+    }
+
+    /// One identical-input run for each deterministic turn phase.
+    fn phases(&self, sites: &[SiteSpec]) -> Vec<RunEvidence> {
+        (0..PHASES).map(|phase| self.run(sites, phase * 7_919)).collect()
     }
 
     /// The most requests waiting at any one site, after [`WARM_UP_MS`], while requests are routed
     /// between `sites` by the real selection over snapshots [`POLL_MS`] apart, the first request
     /// being turn `first_turn`.
-    fn run(&self, sites: &[SiteSpec], first_turn: usize) -> usize {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the simulation keeps ordered scrape, snapshot, arrival, and evidence boundaries together"
+    )]
+    fn run(&self, sites: &[SiteSpec], first_turn: usize) -> RunEvidence {
         let mut grid = Harness::new(HORIZON_MS);
         // Teach every ceiling with one sample holding its slots and nothing waiting.
         let mut snapshot = grid.refresh(sites, NOW_MS, |site| site.capacity, 0.0);
         let mut serving: Vec<Serving> = sites.iter().map(|_| Serving::default()).collect();
         let (mut turn, mut peak) = (first_turn, 0_usize);
+        let mut total_offered = 0_usize;
+        let mut total_completed = 0_usize;
+        let mut interval_offered = 0_usize;
+        let mut interval_completed = 0_usize;
+        let mut interval_dispatched = vec![0_usize; sites.len()];
+        let mut queue_observations = Vec::new();
+        let mut intervals = Vec::new();
         for step in 1..=DURATION_MS / STEP_MS {
             let since_start = step * STEP_MS;
             let at = NOW_MS + since_start;
             for (index, site) in serving.iter_mut().enumerate() {
                 while site.running.front().is_some_and(|ends| *ends <= at) {
                     site.running.pop_front();
+                    total_completed += 1;
+                    interval_completed += 1;
                 }
                 while site.waiting > 0 && site.running.len() < self.slots(index, since_start) {
                     site.waiting -= 1;
@@ -134,6 +189,8 @@ impl Scenario {
             }
             let arriving = if since_start < self.idle_ms { 0 } else { self.arriving };
             for _ in 0..arriving {
+                total_offered += 1;
+                interval_offered += 1;
                 turn += 1;
                 let chosen = select_spread(
                     &snapshot,
@@ -148,6 +205,7 @@ impl Scenario {
                     .iter()
                     .position(|spec| *spec.site == *chosen.candidate.site)
                     .expect("the chosen site is one of the sites");
+                interval_dispatched[index] += 1;
                 let slots = self.slots(index, since_start);
                 let site = &mut serving[index];
                 if site.running.len() < slots {
@@ -159,8 +217,66 @@ impl Scenario {
             if since_start >= WARM_UP_MS {
                 peak = peak.max(serving.iter().map(|site| site.waiting).max().unwrap_or(0));
             }
+            if since_start % POLL_MS == 0 {
+                let interval_sites = sites
+                    .iter()
+                    .enumerate()
+                    .map(|(index, spec)| {
+                        let state = &serving[index];
+                        let candidate = snapshot
+                            .candidates
+                            .iter()
+                            .find(|candidate| candidate.site.as_ref() == spec.site);
+                        let kv_cache = match self.publish {
+                            Publish::Count => None,
+                            Publish::Scheduler { kv_at_full } => {
+                                Some(kv_at_full * count(state.running.len()) / count(SLOTS))
+                            },
+                        };
+                        SiteInterval {
+                            site: spec.site,
+                            running: state.running.len(),
+                            waiting: state.waiting,
+                            kv_cache,
+                            rho: candidate.and_then(|candidate| candidate.rho),
+                            backlog: candidate.and_then(|candidate| candidate.backlog),
+                            full: candidate.and_then(|candidate| candidate.full),
+                            dispatched: interval_dispatched[index],
+                        }
+                    })
+                    .collect();
+                if since_start >= WARM_UP_MS {
+                    queue_observations.extend(serving.iter().map(|site| site.waiting));
+                }
+                intervals.push(Interval {
+                    since_start_ms: since_start,
+                    offered: interval_offered,
+                    completed: interval_completed,
+                    sites: interval_sites,
+                });
+                interval_offered = 0;
+                interval_completed = 0;
+                interval_dispatched.fill(0);
+            }
         }
-        peak
+        queue_observations.sort_unstable();
+        let p95_index = queue_observations
+            .len()
+            .saturating_mul(95)
+            .div_ceil(100)
+            .saturating_sub(1);
+        let mean_waiting = count(queue_observations.iter().sum()) / count(queue_observations.len());
+        RunEvidence {
+            first_turn,
+            offered: total_offered,
+            completed: total_completed,
+            final_running: serving.iter().map(|site| site.running.len()).sum(),
+            final_waiting: serving.iter().map(|site| site.waiting).sum(),
+            peak_waiting: peak,
+            mean_waiting,
+            p95_waiting: queue_observations.get(p95_index).copied().unwrap_or_default(),
+            intervals,
+        }
     }
 
     /// Publish what `site` holds at `at_ms`, as [`Publish`] says.
@@ -171,6 +287,7 @@ impl Scenario {
             Publish::Scheduler { kv_at_full } => {
                 let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
                 let engines = count(ENGINES);
+                // The scheduler publishes averages per engine; retain fractional averages rather than flooring them.
                 for (metric, value) in [
                     ("llm_d_epp_average_running_requests", running / engines),
                     ("llm_d_epp_average_queue_size", waiting / engines),
@@ -252,6 +369,63 @@ fn sites_behind_the_scheduler_at_five_sixths_of_capacity_stay_near_empty_when_kv
     assert!(
         peak <= SLOTS / 2,
         "with a sixth of every site free, a queue of {peak} at one site is the pick herding"
+    );
+}
+
+/// Emit the five-phase scheduler waveform and gate KV-binding pressure at half the reported base peak.
+/// The old selector removes a site at rho 1; the issue's unverified report puts its queue near 160.
+#[expect(
+    clippy::print_stdout,
+    reason = "machine-readable evidence is consumed by the qualification report"
+)]
+#[test]
+fn sites_behind_the_scheduler_at_five_sixths_of_capacity_keep_soft_saturated_kv_sites_in_the_draw() {
+    const MAX_PEAK_WAITING: usize = 80;
+    let scenario = Scenario::steady(5, KV_BINDS);
+    let sites = equal(&["a", "b", "c"]);
+    let phases = scenario.phases(&sites);
+    let worst_peak = phases.iter().map(|phase| phase.peak_waiting).max().unwrap_or(0);
+    let accounted = phases
+        .iter()
+        .all(|phase| phase.offered == phase.completed + phase.final_running + phase.final_waiting);
+    let interval_dispatches_conserved = phases.iter().all(|phase| {
+        phase
+            .intervals
+            .iter()
+            .all(|interval| interval.offered == interval.sites.iter().map(|site| site.dispatched).sum::<usize>())
+    });
+    println!(
+        "GRID_SATURATION_EVIDENCE={}",
+        serde_json::json!({
+            "scenario": "three_equal_sites_five_sixths_kv_binds",
+            "selector": "grid_site_route::select_spread",
+            "arrivals_per_100ms_step": scenario.arriving,
+            "service_time_ms": SERVICE_MS,
+            "slots_per_site": SLOTS,
+            "kv_at_full": 0.8,
+            "sites": ["a", "b", "c"],
+            "horizon_ms": DURATION_MS,
+            "snapshot_period_ms": POLL_MS,
+            "scrape_period_ms": SCRAPE_MS,
+            "first_turn_phases": phases.iter().map(|phase| phase.first_turn).collect::<Vec<_>>(),
+            "worst_peak_waiting": worst_peak,
+            "max_peak_waiting": MAX_PEAK_WAITING,
+            "request_accounting_conserved": accounted,
+            "interval_dispatch_accounting_conserved": interval_dispatches_conserved,
+            "phases": phases,
+        })
+    );
+    assert!(
+        accounted,
+        "each offered request must be completed or remain running/queued; no traffic is dropped"
+    );
+    assert!(
+        interval_dispatches_conserved,
+        "each interval must dispatch every offered request exactly once"
+    );
+    assert!(
+        worst_peak <= MAX_PEAK_WAITING,
+        "five-sixths KV-binding load must keep the worst phase at or below half the reproduced ~160-request base queue; observed {worst_peak}"
     );
 }
 
