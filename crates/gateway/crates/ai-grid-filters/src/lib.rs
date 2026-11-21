@@ -56,7 +56,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 14] = [
+const COUNTER_HELP: [(&str, &str); 15] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -94,6 +94,10 @@ const COUNTER_HELP: [(&str, &str); 14] = [
     (
         "grid_dial_failures_total",
         "Dialed requests that got no response head within the connect budget, by cluster.",
+    ),
+    (
+        "grid_dial_refusals_total",
+        "Requests a provider gateway refused because its site does not serve the provider, by cluster. One orders that provider last for 10 seconds and leaves the dial up.",
     ),
     (
         "grid_dial_server_errors_total",
