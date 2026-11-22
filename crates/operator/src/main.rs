@@ -3731,19 +3731,19 @@ impl PeerSignalApply<'_> {
         &mut self,
         peer: &str,
         offered_rows: Vec<operator::signals::Observation>,
-        rejected: usize,
+        malformed: bool,
         stamp: &operator::metrics_scraper::Stamp,
     ) {
+        if malformed {
+            tracing::warn!(
+                peer,
+                "malformed peer signal frame; retaining the prior catalog and signals"
+            );
+            return;
+        }
         let Some(admitted) = self.admit(peer, offered_rows, stamp) else {
             return;
         };
-        if rejected > 0 {
-            tracing::debug!(
-                peer,
-                rejected,
-                "peer signal rows rejected while applying matched catalog"
-            );
-        }
         self.heard.record(peer, &admitted.observations);
         self.peers
             .refresh(BTreeMap::from([(peer.to_owned(), admitted.observations)]), self.ttl);
@@ -3775,31 +3775,8 @@ impl PeerSignalApply<'_> {
             ProviderAdmissionMode::Legacy if self.catalogs.holds(peer) || selection.use_pending => {
                 Some(self.slots.bound_legacy(peer, offered_rows))
             },
-            ProviderAdmissionMode::SourceRanked if let Some(network) = self.active_network.as_deref() => {
-                let held_providers = (!selection.use_pending)
-                    .then(|| self.catalogs.providers_for(peer))
-                    .flatten();
-                let source_providers = if selection.use_pending {
-                    self.pending_catalogs
-                        .get(peer)
-                        .map(|catalog| catalog.providers.as_slice())
-                } else {
-                    held_providers.as_deref()
-                };
-                let allowed = source_ranked_provider_generations(source_providers.unwrap_or_default(), network);
-                let filtered = self.slots.bound_source_ranked_with_status(peer, offered_rows, &allowed);
-                if !selection.accepts_signal_generation(filtered.spec_generation_mismatch) {
-                    tracing::warn!(
-                        peer,
-                        "peer signal/catalog digest matched but a provider spec generation did not; retaining the prior pair"
-                    );
-                    return None;
-                }
-                Some(filtered.observations)
-            },
-            ProviderAdmissionMode::Legacy | ProviderAdmissionMode::SourceRanked | ProviderAdmissionMode::Unmatched => {
-                None
-            },
+            ProviderAdmissionMode::SourceRanked => self.admit_ranked(peer, offered_rows, selection),
+            ProviderAdmissionMode::Legacy | ProviderAdmissionMode::Unmatched => None,
         };
         let Some(admitted_rows) = admitted else {
             tracing::warn!(
@@ -3817,6 +3794,40 @@ impl PeerSignalApply<'_> {
             observations: admitted_rows,
             use_pending: selection.use_pending,
         })
+    }
+
+    /// Filter ranked rows against the exact selected catalog without advancing a malformed pair.
+    fn admit_ranked(
+        &self,
+        peer: &str,
+        offered_rows: Vec<operator::signals::Observation>,
+        selection: ProviderAdmissionSelection,
+    ) -> Option<Vec<operator::signals::Observation>> {
+        let network = self.active_network.as_deref()?;
+        let held_providers = (!selection.use_pending)
+            .then(|| self.catalogs.providers_for(peer))
+            .flatten();
+        let source_providers = if selection.use_pending {
+            self.pending_catalogs
+                .get(peer)
+                .map(|catalog| catalog.providers.as_slice())
+        } else {
+            held_providers.as_deref()
+        };
+        let allowed = source_ranked_provider_generations(source_providers.unwrap_or_default(), network);
+        let filtered = self.slots.bound_source_ranked_with_status(peer, offered_rows, &allowed);
+        if filtered.malformed_batch {
+            tracing::warn!(peer, "malformed ranked peer batch; retaining the prior pair");
+            return None;
+        }
+        if !selection.accepts_signal_generation(filtered.spec_generation_mismatch) {
+            tracing::warn!(
+                peer,
+                "peer signal/catalog digest matched but a provider spec generation did not; retaining the prior pair"
+            );
+            return None;
+        }
+        Some(filtered.observations)
     }
 
     /// Replace the held catalog with the staged catalog paired to the applied signals.
@@ -4293,12 +4304,15 @@ impl PeerPoller {
                 pending_catalogs: &mut pending_catalogs,
             };
             source
-                .collect_each_raw(&sites, |peer, observations, rejected, stamp| {
+                .collect_each_raw(&sites, |peer, observations, rejected, malformed, stamp| {
                     answered.insert(peer.clone(), rejected);
                     modes.insert(peer.clone(), stamp.membership.clone());
                     versions.insert(peer.clone(), stamp.providers_version.clone());
                     admission_versions.insert(peer.clone(), stamp.providers_admission_contract.clone());
-                    apply_signals.apply(&peer, observations, rejected, &stamp);
+                    if rejected > 0 {
+                        tracing::debug!(peer, rejected, "peer signal rows rejected during collection");
+                    }
+                    apply_signals.apply(&peer, observations, malformed, &stamp);
                 })
                 .await;
         }
@@ -6331,9 +6345,10 @@ mod tests {
         let provider = |name: &str| {
             serde_json::from_value::<operator::site_providers::WireProvider>(serde_json::json!({
                 "networkId": "net", "providerId": name, "routingCluster": name,
-                "capacityWeight": 1, "phase": "Available", "revision": 1
+                "capacityWeight": 1, "phase": "Available", "revision": 1,
+                "specGeneration": 1, "admissionRank": { "createdAtNs": 1, "uid": "uid" }
             }))
-            .expect("legacy provider fixture")
+            .expect("ranked provider fixture")
         };
         let peers = operator::signals::SignalStore::new();
         let heard = operator::signals::LoadHeard::default();
@@ -6341,15 +6356,22 @@ mod tests {
         let slots = operator::signals::PeerSlots::default();
         catalogs.replace("peer", vec![provider("old")]);
         let mut versions = std::collections::HashMap::from([("peer".to_owned(), "a".repeat(16))]);
-        let mut contracts = std::collections::HashMap::new();
+        let mut contracts = std::collections::HashMap::from([("peer".to_owned(), "1".to_owned())]);
         let mut pending = std::collections::HashMap::from([(
             "peer".to_owned(),
             PendingProviderCatalog {
                 providers: vec![provider("new")],
                 version: Some("b".repeat(16)),
-                admission_contract: None,
+                admission_contract: Some("1".to_owned()),
             },
         )]);
+        peers.refresh(
+            BTreeMap::from([(
+                "peer".to_owned(),
+                operator::signals::parse("llm_d_epp_ready_endpoints{grid_site=\"peer\",grid_provider=\"old\"} 42"),
+            )]),
+            std::time::Duration::from_secs(60),
+        );
         let mut apply = PeerSignalApply {
             peers: &peers,
             heard: &heard,
@@ -6361,12 +6383,14 @@ mod tests {
             catalog_admission_contracts: &mut contracts,
             pending_catalogs: &mut pending,
         };
+        assert_malformed_peer_frames_are_rejected(&mut apply);
         apply.apply(
             "peer",
             Vec::new(),
-            0,
+            false,
             &operator::metrics_scraper::Stamp {
                 providers_version: Some("c".repeat(16)),
+                providers_admission_contract: Some("1".to_owned()),
                 ..Default::default()
             },
         );
@@ -6387,9 +6411,10 @@ mod tests {
         apply.apply(
             "peer",
             Vec::new(),
-            0,
+            false,
             &operator::metrics_scraper::Stamp {
                 providers_version: Some("b".repeat(16)),
+                providers_admission_contract: Some("1".to_owned()),
                 ..Default::default()
             },
         );
@@ -6406,6 +6431,71 @@ mod tests {
                 .expect("one provider")
                 .provider_id,
             "new"
+        );
+    }
+
+    /// Check that malformed or unversioned ranked frames keep both halves of the prior pair.
+    fn assert_malformed_peer_frames_are_rejected(apply: &mut PeerSignalApply<'_>) {
+        let revision = "grid_provider_config_generation{grid_site=\"peer\",grid_provider=\"new\",provider_uid=\"uid\",publisher_epoch=\"1\",batch_sequence=\"2\",batch_samples=\"0\"} 1 2000";
+        for text in [
+            format!("{revision}\n{revision}\n"),
+            format!(
+                "{}\n{revision}\n{revision}\n",
+                revision.replace("grid_provider=\"new\"", "grid_provider=\"old\"")
+            ),
+            revision.replace("batch_samples=\"0\"", "batch_samples=\"1\""),
+            "not exposition".to_owned(),
+        ] {
+            let (malformed_rows, malformed) = operator::signals::parse_peer_frame(&text);
+            assert!(malformed);
+            apply.apply(
+                "peer",
+                malformed_rows,
+                malformed,
+                &operator::metrics_scraper::Stamp {
+                    providers_version: Some("b".repeat(16)),
+                    providers_admission_contract: Some("1".to_owned()),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                apply.pending_catalogs.contains_key("peer"),
+                "malformed matched frames remain staged"
+            );
+            assert_eq!(apply.catalog_versions.get("peer"), Some(&"a".repeat(16)));
+            let (held_rows, _) = apply
+                .peers
+                .render(None, &[], None, operator::signals::ClockReading::now());
+            assert!(
+                held_rows.contains(" 42 "),
+                "malformed frames preserve the held signal snapshot"
+            );
+        }
+        let (unversioned, malformed) = operator::signals::parse_peer_frame(
+            "llm_d_epp_ready_endpoints{grid_site=\"peer\",grid_provider=\"new\"} 1 2000",
+        );
+        assert!(!malformed, "unversioned exposition remains valid for legacy readers");
+        apply.apply(
+            "peer",
+            unversioned,
+            malformed,
+            &operator::metrics_scraper::Stamp {
+                providers_version: Some("b".repeat(16)),
+                providers_admission_contract: Some("1".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            apply.pending_catalogs.contains_key("peer"),
+            "ranked payload requires a revision row"
+        );
+        assert_eq!(apply.catalog_versions.get("peer"), Some(&"a".repeat(16)));
+        let (held_rows, _) = apply
+            .peers
+            .render(None, &[], None, operator::signals::ClockReading::now());
+        assert!(
+            held_rows.contains(" 42 "),
+            "unversioned ranked payload retains prior signals"
         );
     }
 

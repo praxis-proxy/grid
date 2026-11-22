@@ -65,6 +65,20 @@ release rule. The source catalog and relay remain bounded; this contract does
 not guarantee that an arbitrary number of providers or signal rows fits in one
 response.
 
+Malformed revision frames do not refresh signals or promote a staged catalog.
+The receiver distinguishes these from a genuinely empty response and a valid
+zero-sample ordering fence. A malformed response retains the prior pair as a
+whole; independently valid fences in that response do not advance it.
+
+The receiver also keeps bounded authority for invalidation fences from recently
+accepted provider payloads after their UIDs leave the catalog. It permits only
+zero-sample fences, never their metric payloads. It holds at most 512
+provider/UID identities per peer, including identities still in the current catalog. Retired
+identities expire after 12 accepted ranked responses; if capacity is reached,
+the oldest retired identities are removed first. Fences do not renew this
+history. Failed responses do not age it, and removing a peer clears it. This
+cleanup history does not decide which providers receive payload admission.
+
 ## Gateway ingest feedback
 
 The local gateway reports completed ingests with an empty-body
