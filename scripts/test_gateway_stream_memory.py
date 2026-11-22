@@ -27,6 +27,165 @@ def chunked(body: bytes) -> bytes:
     return f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
 
 
+class ReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_ratio_comparison_does_not_round_the_threshold_product(self) -> None:
+        self.assertTrue(memory.ratio_exceeded(30 * 1024**2, 40 * 1024**2, "1.3333333333333333333333333333"))
+        self.assertFalse(memory.ratio_exceeded(30 * 1024**2, 45 * 1024**2, "1.5"))
+        for limit in ["1e9999999", "1e-9999999", "NaN", "Infinity"]:
+            with self.assertRaises(ValueError):
+                memory.ratio_exceeded(30, 40, limit)
+
+    def test_source_identity_rejects_ignored_cargo_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = memory.Path(directory)
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+            git("init", "-q")
+            git("config", "user.email", "test@example.test")
+            git("config", "user.name", "Test")
+            (root / ".dockerignore").write_text("target\n**/target\n")
+            (root / ".gitignore").write_text("target/\n.cargo/config\n")
+            git("add", ".")
+            git("commit", "-qm", "fixture")
+            (root / "target").mkdir()
+            (root / "target" / "ignored").write_text("excluded by Docker")
+            source = memory.git_identity(root)
+            (root / ".cargo").mkdir()
+            (root / ".cargo" / "config").write_text("[build]\nrustflags=[]\n")
+            with self.assertRaisesRegex(memory.MeasurementError, "Git-excluded build input"):
+                memory.git_identity(root)
+            (root / ".cargo" / "config").unlink()
+            self.assertEqual(memory.git_identity(root)["fingerprint_sha256"], source["fingerprint_sha256"])
+            override = root / "deploy/gateway/Containerfile.dockerignore"
+            override.parent.mkdir(parents=True)
+            override.write_text("# root Docker exclusions no longer apply\n")
+            with self.assertRaisesRegex(memory.MeasurementError, "Dockerfile-specific ignore"):
+                memory.git_identity(root)
+
+    def test_docker_exclusion_proof_is_conservative(self) -> None:
+        rules = ["target", "**/target", "*.pem", "crates/web/dist"]
+        for path in ["target/", "crates/gateway/target/", "secret.pem", "crates/web/dist/index"]:
+            self.assertTrue(memory.definitely_docker_excluded(path, rules), path)
+        for path in [".cargo/config", "nested/secret.pem", "crates/targeted/file"]:
+            self.assertFalse(memory.definitely_docker_excluded(path, rules), path)
+        self.assertFalse(memory.definitely_docker_excluded("target", ["target", "!target/config"]))
+
+    async def test_buffered_data_after_heartbeat_needs_no_additional_chunk(self) -> None:
+        payload = b": heartbeat\n\ndata: first\n\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+        stream = memory.HttpBody(reader, {"transfer-encoding": "chunked"})
+        self.assertEqual(await asyncio.wait_for(stream.next_event(), timeout=0.1), "first")
+
+    async def test_backend_shutdown_closes_connections_before_waiting(self) -> None:
+        backend = memory.Backend("shutdown")
+        events: list[str] = []
+        class Writer:
+            def close(self) -> None:
+                events.append("writer.close")
+        class Server:
+            def close(self) -> None:
+                events.append("server.close")
+            async def wait_closed(self) -> None:
+                if "writer.close" not in events:
+                    await asyncio.Future()
+                events.append("server.wait_closed")
+        backend.server = Server()
+        backend.writers.add(Writer())
+        await asyncio.wait_for(backend.close(), timeout=0.1)
+        self.assertEqual(events, ["server.close", "writer.close", "server.wait_closed"])
+
+    async def test_final_idle_sample_window_waits_for_new_phase_samples(self) -> None:
+        runner = memory.StreamMemoryRunner.__new__(memory.StreamMemoryRunner)
+        sampler = mock.Mock()
+        sampler.errors = []
+        sampler.phase_samples.side_effect = [[], [{"rss_bytes": 100}] * memory.RSS_SAMPLES]
+        runner.sampler = sampler
+        with mock.patch.object(memory.asyncio, "sleep", new=mock.AsyncMock()):
+            values = await runner.wait_for_samples("final_idle", memory.RSS_SAMPLES)
+        self.assertEqual(len(values), memory.RSS_SAMPLES)
+        self.assertEqual(sampler.phase_samples.call_args_list, [mock.call("final_idle"), mock.call("final_idle")])
+
+    async def test_profile_uses_recorded_post_close_and_post_deadline_idle_samples(self) -> None:
+        for missing_post_close in [False, True]:
+            events: list[tuple[str, object]] = []
+            runner = memory.StreamMemoryRunner.__new__(memory.StreamMemoryRunner)
+            runner.args = memory.argparse.Namespace(mode="full", max_settle_ratio="1.5")
+            runner.summary = {}
+            runner.bursts = []
+            runner.baseline = None
+            runner.client_active = set()
+            runner.request_tasks = {"burst-01": []}
+            runner.warm_gateway = mock.AsyncMock()
+            def unrecorded_sample() -> dict:
+                raise AssertionError("summary must not perform an unrecorded RSS read")
+            runner.gateway_sample = unrecorded_sample
+            state = memory.BurstState("burst-01", {"request"})
+            state.started = {"request"}
+            state.finished = {"request"}
+            state.peak_active = state.peak_client_active = 1
+            runner.start_burst = mock.AsyncMock(return_value=state)
+            class Sampler:
+                errors: list = []
+                def set_phase(self, phase: str, burst: str | None = None) -> None:
+                    events.append(("phase", phase))
+                def phase_samples(self, phase: str, burst: str | None = None) -> list[dict]:
+                    events.append(("samples", phase))
+                    if phase == "burst_post_close" and missing_post_close:
+                        return []
+                    active = 1 if phase == "burst_live" else 0
+                    rss = 123 if phase == "burst_post_close" else 100
+                    return [{"rss_bytes": rss, "client_active": active, "backend_active": active}] * memory.RSS_SAMPLES
+            runner.sampler = Sampler()
+            async def sleep(seconds: float) -> None:
+                events.append(("sleep", seconds))
+            with mock.patch.object(memory, "FULL_BURSTS", 1), mock.patch.object(memory, "FULL_CONCURRENCY", 1), mock.patch.object(memory.asyncio, "sleep", new=sleep):
+                if missing_post_close:
+                    with self.assertRaisesRegex(memory.MeasurementError, "post-close RSS sample was not recorded"):
+                        await runner.run_memory_profile()
+                    continue
+                await runner.run_memory_profile()
+            self.assertEqual(runner.bursts[0]["immediate_post_close_rss_bytes"], 123)
+            wait = events.index(("phase", "final_idle_wait"))
+            self.assertEqual(events[wait:wait + 4], [
+                ("phase", "final_idle_wait"), ("sleep", 120),
+                ("phase", "final_idle"), ("samples", "final_idle"),
+            ])
+            self.assertEqual(runner.summary["final_idle_samples"], memory.RSS_SAMPLES)
+
+    def test_proc_sample_reads_one_open_process_directory(self) -> None:
+        gateway = memory.GatewayContainer.__new__(memory.GatewayContainer)
+        gateway.pid = os.getpid()
+        gateway.start_ticks = memory.parse_proc_start_ticks(memory.Path(f"/proc/{gateway.pid}/stat").read_text())
+        original_open = os.open
+        calls: list[tuple[str, dict]] = []
+        def record_open(path: str, flags: int, **kwargs: object) -> int:
+            calls.append((path, kwargs))
+            return original_open(path, flags, **kwargs)
+        with mock.patch.object(memory.os, "open", side_effect=record_open):
+            sample = gateway.proc_sample()
+        directory_fd = calls[1][1]["dir_fd"]
+        self.assertEqual(calls[0][0], f"/proc/{gateway.pid}")
+        self.assertTrue(all(call[1].get("dir_fd") == directory_fd for call in calls[1:]))
+        self.assertEqual(sample["gateway_start_ticks"], gateway.start_ticks)
+        self.assertGreater(sample["rss_bytes"], 0)
+
+    def test_preflight_docker_commands_have_timeouts(self) -> None:
+        runner = memory.StreamMemoryRunner.__new__(memory.StreamMemoryRunner)
+        runner.host = {}
+        outputs = [
+            subprocess.CompletedProcess([], 0, "29.0", ""),
+            subprocess.CompletedProcess([], 0, "/tmp", ""),
+            subprocess.CompletedProcess([], 0, "172.17.0.1", ""),
+        ]
+        runner.args = memory.argparse.Namespace(mode="quick")
+        runner.write_manifest = lambda: None
+        with mock.patch.object(memory.os, "getuid", return_value=1000), mock.patch.object(memory.os, "getgid", return_value=1000), mock.patch.object(memory.subprocess, "run", side_effect=outputs) as run:
+            runner.validate_host()
+        self.assertEqual(len(run.call_args_list), 3)
+        self.assertTrue(all(call.kwargs.get("timeout") == 30 for call in run.call_args_list))
+
+
 class ProcParsingTests(unittest.TestCase):
     def test_start_ticks_allow_parentheses_in_process_name(self) -> None:
         self.assertEqual(memory.parse_proc_start_ticks(proc_stat()), 987654)
@@ -352,6 +511,11 @@ class NumericGateTests(unittest.TestCase):
 
 
 class GatewayCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.object(memory.GatewayContainer, "choose_cpu_set", return_value="0-3")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_stop(
         self,
         exit_code: int,
@@ -381,6 +545,30 @@ class GatewayCleanupTests(unittest.TestCase):
             container.docker = fake_docker
             return container.stop()
 
+    def test_jemalloc_marker_is_read_from_stopped_container_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            container = memory.GatewayContainer(
+                "sha256:image", "gnu-jemalloc", "exit-log-test", memory.Path(directory), "127.0.0.1", 9000, {}
+            )
+            container.container_created = True
+            container.container_id = "a" * 64
+            commands: list[str] = []
+            def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+                commands.append(args[0])
+                if args[0] == "logs":
+                    self.assertEqual(args[:3], ("logs", "--tail", "200"))
+                    return subprocess.CompletedProcess(args, 0, "", "opt.background_thread: true\n")
+                if args[0] == "inspect":
+                    if "rm" in commands:
+                        return subprocess.CompletedProcess(args, 1, "", "No such container")
+                    return subprocess.CompletedProcess(args, 0, json.dumps([{"State": {"Running": False, "ExitCode": 0}}]), "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+            container.docker = docker
+            result = container.stop()
+            self.assertTrue(result["jemalloc_background_thread_verified"])
+            self.assertLess(commands.index("logs"), commands.index("rm"))
+            self.assertIn("opt.background_thread: true", (memory.Path(directory) / "gateway-exit.log").read_text())
+
     def test_unexpected_gateway_exit_fails_cleanup(self) -> None:
         absent = subprocess.CompletedProcess(["docker"], 1, "", "Error: No such object: cleanup-test")
         cleanup = self.run_stop(exit_code=23, rm_code=0, post_remove=absent)
@@ -409,6 +597,11 @@ class GatewayCleanupTests(unittest.TestCase):
 
 
 class GatewayCreationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.object(memory.GatewayContainer, "choose_cpu_set", return_value="0-3")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_failed_start_removes_only_the_created_container_id(self) -> None:
         await self.check_failed_creation("start", owns_container=True)
 
@@ -472,6 +665,11 @@ class DockerArgumentsTests(unittest.TestCase):
 
 
 class GatewayLogCaptureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.object(memory.GatewayContainer, "choose_cpu_set", return_value="0-3")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_startup_log_is_visible_while_docker_log_stream_is_open(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             container = memory.GatewayContainer(
@@ -584,13 +782,29 @@ class BackendBarrierTests(unittest.IsolatedAsyncioTestCase):
         ).encode() + body
         writer.write(request)
         await writer.drain()
-        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2)
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2)
+        except BaseException:
+            writer.close()
+            await writer.wait_closed()
+            raise
         status, headers = memory.parse_http_head(head)
         if status != 200:
             raise AssertionError(f"backend returned HTTP {status}")
         stream = memory.HttpBody(reader, headers)
         self.assertTrue((await asyncio.wait_for(stream.next_event(), 2) or "").startswith("{"))
         return reader, writer, stream
+
+    async def test_duplicate_handler_does_not_cancel_the_original_receipt(self) -> None:
+        _reader, writer, _body = await self.open_stream()
+        try:
+            with self.assertRaises(asyncio.IncompleteReadError):
+                await self.open_stream()
+            self.assertEqual(self.state.active, {"request-01"})
+            self.assertEqual(self.state.cancelled, set())
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     async def test_release_completes_one_barriered_stream_and_counts_it(self) -> None:
         _reader, writer, stream = await self.open_stream()
@@ -755,6 +969,12 @@ class ObserveModeTests(unittest.IsolatedAsyncioTestCase):
 
 class SignalCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_sigterm_cancels_once_and_runs_backend_and_gateway_cleanup(self) -> None:
+        await self.check_cleanup(sampler_close_raises=False)
+
+    async def test_sampler_close_failure_still_stops_and_removes_gateway(self) -> None:
+        await self.check_cleanup(sampler_close_raises=True)
+
+    async def check_cleanup(self, sampler_close_raises: bool) -> None:
         events: list[str] = []
 
         class FakeBackend:
@@ -808,6 +1028,8 @@ class SignalCleanupTests(unittest.IsolatedAsyncioTestCase):
 
             async def close(self) -> None:
                 events.append("sampler.close")
+                if sampler_close_raises:
+                    raise OSError("evidence disk full")
 
         with tempfile.TemporaryDirectory() as directory:
             runner = memory.StreamMemoryRunner.__new__(memory.StreamMemoryRunner)

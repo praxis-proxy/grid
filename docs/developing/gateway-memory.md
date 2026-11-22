@@ -127,7 +127,7 @@ EVIDENCE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/grid-memory-XXXXXX")"
 GNU_TAG="grid-gateway-memory:gnu-${SOURCE_FINGERPRINT:0:12}"
 MUSL_BASE_TAG="grid-gateway-memory:musl-base-${SOURCE_FINGERPRINT:0:12}"
 MUSL_TAG="grid-gateway-memory:musl-${SOURCE_FINGERPRINT:0:12}"
-set -o pipefail
+set -euo pipefail
 
 docker build \
   --progress=plain \
@@ -143,6 +143,7 @@ docker build \
   --progress=plain \
   --file deploy/gateway/Containerfile \
   --build-arg CARGO_PROFILE=release \
+  --build-arg "GRID_QUALIFICATION_SOURCE_SHA256=$SOURCE_FINGERPRINT" \
   --build-arg "GRID_GIT_COMMIT=$SOURCE_REVISION" \
   --build-arg "GRID_GIT_VERSION=$GRID_VERSION" \
   --build-arg "GRID_GIT_TREE_STATE=$TREE_STATE" \
@@ -156,21 +157,21 @@ docker build \
   --progress=plain \
   --file crates/gateway/tests/memory/Containerfile.musl \
   --build-arg "BASE_IMAGE=$MUSL_BASE_TAG" \
-  --build-arg "GRID_GIT_COMMIT=$SOURCE_REVISION" \
-  --build-arg "GRID_GIT_VERSION=$GRID_VERSION" \
-  --build-arg "GRID_QUALIFICATION_SOURCE_SHA256=$SOURCE_FINGERPRINT" \
   --tag "$MUSL_TAG" . 2>&1 | tee "$EVIDENCE_ROOT/build-musl-lock.log"
 
 GNU_IMAGE="$(docker image inspect --format '{{.Id}}' "$GNU_TAG")"
 MUSL_IMAGE="$(docker image inspect --format '{{.Id}}' "$MUSL_TAG")"
 MUSL_BASE_IMAGE_ID_AFTER="$(docker image inspect --format '{{.Id}}' "$MUSL_BASE_TAG")"
 printf '%s\n' "$MUSL_BASE_IMAGE_ID_AFTER" > "$EVIDENCE_ROOT/musl-base-image-id-after-wrapper.txt"
-test "$MUSL_BASE_IMAGE_ID" = "$MUSL_BASE_IMAGE_ID_AFTER"
+test "$MUSL_BASE_IMAGE_ID" = "$MUSL_BASE_IMAGE_ID_AFTER" || exit 1
 test "$(docker image inspect --format '{{json .RootFS.Layers}}' "$MUSL_BASE_TAG")" = \
-  "$(docker image inspect --format '{{json .RootFS.Layers}}' "$MUSL_TAG")"
+  "$(docker image inspect --format '{{json .RootFS.Layers}}' "$MUSL_TAG")" || exit 1
 docker image inspect "$MUSL_BASE_TAG" \
   | jq '.[0] | {id: .Id, repo_digests: .RepoDigests, repo_tags: .RepoTags}' \
   > "$EVIDENCE_ROOT/musl-build-image.json"
+
+test "$(docker image inspect --format '{{index .Config.Labels "org.grid.qualification.source-sha256"}}' "$MUSL_IMAGE")" = \
+  "$SOURCE_FINGERPRINT" || exit 1
 
 for BASE_IMAGE in rust:1.96-bookworm debian:bookworm-slim rust:1.96-alpine alpine:3.23; do
   BASE_NAME="$(printf '%s' "$BASE_IMAGE" | tr ':/' '--')"
@@ -302,3 +303,18 @@ for each trial.
   cluster RSS cannot replace or be combined with these process-level trials.
 - The qualification is opt-in and is not invoked from GitHub Actions.
 - Do not change allocator behavior or proxy buffer sizes to make the gate pass.
+
+### Source provenance checks
+
+The source-identity command rejects Git-ignored inputs that Docker might send,
+including an ignored `.cargo/config`. Remove or track those files before building.
+Known exclusions in the root `.dockerignore`, such as `target` and `evidence`,
+are allowed. This is a conservative check: unsupported exclusion patterns do
+not excuse ignored files, and negated rules disable the exclusion shortcut.
+Dockerfile-specific ignore overrides are rejected because they would replace the
+root build-context policy.
+
+The musl binary-producing build records the source fingerprint; the wrapper
+inherits it and cannot substitute a different fingerprint. Qualification rejects
+an unknown or mismatched label. These labels and saved build commands document
+build provenance; they are not cryptographic attestations of the source content.

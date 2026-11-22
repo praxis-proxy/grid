@@ -4,11 +4,7 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-ARG GRID_GIT_COMMIT=unknown
-ARG GRID_GIT_VERSION=unknown
-ARG GRID_QUALIFICATION_SOURCE_SHA256=unknown
-LABEL org.opencontainers.image.revision=${GRID_GIT_COMMIT} \
-    org.opencontainers.image.version=${GRID_GIT_VERSION} \
-    org.grid.qualification.memory.variant="musl-malloc" \
-    org.grid.qualification.memory.allocator="system" \
-    org.grid.qualification.source-sha256=${GRID_QUALIFICATION_SOURCE_SHA256}
+# The source/revision labels are inherited from the binary-producing build.
+# Never let this metadata-only wrapper relabel an unrelated base as current.
+LABEL org.grid.qualification.memory.variant="musl-malloc" \
+    org.grid.qualification.memory.allocator="system"

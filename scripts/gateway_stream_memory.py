@@ -9,6 +9,7 @@ import collections
 import dataclasses
 import datetime as dt
 import decimal
+import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -227,7 +228,12 @@ def ratio_exceeded(baseline_bytes: int, final_bytes: int, limit: str) -> bool:
         raise ValueError("ratio limit is not a decimal number") from error
     if not maximum.is_finite() or maximum <= 0:
         raise ValueError("ratio limit must be finite and positive")
-    return decimal.Decimal(final_bytes) > decimal.Decimal(baseline_bytes) * maximum
+    if len(maximum.as_tuple().digits) > 256:
+        raise ValueError("ratio limit has too many significant digits")
+    if maximum > decimal.Decimal("1000000") or maximum < decimal.Decimal("0.000001"):
+        raise ValueError("ratio limit must be between 0.000001 and 1000000")
+    numerator, denominator = maximum.as_integer_ratio()
+    return final_bytes * denominator > baseline_bytes * numerator
 
 
 def median_bytes(values: list[int]) -> int:
@@ -338,6 +344,28 @@ def validate_full_evidence(
     return errors
 
 
+def definitely_docker_excluded(path: str, rules: list[str]) -> bool:
+    """Prove exclusion for the repository's simple Docker rules; fail closed otherwise.
+
+    This deliberately does not implement Docker's complete pattern language. Unknown
+    patterns cannot excuse a Git-ignored input, and negations disable this shortcut.
+    """
+    patterns = [rule.strip().strip("/") for rule in rules if rule.strip() and not rule.startswith("#")]
+    if any(rule.startswith("!") for rule in patterns):
+        return False
+    parts = Path(path.rstrip("/")).parts
+    for pattern in patterns:
+        if pattern.startswith("**/") and not any(char in pattern[3:] for char in "/*?[]"):
+            if pattern[3:] in parts:
+                return True
+        elif not any(char in pattern for char in "*?[]"):
+            if path.rstrip("/") == pattern or path.startswith(pattern + "/"):
+                return True
+        elif "/" not in pattern and parts and fnmatch.fnmatchcase(parts[0], pattern):
+            return True
+    return False
+
+
 def git_identity(repo: Path) -> dict[str, Any]:
     """Fingerprint tracked changes and untracked source files for this build tree."""
     def git(*args: str) -> bytes:
@@ -353,6 +381,18 @@ def git_identity(repo: Path) -> dict[str, Any]:
     head = git("rev-parse", "HEAD").decode().strip()
     tree = git("rev-parse", "HEAD^{tree}").decode().strip()
     diff = git("diff", "--binary", "HEAD", "--").replace(b"\r\n", b"\n")
+    for dockerfile in (
+        "crates/gateway/tests/memory/Containerfile.gnu",
+        "crates/gateway/tests/memory/Containerfile.musl",
+        "deploy/gateway/Containerfile",
+    ):
+        if (repo / (dockerfile + ".dockerignore")).exists():
+            raise MeasurementError("Dockerfile-specific ignore files are unsupported by source qualification")
+    ignored = git("ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z").split(b"\0")
+    rules = (repo / ".dockerignore").read_text().splitlines() if (repo / ".dockerignore").exists() else []
+    for raw_path in filter(None, ignored):
+        if not definitely_docker_excluded(os.fsdecode(raw_path), rules):
+            raise MeasurementError(f"Git-excluded build input must be removed or tracked: {os.fsdecode(raw_path)}")
     untracked = git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
     digest = hashlib.sha256()
     included: list[str] = []
@@ -521,6 +561,7 @@ class HttpBody:
                 for line in event.splitlines():
                     if line.startswith(b"data:"):
                         return line[5:].lstrip().decode("utf-8", "replace")
+                continue
             if self.finished:
                 if self.buffer:
                     raise MeasurementError("SSE stream ended with an incomplete event")
@@ -600,14 +641,19 @@ class Backend:
     async def close(self) -> None:
         if self.server is not None:
             self.server.close()
-            await self.server.wait_closed()
-            self.server = None
         for state in self.states.values():
             state.release.set()
             state.cancel_clients.set()
             state.slow_start.set()
         for writer in tuple(self.writers):
             writer.close()
+        if self.server is not None:
+            try:
+                await asyncio.wait_for(self.server.wait_closed(), timeout=5)
+            except TimeoutError:
+                for writer in tuple(self.writers):
+                    writer.transport.abort()
+            self.server = None
         if self.handler_tasks:
             _done, pending = await asyncio.wait(self.handler_tasks, timeout=5)
             for task in pending:
@@ -641,6 +687,7 @@ class Backend:
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request_id = "unknown"
         state: BurstState | None = None
+        registered = False
         current = asyncio.current_task()
         if current is not None:
             self.handler_tasks.add(current)
@@ -664,6 +711,7 @@ class Backend:
                 state.note_change()
                 raise MeasurementError("backend request ID is unexpected or duplicated")
             state.started.add(request_id)
+            registered = True
             state.active.add(request_id)
             state.peak_active = max(state.peak_active, len(state.active))
             state.note_change()
@@ -699,7 +747,7 @@ class Backend:
             TimeoutError,
             ValueError,
         ) as error:
-            if state is not None and request_id in state.active:
+            if registered and state is not None and request_id in state.active:
                 state.cancelled.add(request_id)
                 state.active.discard(request_id)
                 state.note_change()
@@ -707,7 +755,7 @@ class Backend:
         except MeasurementError as error:
             self.remember_error(str(error))
         finally:
-            if state is not None and request_id in state.active:
+            if registered and state is not None and request_id in state.active:
                 state.cancelled.add(request_id)
                 state.active.discard(request_id)
                 state.note_change()
@@ -1087,18 +1135,23 @@ class GatewayContainer:
         raise MeasurementError("Gateway startup identity was not recorded in the bounded log")
 
     def proc_sample(self) -> dict[str, Any]:
-        proc = Path(f"/proc/{self.pid}")
         try:
-            start_ticks = parse_proc_start_ticks((proc / "stat").read_text())
-            if start_ticks != self.start_ticks:
-                raise MeasurementError("Gateway PID was reused during the measurement")
-            smaps: str | None
+            directory_fd = os.open(f"/proc/{self.pid}", os.O_RDONLY | os.O_DIRECTORY)
             try:
-                smaps = (proc / "smaps_rollup").read_text()
-            except OSError:
-                smaps = None
-            status = (proc / "status").read_text()
-            rss_bytes, rss_source = parse_process_rss(smaps, status)
+                def read_proc(name: str) -> str:
+                    with os.fdopen(os.open(name, os.O_RDONLY, dir_fd=directory_fd)) as handle:
+                        return handle.read()
+                start_ticks = parse_proc_start_ticks(read_proc("stat"))
+                if start_ticks != self.start_ticks:
+                    raise MeasurementError("Gateway PID was reused during the measurement")
+                try:
+                    smaps = read_proc("smaps_rollup")
+                except OSError:
+                    smaps = None
+                status = read_proc("status")
+                rss_bytes, rss_source = parse_process_rss(smaps, status)
+            finally:
+                os.close(directory_fd)
         except (OSError, ValueError) as error:
             raise MeasurementError(f"Gateway process RSS sample failed: {type(error).__name__}") from error
         status_fields = {line.partition(":")[0]: line.partition(":")[2].strip() for line in status.splitlines()}
@@ -1184,10 +1237,17 @@ class GatewayContainer:
         if result["exit_code"] == 137:
             cleanup_errors.append("Gateway required SIGKILL after the stop timeout")
         if self.variant == "gnu-jemalloc" and self.container_created:
-            try:
-                gateway_log = (self.evidence / "gateway.log").read_text(errors="replace")
-            except OSError:
-                gateway_log = ""
+            gateway_log = ""
+            if post_stop_running is False:
+                try:
+                    stopped_logs = self.docker("logs", "--tail", "200", self.container_id, check=False)
+                    if stopped_logs.returncode == 0:
+                        gateway_log = (stopped_logs.stdout + stopped_logs.stderr)[-MAX_GATEWAY_LOG_TAIL_BYTES:]
+                        (self.evidence / "gateway-exit.log").write_text(gateway_log)
+                    else:
+                        cleanup_errors.append("stopped Gateway logs could not be retrieved")
+                except (MeasurementError, OSError) as error:
+                    cleanup_errors.append(f"stopped Gateway log capture failed: {type(error).__name__}")
             result["jemalloc_background_thread_verified"] = "opt.background_thread: true" in gateway_log
             if not result["jemalloc_background_thread_verified"]:
                 cleanup_errors.append("GNU image did not emit jemalloc background-thread statistics on exit")
@@ -1412,12 +1472,17 @@ class StreamMemoryRunner:
             self.failures.append("interrupted by SIGTERM")
         finally:
             self._cleanup_started = True
-            await self.release_requests()
-            await self.backend.close()
-            if self.sampler is not None:
-                await self.sampler.close()
+            try:
+                await self.release_requests()
+                await self.backend.close()
+                if self.sampler is not None:
+                    await self.sampler.close()
+            except (MeasurementError, OSError) as error:
+                self.failures.append(f"cleanup evidence failed: {type(error).__name__}: {str(error)[:500]}")
+            finally:
+                if self.gateway is not None:
+                    self.container_cleanup = self.gateway.stop()
             if self.gateway is not None:
-                self.container_cleanup = self.gateway.stop()
                 if self.container_cleanup.get("oom_killed"):
                     self.failures.append("Gateway container was OOM-killed")
                 if self.container_cleanup.get("log_capture_error"):
@@ -1467,10 +1532,10 @@ class StreamMemoryRunner:
         measurement_user(os.getuid(), os.getgid())
         soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         validate_file_descriptor_limit(soft)
-        result = subprocess.run(["docker", "info", "--format", "{{.ServerVersion}}"], capture_output=True, text=True)
+        result = subprocess.run(["docker", "info", "--format", "{{.ServerVersion}}"], capture_output=True, text=True, timeout=30, check=False)
         if result.returncode != 0:
             raise MeasurementError(f"Docker daemon is unavailable: {result.stderr.strip()[:500]}")
-        docker_root = subprocess.run(["docker", "info", "--format", "{{.DockerRootDir}}"], capture_output=True, text=True)
+        docker_root = subprocess.run(["docker", "info", "--format", "{{.DockerRootDir}}"], capture_output=True, text=True, timeout=30, check=False)
         if docker_root.returncode != 0 or not docker_root.stdout.strip():
             raise MeasurementError("could not determine Docker storage location")
         self.host["docker_server_version"] = result.stdout.strip()
@@ -1479,6 +1544,8 @@ class StreamMemoryRunner:
             ["docker", "network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}"],
             capture_output=True,
             text=True,
+            timeout=30,
+            check=False,
         )
         if bridge.returncode != 0:
             raise MeasurementError(f"could not determine the Docker bridge address: {bridge.stderr.strip()[:500]}")
@@ -1619,7 +1686,10 @@ class StreamMemoryRunner:
             if self.client_active:
                 raise MeasurementError(f"{burst_id} clients did not return to zero")
             self.sampler.set_phase("burst_post_close", burst_id)
-            post_close = self.gateway_sample()["rss_bytes"] if self.gateway is not None else 0
+            post_close_rows = self.sampler.phase_samples("burst_post_close", burst_id)
+            if not post_close_rows:
+                raise MeasurementError(f"{burst_id} post-close RSS sample was not recorded")
+            post_close = post_close_rows[-1]["rss_bytes"]
             self.sampler.set_phase("burst_settle", burst_id)
             await asyncio.sleep(settle_seconds)
             settled = self.sampler.phase_samples("burst_settle", burst_id)
@@ -1650,9 +1720,10 @@ class StreamMemoryRunner:
             self.sampler.set_phase("interburst_idle", burst_id)
             if index + 1 < burst_count:
                 await asyncio.sleep(settle_seconds)
-        self.sampler.set_phase("final_idle")
+        self.sampler.set_phase("final_idle_wait")
         await asyncio.sleep(final_idle_seconds)
-        idle = self.sampler.phase_samples("final_idle")
+        self.sampler.set_phase("final_idle")
+        idle = await self.wait_for_samples("final_idle", RSS_SAMPLES)
         final_values = [item["rss_bytes"] for item in idle[-RSS_SAMPLES:]]
         if full and len(final_values) < RSS_SAMPLES:
             raise MeasurementError(f"final idle window has {len(final_values)} RSS samples")
@@ -1880,6 +1951,20 @@ class StreamMemoryRunner:
             raise MeasurementError("Gateway container is not running")
         return self.gateway.proc_sample()
 
+    async def wait_for_samples(self, phase: str, minimum: int) -> list[dict[str, Any]]:
+        """Collect a bounded qualification window after its phase has started."""
+        if self.sampler is None:
+            raise MeasurementError("sampler is not initialized")
+        deadline = time.monotonic() + (minimum + 5) * SAMPLE_PERIOD_SECONDS
+        while time.monotonic() < deadline:
+            values = self.sampler.phase_samples(phase)
+            if len(values) >= minimum:
+                return values
+            if self.sampler.errors:
+                raise MeasurementError("sampler failed while collecting the final idle window")
+            await asyncio.sleep(SAMPLE_PERIOD_SECONDS)
+        raise MeasurementError(f"{phase} did not collect {minimum} samples before its deadline")
+
     def window(self, phase: str, minimum: int) -> list[dict[str, Any]]:
         if self.sampler is None:
             raise MeasurementError("sampler is not initialized")
@@ -1986,8 +2071,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             limit = decimal.Decimal(args.max_settle_ratio)
         except decimal.InvalidOperation:
             parser.error("--max-settle-ratio must be numeric")
-        if not limit.is_finite() or limit <= 0:
-            parser.error("--max-settle-ratio must be finite and positive")
+        try:
+            ratio_exceeded(1, 1, args.max_settle_ratio)
+        except ValueError as error:
+            parser.error(str(error))
     elif args.max_settle_ratio is not None:
         parser.error("--max-settle-ratio is only accepted with --mode full")
     return args

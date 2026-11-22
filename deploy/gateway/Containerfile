@@ -46,11 +46,13 @@ FROM alpine:3.23
 
 ARG GRID_GIT_COMMIT=unknown
 ARG GRID_GIT_VERSION=unknown
+ARG GRID_QUALIFICATION_SOURCE_SHA256=unknown
 LABEL org.opencontainers.image.revision="$GRID_GIT_COMMIT" \
     org.opencontainers.image.version="$GRID_GIT_VERSION" \
     org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
     org.opencontainers.image.description="Praxis-based grid data-plane gateway" \
-    org.opencontainers.image.licenses="Apache-2.0"
+    org.opencontainers.image.licenses="Apache-2.0" \
+    org.grid.qualification.source-sha256="$GRID_QUALIFICATION_SOURCE_SHA256"
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S grid \
