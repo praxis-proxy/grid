@@ -656,7 +656,7 @@ Replace images in an override file:
 # operator-overrides.yaml
 image:
   repository: my-registry.example.com/grid-operator
-  tag: v0.3.1
+  tag: v0.3.2
   pullPolicy: Always
 ```
 
