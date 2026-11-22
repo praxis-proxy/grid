@@ -407,12 +407,14 @@ async fn main() {
                 signals_enabled.then(|| SignalsListener {
                     bind: config.signals.addr,
                     client: client.clone(),
+                    publication: Arc::clone(&ctx),
                     published: Published {
                         site: ctx.signals(),
                         peers: ctx.peers(),
                         rounds: ctx.peer_rounds(),
                         providers: ctx.local_providers(),
                         membership: ctx.membership().as_str(),
+                        ordered_publication: false,
                         feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
                     },
                     peer_identities: ctx.peer_identities(),
@@ -2333,6 +2335,8 @@ struct Published {
     providers: operator::site_providers::LocalProviders,
     /// This site's membership mode, named on every answer.
     membership: &'static str,
+    /// Whether settled startup reserved an ordered signal publisher for this source.
+    ordered_publication: bool,
 }
 
 /// What the signals listener needs from startup.
@@ -2341,6 +2345,8 @@ struct SignalsListener {
     bind: Option<SocketAddr>,
     /// Kube client, for this site's TLS material.
     client: Client,
+    /// The actual publisher reservation, inspected after startup settles.
+    publication: Arc<OperatorCtx>,
     /// What is served.
     published: Published,
     /// Keys peers have declared, and the labels held for each.
@@ -2364,13 +2370,13 @@ async fn run_signals_server(
     swim: SwimStartup,
     shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(listener) = listener else {
+    let Some(mut listener) = listener else {
         return Ok(());
     };
     // Peers learn this listener from the advertised address, so it waits for SWIM to settle.
-    let advertised = swim_settled(swim)
-        .await
-        .and_then(|handle| handle.signals_address().map(str::to_owned));
+    let swim = swim_settled(swim).await;
+    listener.published.ordered_publication = ordered_publication_capable(&listener.publication);
+    let advertised = swim.and_then(|handle| handle.signals_address().map(str::to_owned));
     let app = signals_app(listener.published.clone());
 
     // The opt-in listener rebinds on every material change, so a transient
@@ -2390,6 +2396,13 @@ async fn run_signals_server(
         }
     }
     Ok(())
+}
+
+/// Whether settled startup installed a publisher that can emit provider revision rows.
+///
+/// A configured mode or site name alone does not establish a reserved publisher.
+fn ordered_publication_capable(ctx: &OperatorCtx) -> bool {
+    ctx.publisher().is_some()
 }
 
 impl SignalsListener {
@@ -3277,7 +3290,10 @@ fn with_catalog_version(
                 .headers_mut()
                 .insert(operator::site_providers::VERSION_HEADER, version);
         }
-        response = with_admission_contract(response, rendered.admission_contract);
+        response = with_admission_contract(
+            response,
+            rendered.admission_contract.filter(|_| published.ordered_publication),
+        );
     }
     response
 }
@@ -3322,7 +3338,10 @@ async fn providers_handler(
         rendered.body,
     )
         .into_response();
-    with_admission_contract(response, rendered.admission_contract)
+    with_admission_contract(
+        response,
+        rendered.admission_contract.filter(|_| published.ordered_publication),
+    )
 }
 
 /// This site's own gateway's read: the poller's rounds, then the site, then its peers, in one
@@ -3404,6 +3423,19 @@ async fn signals_identity(client: &Client) -> (Option<ServerTlsConfig>, Option<g
 /// The `GridNetwork` this operator serves, `None` when absent or unlistable.
 async fn sole_network(client: &Client) -> Option<GridNetwork> {
     Box::pin(operator::site_name::sole_network(client)).await.ok().flatten()
+}
+
+/// Refresh the receiver's one selected network without losing it to transient API failure.
+async fn selected_peer_network(client: &Client, selected: &mut Option<String>) -> Option<String> {
+    if let Ok(Ok(network)) = tokio::time::timeout(
+        PEER_AGES_WRITE_TIMEOUT,
+        Box::pin(operator::site_name::sole_network(client)),
+    )
+    .await
+    {
+        *selected = network.and_then(|network| network.metadata.name);
+    }
+    selected.clone()
 }
 
 /// TLS for the listener, or `None` when unconfigured or unreadable.
@@ -3616,6 +3648,7 @@ async fn run_peer_poller(
         catalog_versions: std::collections::HashMap::new(),
         catalog_admission_contracts: std::collections::HashMap::new(),
         pending_catalogs: std::collections::HashMap::new(),
+        selected_network: None,
         remembered: BTreeMap::new(),
         unanswered: BTreeSet::new(),
         turn: 0,
@@ -3668,8 +3701,6 @@ struct AdmittedPeerSignal {
     observations: Vec<operator::signals::Observation>,
     /// Whether the catalog paired with these rows should replace the held catalog.
     use_pending: bool,
-    /// The staged catalog selected for promotion, if any.
-    pending: Option<PendingProviderCatalog>,
 }
 
 /// Applies completed peer polls against their selected provider catalog versions.
@@ -3717,7 +3748,7 @@ impl PeerSignalApply<'_> {
         self.peers
             .refresh(BTreeMap::from([(peer.to_owned(), admitted.observations)]), self.ttl);
         if admitted.use_pending
-            && let Some(candidate) = admitted.pending
+            && let Some(candidate) = self.pending_catalogs.remove(peer)
         {
             self.promote(peer, candidate);
         }
@@ -3740,18 +3771,22 @@ impl PeerSignalApply<'_> {
             catalog_version,
             self.pending_catalogs.get(peer),
         );
-        let pending = self.pending_catalogs.get(peer).cloned();
-        let source_providers = if selection.use_pending {
-            pending.as_ref().map(|candidate| candidate.providers.clone())
-        } else {
-            self.catalogs.providers_for(peer)
-        };
         let admitted = match selection.mode {
             ProviderAdmissionMode::Legacy if self.catalogs.holds(peer) || selection.use_pending => {
                 Some(self.slots.bound_legacy(peer, offered_rows))
             },
             ProviderAdmissionMode::SourceRanked if let Some(network) = self.active_network.as_deref() => {
-                let allowed = source_ranked_provider_generations(&source_providers.unwrap_or_default(), network);
+                let held_providers = (!selection.use_pending)
+                    .then(|| self.catalogs.providers_for(peer))
+                    .flatten();
+                let source_providers = if selection.use_pending {
+                    self.pending_catalogs
+                        .get(peer)
+                        .map(|catalog| catalog.providers.as_slice())
+                } else {
+                    held_providers.as_deref()
+                };
+                let allowed = source_ranked_provider_generations(source_providers.unwrap_or_default(), network);
                 let filtered = self.slots.bound_source_ranked_with_status(peer, offered_rows, &allowed);
                 if !selection.accepts_signal_generation(filtered.spec_generation_mismatch) {
                     tracing::warn!(
@@ -3781,7 +3816,6 @@ impl PeerSignalApply<'_> {
         Some(AdmittedPeerSignal {
             observations: admitted_rows,
             use_pending: selection.use_pending,
-            pending,
         })
     }
 
@@ -3797,7 +3831,6 @@ impl PeerSignalApply<'_> {
             Some(contract) => self.catalog_admission_contracts.insert(peer.to_owned(), contract),
             None => self.catalog_admission_contracts.remove(peer),
         };
-        self.pending_catalogs.remove(peer);
     }
 }
 
@@ -3970,6 +4003,8 @@ struct PeerPoller {
     catalog_admission_contracts: std::collections::HashMap<String, String>,
     /// Versioned catalogs kept out of candidate selection until a signal answer names them.
     pending_catalogs: std::collections::HashMap<String, PendingProviderCatalog>,
+    /// The last successfully selected receiver network, retained across transient API failure.
+    selected_network: Option<String>,
     /// Each peer where it was last polled, so one SWIM no longer lists is still polled there.
     remembered: BTreeMap<String, operator::signals::PeerSite>,
     /// Peers polled last round that did not answer, polled last and briefly.
@@ -4236,7 +4271,7 @@ impl PeerPoller {
         self.ctx.peer_slots().retain_sites(|site| identities.knows(site));
         let catalogs = self.ctx.peer_providers();
         let slots = source.slots.clone();
-        let active_network = self.ctx.signal_network_name().map(str::to_owned);
+        let active_network = selected_peer_network(&self.client, &mut self.selected_network).await;
         let mut catalog_versions = self.catalog_versions.clone();
         let mut catalog_admission_contracts = self.catalog_admission_contracts.clone();
         let mut pending_catalogs = self.pending_catalogs.clone();
@@ -5206,6 +5241,7 @@ mod tests {
             rounds: operator::signals::PeerRounds::default(),
             providers: operator::site_providers::LocalProviders::default(),
             membership: "Swim",
+            ordered_publication: false,
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
@@ -5785,6 +5821,7 @@ mod tests {
             rounds: operator::signals::PeerRounds::default(),
             providers: open_and_gold(),
             membership: "Swim",
+            ordered_publication: true,
             feedback: operator::gateway_ages::GatewayFeedback::new(
                 stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0))),
                 operator::shutdown::Shutdown::never(),
@@ -6290,6 +6327,89 @@ mod tests {
     }
 
     #[test]
+    fn pending_catalog_is_retained_on_rejection_and_consumed_after_signal_admission() {
+        let provider = |name: &str| {
+            serde_json::from_value::<operator::site_providers::WireProvider>(serde_json::json!({
+                "networkId": "net", "providerId": name, "routingCluster": name,
+                "capacityWeight": 1, "phase": "Available", "revision": 1
+            }))
+            .expect("legacy provider fixture")
+        };
+        let peers = operator::signals::SignalStore::new();
+        let heard = operator::signals::LoadHeard::default();
+        let catalogs = operator::site_providers::PeerProviders::default();
+        let slots = operator::signals::PeerSlots::default();
+        catalogs.replace("peer", vec![provider("old")]);
+        let mut versions = std::collections::HashMap::from([("peer".to_owned(), "a".repeat(16))]);
+        let mut contracts = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::from([(
+            "peer".to_owned(),
+            PendingProviderCatalog {
+                providers: vec![provider("new")],
+                version: Some("b".repeat(16)),
+                admission_contract: None,
+            },
+        )]);
+        let mut apply = PeerSignalApply {
+            peers: &peers,
+            heard: &heard,
+            catalogs: &catalogs,
+            slots: &slots,
+            active_network: Some("net".to_owned()),
+            ttl: std::time::Duration::from_secs(60),
+            catalog_versions: &mut versions,
+            catalog_admission_contracts: &mut contracts,
+            pending_catalogs: &mut pending,
+        };
+        apply.apply(
+            "peer",
+            Vec::new(),
+            0,
+            &operator::metrics_scraper::Stamp {
+                providers_version: Some("c".repeat(16)),
+                ..Default::default()
+            },
+        );
+        assert!(
+            apply.pending_catalogs.contains_key("peer"),
+            "rejection keeps the pending catalog"
+        );
+        assert_eq!(apply.catalog_versions.get("peer"), Some(&"a".repeat(16)));
+        assert_eq!(
+            catalogs
+                .providers_for("peer")
+                .expect("held catalog")
+                .first()
+                .expect("one provider")
+                .provider_id,
+            "old"
+        );
+        apply.apply(
+            "peer",
+            Vec::new(),
+            0,
+            &operator::metrics_scraper::Stamp {
+                providers_version: Some("b".repeat(16)),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !apply.pending_catalogs.contains_key("peer"),
+            "promotion consumes the pending catalog"
+        );
+        assert_eq!(apply.catalog_versions.get("peer"), Some(&"b".repeat(16)));
+        assert_eq!(
+            catalogs
+                .providers_for("peer")
+                .expect("promoted catalog")
+                .first()
+                .expect("one provider")
+                .provider_id,
+            "new"
+        );
+    }
+
+    #[test]
     fn source_ranked_provider_generations_follow_the_access_filtered_active_network_catalog() {
         let make_provider =
             |network: &str, id: &str, cluster: &str, restricted: bool| operator::site_providers::WireProvider {
@@ -6349,6 +6469,112 @@ mod tests {
             !source_ranked_provider_generations(&providers, "network-a").contains_key("other-network-cluster"),
             "a different GridNetwork cannot contribute signal labels"
         );
+    }
+
+    #[tokio::test]
+    async fn ranked_publication_requires_a_reserved_publisher() {
+        for membership in [Membership::Local, Membership::Swim] {
+            let ctx = OperatorCtx::new(network_modes_client(None), None, SignalMode::Poll).with_membership(membership);
+            assert!(!ordered_publication_capable(&ctx));
+            assert!(ctx.set_publisher(grid_network::Publisher {
+                site: "source".to_owned(),
+                reservation: (1, 2),
+            }));
+            assert!(ordered_publication_capable(&ctx));
+        }
+    }
+
+    #[tokio::test]
+    async fn ranked_receiver_selects_its_network_without_a_local_publisher() {
+        let client = network_modes_client(Some(serde_json::json!({
+            "membership": {"mode": "Swim"}, "signalTransport": {"mode": "poll"}
+        })));
+        let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
+        assert!(ctx.publisher().is_none());
+        assert!(ctx.signal_network_name().is_none());
+        let mut selected = None;
+        assert_eq!(
+            selected_peer_network(&client, &mut selected).await.as_deref(),
+            Some("grid")
+        );
+        assert_eq!(selected.as_deref(), Some("grid"));
+        let missing = network_modes_client(None);
+        assert!(selected_peer_network(&missing, &mut selected).await.is_none());
+        assert!(selected.is_none(), "a successful deletion clears the previous network");
+        selected = Some("previous-grid".to_owned());
+        assert_eq!(
+            selected_peer_network(&client, &mut selected).await.as_deref(),
+            Some("grid")
+        );
+        assert_eq!(
+            selected.as_deref(),
+            Some("grid"),
+            "a successful lookup replaces the old network"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ranked_receiver_network_lookup_is_bounded_when_the_api_stalls() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                std::future::pending::<Result<http::Response<axum::body::Body>, std::convert::Infallible>>().await
+            }),
+            "default",
+        );
+        for previous in [None, Some("grid".to_owned())] {
+            let mut selected = previous.clone();
+            let started = tokio::time::Instant::now();
+            assert_eq!(selected_peer_network(&client, &mut selected).await, previous);
+            assert_eq!(selected, previous, "a timeout retains only previously known selection");
+            assert_eq!(started.elapsed(), PEER_AGES_WRITE_TIMEOUT);
+        }
+    }
+
+    #[tokio::test]
+    async fn ranked_receiver_network_lookup_retains_selection_on_api_error() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                Err::<http::Response<axum::body::Body>, _>(std::io::Error::other("injected API failure"))
+            }),
+            "default",
+        );
+        for previous in [None, Some("grid".to_owned())] {
+            let mut selected = previous.clone();
+            assert_eq!(selected_peer_network(&client, &mut selected).await, previous);
+            assert_eq!(
+                selected, previous,
+                "an API error retains only previously known selection"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn ranked_endpoint_headers_require_ordered_publication_on_both_paths() {
+        for ordered in [false, true] {
+            let mut published = serving_providers();
+            published.ordered_publication = ordered;
+            for caller in [Caller::Local, Caller::Peer(Some(BTreeMap::new()))] {
+                let catalog =
+                    providers_handler(axum::extract::State(published.clone()), axum::Extension(caller.clone())).await;
+                let signals = signals_handler(
+                    axum::extract::State(published.clone()),
+                    axum::Extension(caller),
+                    axum::extract::Query(Vec::new()),
+                )
+                .await;
+                let version = operator::site_providers::VERSION_HEADER;
+                assert!(catalog.headers().contains_key(version));
+                assert_eq!(catalog.headers().get(version), signals.headers().get(version));
+                for response in [catalog, signals] {
+                    let advertised = response
+                        .headers()
+                        .get(operator::site_providers::ADMISSION_CONTRACT_HEADER)
+                        .map(|value| value.to_str().expect("ASCII contract"));
+                    assert_eq!(advertised, ordered.then_some("1"));
+                }
+            }
+        }
     }
 
     /// Every signals answer names the catalog version and the producer release.
@@ -7514,6 +7740,7 @@ mod tests {
             catalog_versions: std::collections::HashMap::default(),
             catalog_admission_contracts: std::collections::HashMap::default(),
             pending_catalogs: std::collections::HashMap::default(),
+            selected_network: None,
             remembered: BTreeMap::default(),
             unanswered: BTreeSet::default(),
             turn: 0,
@@ -8312,6 +8539,7 @@ mod tests {
             rounds: operator::signals::PeerRounds::default(),
             providers: operator::site_providers::LocalProviders::default(),
             membership: "Swim",
+            ordered_publication: false,
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         published.peers.refresh(
@@ -8666,6 +8894,7 @@ mod tests {
                 rounds: operator::signals::PeerRounds::default(),
                 providers: operator::site_providers::LocalProviders::default(),
                 membership: "Swim",
+                ordered_publication: false,
                 feedback,
             })
         }

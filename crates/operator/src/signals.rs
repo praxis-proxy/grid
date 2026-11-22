@@ -1317,7 +1317,7 @@ fn classify(error: &MetricsScrapeError) -> RequestOutcome {
                 Ok(outcome) => outcome,
             }
         },
-        MetricsScrapeError::Encoding(_) => RequestOutcome::Encoding,
+        MetricsScrapeError::Encoding(_) | MetricsScrapeError::InvalidAdmissionContract => RequestOutcome::Encoding,
         MetricsScrapeError::BodyTooLarge(_) => RequestOutcome::Transport,
         MetricsScrapeError::InvalidUrl(_)
         | MetricsScrapeError::HttpWithTls(_)

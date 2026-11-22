@@ -814,7 +814,8 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
         metrics_scraper::MetricsScrapeError::BodyTooLarge(_) => "MetricsBodyTooLarge",
         metrics_scraper::MetricsScrapeError::InvalidUrl(_)
         | metrics_scraper::MetricsScrapeError::NonOkStatus { .. }
-        | metrics_scraper::MetricsScrapeError::Encoding(_) => "MetricsScrapeError",
+        | metrics_scraper::MetricsScrapeError::Encoding(_)
+        | metrics_scraper::MetricsScrapeError::InvalidAdmissionContract => "MetricsScrapeError",
     }
 }
 
