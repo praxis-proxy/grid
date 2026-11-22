@@ -107,6 +107,16 @@ mod tests {
             Some(503),
             "a stable ID this site does not serve has no upstream"
         );
+        let refusal = gateway.head(&ca, &west, ELSEWHERE).expect("answered");
+        assert!(
+            refusal.contains("x-grid-refusal: candidate"),
+            "the consumer must read why it was refused:\n{refusal}"
+        );
+        let answer = gateway.head(&ca, &west, SERVED).expect("answered");
+        assert!(
+            answer.starts_with("http/1.1 200") && !answer.contains("x-grid-refusal"),
+            "a backend cannot speak this gateway's refusal:\n{answer}"
+        );
         let served = backend.heads();
         let head = served
             .last()
@@ -467,7 +477,9 @@ mod tests {
                         while let Ok((head, _body)) = read_request(&mut stream) {
                             seen.lock().expect("heads").push(head);
                             if stream
-                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nX-Grid-Refusal: candidate\r\nContent-Length: 2\r\n\r\nok",
+                                )
                                 .is_err()
                             {
                                 return;
@@ -558,6 +570,11 @@ mod tests {
             Client::connect(ca, leaf, self.listen).ok()?.chat(candidate)
         }
 
+        /// The lowercased response head of [`Self::chat`].
+        fn head(&self, ca: &CaCert, leaf: &SiteCertOutput, candidate: &str) -> Option<String> {
+            Client::connect(ca, leaf, self.listen).ok()?.exchange(candidate)
+        }
+
         fn lines(&self, needle: &str) -> usize {
             self.output
                 .lock()
@@ -617,6 +634,11 @@ mod tests {
         /// One chat request carrying every credential a caller might send, the status, or
         /// `None` when the connection is refused or cut.
         fn chat(&mut self, candidate: &str) -> Option<u16> {
+            self.exchange(candidate)?.split_whitespace().nth(1)?.parse().ok()
+        }
+
+        /// [`Self::chat`], returning the lowercased response head.
+        fn exchange(&mut self, candidate: &str) -> Option<String> {
             let body = r#"{"model":"llama"}"#;
             let request = format!(
                 "POST /v1/chat/completions?api_key=s3cret&stream=true&token=t HTTP/1.1\r\nHost: site-a.grid.internal\r\nAuthorization: Bearer caller\r\nProxy-Authorization: Basic x\r\nCookie: session=1\r\nX-Api-Key: k\r\nX-Goog-Api-Key: g\r\nx-ai-routing-candidate: {candidate}\r\nx-ai-routing-revision: 7\r\nx-ai-routing-request-id: req-1\r\nX-Peer-Extra: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -639,7 +661,7 @@ mod tests {
                 .unwrap_or(0);
             let mut rest = vec![0_u8; length];
             self.stream.read_exact(&mut rest).ok()?;
-            head.split_whitespace().nth(1)?.parse().ok()
+            Some(head)
         }
     }
 }
