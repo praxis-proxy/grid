@@ -142,6 +142,8 @@ pub struct OperatorCtx {
     pub(crate) peers: signals::SignalStore,
     /// When the poller's last round that included each peer ended.
     pub(crate) peer_rounds: signals::PeerRounds,
+    /// Latest response-size result of this process's local-gateway relay.
+    relay_capacity: signals::RelayCapacity,
     /// Whether each polled peer has caught up since this process started.
     pub(crate) peer_catch_up: signals::CatchUp,
     /// Each peer provider the poller has received load rows for.
@@ -415,6 +417,7 @@ impl OperatorCtx {
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
             peer_rounds: signals::PeerRounds::default(),
+            relay_capacity: signals::RelayCapacity::default(),
             peer_catch_up: signals::CatchUp::default(),
             load_heard: signals::LoadHeard::default(),
             peer_slots: signals::PeerSlots::default(),
@@ -647,6 +650,12 @@ impl OperatorCtx {
     #[must_use]
     pub fn peer_rounds(&self) -> signals::PeerRounds {
         self.peer_rounds.clone()
+    }
+
+    /// A handle to the latest local-gateway relay capacity result.
+    #[must_use]
+    pub fn relay_capacity(&self) -> signals::RelayCapacity {
+        self.relay_capacity.clone()
     }
 
     /// A handle to the peer providers the poller has heard load for.
@@ -2611,6 +2620,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         budget_statuses,
     )
     .await?;
+    apply_signal_relay_capacity_condition(&network, &ctx).await?;
     publish_regional_policy_events(&recorder, &object_ref, regional_policy_events).await;
     Box::pin(apply_rollup(client, &network)).await;
 
@@ -2700,6 +2710,12 @@ fn soonest_reconcile_retry(
 /// Manager for the `GridNetwork`'s `Available`, `Progressing` and `Degraded`, written only here.
 pub const ROLLUP_FIELD_MANAGER: &str = "grid-operator-rollup";
 
+/// The status field manager for the process-wide local Gateway relay observation.
+const SIGNAL_RELAY_CAPACITY_FIELD_MANAGER: &str = "grid-operator-signal-relay";
+
+/// Condition type for the latest local Gateway signals response.
+const SIGNAL_RELAY_CAPACITY_CONDITION: &str = "SignalRelayCapacity";
+
 /// What raises the `GridNetwork`'s `Degraded`, each with the status that does, the first held
 /// read: this site's own identity and clocks first, then its view of its peers. None gates
 /// `Available`, since peers being down leaves this site available.
@@ -2734,6 +2750,77 @@ pub(crate) fn network_rollup(network: &GridNetwork) -> Vec<Condition> {
         .find_map(|(type_, bad)| held_condition(held, type_).filter(|condition| condition.status == *bad))
         .map(|condition| (condition.reason.as_str(), condition.message.as_str()));
     rollup::trio(held, &gates, (degraded, crate::enroll::local::in_flight(held)), stamp).into()
+}
+
+/// Whether this `GridNetwork` is the single process-wide poll publisher whose relay is measured.
+fn owns_signal_relay_observation(signal_mode: SignalMode, owner: Option<&str>, network: &str) -> bool {
+    signal_mode == SignalMode::Poll && owner == Some(network)
+}
+
+/// The latest relay-capacity condition, retaining transition time while its status is unchanged.
+fn signal_relay_capacity_condition(
+    held: &[Condition],
+    exceeded: Option<bool>,
+    generation: Option<i64>,
+    now: &str,
+) -> Condition {
+    let (status, reason, message) = match exceeded {
+        Some(true) => (
+            ConditionStatus::True,
+            "RelayCapacityExceeded",
+            "The latest local Gateway relay omitted poll-round rows or provider batches; inspect grid_signals_relay_truncated_total and grid_signals_relay_provider_batches_omitted_total.",
+        ),
+        Some(false) => (
+            ConditionStatus::False,
+            "WithinBudget",
+            "The latest local Gateway relay fit the response bounds.",
+        ),
+        None => (
+            ConditionStatus::Unknown,
+            "AwaitingFirstRelay",
+            "No local Gateway signals relay has completed yet.",
+        ),
+    };
+    rollup::condition(
+        held,
+        SIGNAL_RELAY_CAPACITY_CONDITION,
+        (status, reason, message.to_owned()),
+        rollup::Stamp { generation, now },
+    )
+}
+
+/// Write the process-wide relay result only on its one active poll network and only when it changed.
+async fn apply_signal_relay_capacity_condition(network: &GridNetwork, ctx: &OperatorCtx) -> Result<(), OperatorError> {
+    let name = grid_network_name(network)?;
+    if !owns_signal_relay_observation(ctx.signal_mode, ctx.signal_network.get().map(String::as_str), name) {
+        return Ok(());
+    }
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return Ok(());
+    };
+    let held = network
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let condition =
+        signal_relay_capacity_condition(held, ctx.relay_capacity.exceeded(), network.metadata.generation, &now);
+    let desired = std::slice::from_ref(&condition);
+    if !rollup::differs(held, desired) {
+        return Ok(());
+    }
+    let patch = serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "status": {"conditions": desired}
+    });
+    let api: Api<GridNetwork> = Api::all(ctx.client.clone());
+    api.patch_status(
+        name,
+        &PatchParams::apply(SIGNAL_RELAY_CAPACITY_FIELD_MANAGER).force(),
+        &Patch::Apply(patch),
+    )
+    .await?;
+    Ok(())
 }
 
 /// The enrollment step's and the renewal loop's gates as `held` has them, one not written
@@ -10813,6 +10900,65 @@ mod tests {
         };
         assert!(grid_network_status_needs_update(Some(&baseline), &changed));
         assert!(grid_network_status_needs_update(None, &baseline));
+    }
+
+    #[test]
+    fn relay_capacity_condition_belongs_only_to_the_active_poll_network() {
+        assert!(owns_signal_relay_observation(
+            SignalMode::Poll,
+            Some("grid-a"),
+            "grid-a"
+        ));
+        assert!(!owns_signal_relay_observation(
+            SignalMode::Poll,
+            Some("grid-a"),
+            "grid-b"
+        ));
+        assert!(!owns_signal_relay_observation(
+            SignalMode::Gossip,
+            Some("grid-a"),
+            "grid-a"
+        ));
+        assert!(!owns_signal_relay_observation(SignalMode::Poll, None, "grid-a"));
+    }
+
+    #[test]
+    fn relay_capacity_condition_coalesces_until_an_observed_transition() {
+        const FIRST: &str = "2026-11-20T00:00:00Z";
+        const NEXT: &str = "2026-11-20T00:01:00Z";
+        let awaiting = signal_relay_capacity_condition(&[], None, Some(1), FIRST);
+        assert_eq!(awaiting.status, ConditionStatus::Unknown);
+        assert_eq!(awaiting.reason, "AwaitingFirstRelay");
+
+        let within = signal_relay_capacity_condition(&[], Some(false), Some(1), FIRST);
+        assert_eq!(within.status, ConditionStatus::False);
+        assert_eq!(within.reason, "WithinBudget");
+        let repeated = signal_relay_capacity_condition(std::slice::from_ref(&within), Some(false), Some(1), NEXT);
+        assert_eq!(repeated.last_transition_time, within.last_transition_time);
+        assert!(
+            !rollup::differs(std::slice::from_ref(&within), std::slice::from_ref(&repeated)),
+            "an unchanged relay state is not patched again"
+        );
+
+        let overflow = signal_relay_capacity_condition(std::slice::from_ref(&within), Some(true), Some(1), NEXT);
+        assert_eq!(overflow.status, ConditionStatus::True);
+        assert_eq!(overflow.reason, "RelayCapacityExceeded");
+        assert!(
+            !overflow.message.contains("pool-") && !overflow.message.chars().any(|ch| ch.is_ascii_digit()),
+            "condition text has no provider identity or raw count"
+        );
+        assert!(rollup::differs(
+            std::slice::from_ref(&within),
+            std::slice::from_ref(&overflow)
+        ));
+
+        let recovered = signal_relay_capacity_condition(std::slice::from_ref(&overflow), Some(false), Some(1), NEXT);
+        assert_eq!(recovered.status, ConditionStatus::False);
+        assert_eq!(recovered.last_transition_time, NEXT);
+        assert!(rollup::differs(
+            std::slice::from_ref(&overflow),
+            std::slice::from_ref(&recovered)
+        ));
     }
 
     #[test]

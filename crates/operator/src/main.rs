@@ -411,6 +411,7 @@ async fn main() {
                         site: ctx.signals(),
                         peers: ctx.peers(),
                         rounds: ctx.peer_rounds(),
+                        relay_capacity: ctx.relay_capacity(),
                         providers: ctx.local_providers(),
                         membership: ctx.membership().as_str(),
                         feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
@@ -2329,6 +2330,8 @@ struct Published {
     peers: operator::signals::SignalStore,
     /// When the poller last tried each peer, for this site's own gateway only.
     rounds: operator::signals::PeerRounds,
+    /// Latest response-size result of the local Gateway's process-wide relay.
+    relay_capacity: operator::signals::RelayCapacity,
     /// This site's providers, for peers building candidates.
     providers: operator::site_providers::LocalProviders,
     /// This site's membership mode, named on every answer.
@@ -3310,34 +3313,34 @@ async fn providers_handler(
         .into_response()
 }
 
-/// This site's own gateway's read: the poller's rounds, then the site, then its peers, in one
-/// body under the gateway's read ceiling, so a flood of relayed rows can only cost the last peers,
-/// never this site.
+/// This site's own gateway's read: local site data, poller rounds, then peer data share one body
+/// under the gateway's read ceiling. Local signals have first claim on the budget.
 fn local_relay(
     published: &Published,
     target: Option<&str>,
     collect: &[String],
     now: operator::signals::ClockReading,
 ) -> (String, std::time::Duration) {
-    let rounds = published.rounds.render();
-    let site = published.site.render_bounded(
-        target,
-        collect,
-        operator::signals::MAX_RELAY_BYTES.saturating_sub(rounds.len()),
-        now,
-    );
+    let site = published
+        .site
+        .render_bounded(target, collect, operator::signals::MAX_RELAY_BYTES, now);
+    let rounds = published
+        .rounds
+        .render_bounded(operator::signals::MAX_RELAY_BYTES.saturating_sub(site.body.len()));
     // Peers relay only to Local, and the peers store carries no access map.
     // A Peer(Some) relay would need per-target scoping added here.
     let peers = published.peers.render_bounded(
         target,
         collect,
-        operator::signals::MAX_RELAY_BYTES.saturating_sub(rounds.len().saturating_add(site.body.len())),
+        operator::signals::MAX_RELAY_BYTES.saturating_sub(site.body.len().saturating_add(rounds.body.len())),
         now,
     );
     operator::metrics::record_relay_truncated("site", &site);
     operator::metrics::record_relay_truncated("peers", &peers);
-    let mut body = rounds;
-    body.push_str(&site.body);
+    operator::metrics::record_relay_poll_rounds_omitted(rounds.rows_omitted);
+    published.relay_capacity.observe(&site, &peers, rounds.rows_omitted);
+    let mut body = site.body;
+    body.push_str(&rounds.body);
     body.push_str(&peers.body);
     (body, site.oldest.max(peers.oldest))
 }
@@ -4795,6 +4798,7 @@ mod tests {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
             rounds: operator::signals::PeerRounds::default(),
+            relay_capacity: operator::signals::RelayCapacity::default(),
             providers: operator::site_providers::LocalProviders::default(),
             membership: "Swim",
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
@@ -5365,6 +5369,7 @@ mod tests {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
             rounds: operator::signals::PeerRounds::default(),
+            relay_capacity: operator::signals::RelayCapacity::default(),
             providers: open_and_gold(),
             membership: "Swim",
             feedback: operator::gateway_ages::GatewayFeedback::new(
@@ -7428,6 +7433,7 @@ mod tests {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
             rounds: operator::signals::PeerRounds::default(),
+            relay_capacity: operator::signals::RelayCapacity::default(),
             providers: operator::site_providers::LocalProviders::default(),
             membership: "Swim",
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
@@ -7448,6 +7454,167 @@ mod tests {
             (29_000..=31_000).contains(&(date - stamp)),
             "Date minus the stamp is the row's 30 s age: {}",
             date - stamp
+        );
+    }
+
+    #[tokio::test]
+    async fn local_relay_records_capacity_before_the_response_is_delivered() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                std::future::pending::<Result<http::Response<axum::body::Body>, std::convert::Infallible>>().await
+            }),
+            "default",
+        );
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+            rounds: operator::signals::PeerRounds::default(),
+            relay_capacity: operator::signals::RelayCapacity::default(),
+            providers: operator::site_providers::LocalProviders::default(),
+            membership: "Swim",
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
+        };
+        let oversized = operator::signals::Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([
+                ("grid_provider".to_owned(), "pool-a".to_owned()),
+                (
+                    "exported_label".to_owned(),
+                    "x".repeat(operator::signals::MAX_RELAY_BYTES),
+                ),
+            ]),
+            value: 1.0,
+            timestamp_ms: None,
+            age: std::time::Duration::ZERO,
+        };
+        published.peers.refresh(
+            BTreeMap::from([("east".to_owned(), vec![oversized])]),
+            std::time::Duration::from_secs(60),
+        );
+        let (discarded_before_recovery, _) = local_relay(&published, None, &[], operator::signals::ClockReading::now());
+        drop(discarded_before_recovery);
+        assert_eq!(published.relay_capacity.exceeded(), Some(true));
+
+        published.peers.refresh(
+            BTreeMap::from([("east".to_owned(), vec![row_aged(std::time::Duration::ZERO)])]),
+            std::time::Duration::from_secs(60),
+        );
+        let (discarded_after_recovery, _) = local_relay(&published, None, &[], operator::signals::ClockReading::now());
+        drop(discarded_after_recovery);
+        assert_eq!(published.relay_capacity.exceeded(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn local_relay_reserves_round_metadata_and_local_batches_before_peer_batches() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                std::future::pending::<Result<http::Response<axum::body::Body>, std::convert::Infallible>>().await
+            }),
+            "default",
+        );
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+            rounds: operator::signals::PeerRounds::default(),
+            relay_capacity: operator::signals::RelayCapacity::default(),
+            providers: operator::site_providers::LocalProviders::default(),
+            membership: "Swim",
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
+        };
+        let local = operator::signals::Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([
+                ("grid_site".to_owned(), "pool-a".to_owned()),
+                ("grid_provider".to_owned(), "local-provider".to_owned()),
+                ("payload".to_owned(), "l".repeat(680 * 1024)),
+            ]),
+            value: 1.0,
+            timestamp_ms: None,
+            age: std::time::Duration::ZERO,
+        };
+        let remote = operator::signals::Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([
+                ("grid_site".to_owned(), "pool-b".to_owned()),
+                ("grid_provider".to_owned(), "peer-provider".to_owned()),
+                ("payload".to_owned(), "p".repeat(100 * 1024)),
+            ]),
+            value: 1.0,
+            timestamp_ms: None,
+            age: std::time::Duration::ZERO,
+        };
+        published.site.refresh(
+            BTreeMap::from([("pool-a".to_owned(), vec![local])]),
+            std::time::Duration::from_secs(60),
+        );
+        published.peers.refresh(
+            BTreeMap::from([("pool-b".to_owned(), vec![remote])]),
+            std::time::Duration::from_secs(60),
+        );
+        published.rounds.record(
+            &["pool-b".to_owned()],
+            UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        );
+
+        let (body, _) = local_relay(&published, None, &[], operator::signals::ClockReading::now());
+
+        assert!(body.len() <= operator::signals::MAX_RELAY_BYTES);
+        assert!(
+            body.contains("grid_site=\"pool-b\""),
+            "poll-round metadata uses the remaining bounded response budget"
+        );
+        assert!(
+            body.contains("grid_provider=\"local-provider\""),
+            "the local batch gets budget first"
+        );
+        assert!(
+            !body.contains("grid_provider=\"peer-provider\""),
+            "the peer batch is omitted whole"
+        );
+        assert_eq!(published.relay_capacity.exceeded(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn local_relay_caps_round_metadata_for_many_explicit_peers() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                std::future::pending::<Result<http::Response<axum::body::Body>, std::convert::Infallible>>().await
+            }),
+            "default",
+        );
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+            rounds: operator::signals::PeerRounds::default(),
+            relay_capacity: operator::signals::RelayCapacity::default(),
+            providers: operator::site_providers::LocalProviders::default(),
+            membership: "Swim",
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
+        };
+        published.site.refresh(
+            BTreeMap::from([("pool-a".to_owned(), vec![row_aged(std::time::Duration::ZERO)])]),
+            std::time::Duration::from_secs(60),
+        );
+        let peers: Vec<_> = (0..12_000).map(|index| format!("peer-{index:05}")).collect();
+        published
+            .rounds
+            .record(&peers, UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000));
+
+        let (body, _) = local_relay(&published, None, &[], operator::signals::ClockReading::now());
+
+        assert!(
+            body.len() <= operator::signals::MAX_RELAY_BYTES,
+            "poll-round metadata and provider rows must remain under the response cap, got {} bytes",
+            body.len()
+        );
+        assert!(
+            body.contains("grid_provider=\"pool-a\""),
+            "large poll-round metadata must not starve this site's own signal batch"
+        );
+        assert_eq!(
+            published.relay_capacity.exceeded(),
+            Some(true),
+            "omitted poll-round rows are visible as relay capacity loss"
         );
     }
 
@@ -7782,6 +7949,7 @@ mod tests {
                 site: operator::signals::SignalStore::new(),
                 peers: operator::signals::SignalStore::new(),
                 rounds: operator::signals::PeerRounds::default(),
+                relay_capacity: operator::signals::RelayCapacity::default(),
                 providers: operator::site_providers::LocalProviders::default(),
                 membership: "Swim",
                 feedback,

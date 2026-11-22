@@ -471,13 +471,13 @@ impl PeerRounds {
         }
     }
 
-    /// One row per peer, stamped at its last round, ahead of anything a byte budget can drop.
+    /// Render whole poll-round rows within the response bytes left after local signals.
     #[must_use]
-    pub fn render(&self) -> String {
+    pub fn render_bounded(&self, budget: usize) -> RenderedPeerRounds {
         let Ok(rounds) = self.0.read() else {
-            return String::new();
+            return RenderedPeerRounds::default();
         };
-        let mut out = String::new();
+        let mut rendered = RenderedPeerRounds::default();
         // Names come from `GridSite` identities, so none needs escaping; one that would is skipped.
         for (peer, at) in rounds
             .iter()
@@ -486,7 +486,8 @@ impl PeerRounds {
             let stamp = at
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
-            for part in [
+            let stamp = stamp.to_string();
+            let parts = [
                 grid_signals::poller::METRIC,
                 "{",
                 SITE_LABEL,
@@ -497,14 +498,29 @@ impl PeerRounds {
                 "=\"",
                 grid_signals::poller::PROVIDER,
                 "\"} 1 ",
-                &stamp.to_string(),
+                stamp.as_str(),
                 "\n",
-            ] {
-                out.push_str(part);
+            ];
+            let line_bytes = parts.iter().map(|part| part.len()).sum::<usize>();
+            if line_bytes > budget.saturating_sub(rendered.body.len()) {
+                rendered.rows_omitted = rendered.rows_omitted.saturating_add(1);
+                continue;
+            }
+            for part in parts {
+                rendered.body.push_str(part);
             }
         }
-        out
+        rendered
     }
+}
+
+/// Bounded poll-round metadata and the number of whole rows it left out.
+#[derive(Debug, Default)]
+pub struct RenderedPeerRounds {
+    /// Exposition text, whole rows only.
+    pub body: String,
+    /// Poll-round rows omitted because they exceed the remaining response budget.
+    pub rows_omitted: usize,
 }
 
 /// Signals held per target, where a target is a provider routing identity.
@@ -862,13 +878,12 @@ impl SignalStore {
         self.render_with(target, collect, &std::collections::BTreeSet::new(), now)
     }
 
-    /// Render for this site's own gateway: contract series only, each target cut
-    /// at [`MAX_RENDER_LINES_PER_TARGET`], and whole targets dropped once the body
-    /// would pass `budget` bytes.
+    /// Render for this site's own gateway: contract series only, each provider
+    /// batch omitted whole when it exceeds its row or remaining byte budget.
     ///
     /// The gateway reads every site from one response under its own byte
     /// ceiling, past which the whole poll fails and every site goes unmeasured.
-    /// Bounding here turns that cliff into a counted loss of the last targets.
+    /// Bounding here turns that cliff into counted loss of complete provider batches.
     /// Stamped from `now` as [`Self::render`] is.
     #[must_use]
     pub fn render_bounded(
@@ -887,11 +902,19 @@ impl SignalStore {
                 continue;
             }
             let held_for = now.instant.saturating_duration_since(held.collected_at);
-            let (block, block_oldest, cut) = render_contract_block(&held.samples, collect, held_for, now.wall);
-            rendered.lines_cut = rendered.lines_cut.saturating_add(cut);
-            if rendered.body.len().saturating_add(block.len()) > budget {
+            let remaining = budget.saturating_sub(rendered.body.len());
+            let (block, block_oldest, loss) =
+                render_contract_block(&held.samples, collect, held_for, now.wall, remaining);
+            rendered.lines_cut = rendered.lines_cut.saturating_add(loss.lines_cut);
+            rendered.providers_omitted_by_rows = rendered
+                .providers_omitted_by_rows
+                .saturating_add(loss.providers_omitted_by_rows);
+            rendered.providers_omitted_by_bytes = rendered
+                .providers_omitted_by_bytes
+                .saturating_add(loss.providers_omitted_by_bytes);
+            rendered.invalid_batches = rendered.invalid_batches.saturating_add(loss.invalid_batches);
+            if block.is_empty() && loss.providers_omitted_by_bytes > 0 {
                 rendered.targets_dropped = rendered.targets_dropped.saturating_add(1);
-                continue;
             }
             rendered.body.push_str(&block);
             rendered.oldest = rendered.oldest.max(block_oldest);
@@ -922,7 +945,16 @@ impl SignalStore {
             // TTL uses a monotonic instant; exposition wants epoch millis, so
             // derive from the age rather than store a wall clock that can jump.
             let held_for = now.instant.saturating_duration_since(held.collected_at);
-            let (block, age, _) = render_batches(&held.samples, collect, held_for, now.wall, false);
+            let (block, age, _) = render_batches(
+                &held.samples,
+                RenderContext {
+                    collect,
+                    held_for,
+                    wall: now.wall,
+                    bounded: false,
+                    budget: usize::MAX,
+                },
+            );
             out.push_str(&block);
             oldest = oldest.max(age);
         }
@@ -976,6 +1008,16 @@ impl SignalStore {
 /// The trailing timestamp is load-bearing: a reader takes the sample's age as the
 /// response `Date` less it.
 fn render_sample(out: &mut String, o: &Observation, stamp_ms: i64) {
+    render_sample_with_label_override(out, o, stamp_ms, None);
+}
+
+/// Render one observation, substituting one already-present label without cloning the sample.
+fn render_sample_with_label_override(
+    out: &mut String,
+    o: &Observation,
+    stamp_ms: i64,
+    label_override: Option<(&str, &str)>,
+) {
     // Written into the caller's buffer rather than returned. Building a string
     // per label, collecting them, joining them and then formatting the result
     // allocated once per label plus four more per sample, all of it discarded
@@ -989,6 +1031,9 @@ fn render_sample(out: &mut String, o: &Observation, stamp_ms: i64) {
             }
             out.push_str(key);
             out.push_str("=\"");
+            let value = label_override
+                .filter(|(name, _)| *name == key.as_str())
+                .map_or(value.as_str(), |(_, replacement)| replacement);
             escape_into(out, value);
             out.push('"');
         }
@@ -998,6 +1043,63 @@ fn render_sample(out: &mut String, o: &Observation, stamp_ms: i64) {
     out.push_str(&o.value.to_string());
     out.push(' ');
     out.push_str(&stamp_ms.to_string());
+}
+
+/// The exact byte count of one rendered sample line and newline, if it fits `budget`.
+fn rendered_sample_line_len(
+    observation: &Observation,
+    stamp_ms: i64,
+    label_override: Option<(&str, &str)>,
+    budget: usize,
+) -> Option<usize> {
+    let mut length = 0;
+    length = add_rendered_len(length, &observation.metric, budget)?;
+    if !observation.labels.is_empty() {
+        length = add_rendered_len(length, "{", budget)?;
+        for (index, (name, original)) in observation.labels.iter().enumerate() {
+            if index > 0 {
+                length = add_rendered_len(length, ",", budget)?;
+            }
+            length = add_rendered_len(length, name, budget)?;
+            length = add_rendered_len(length, "=\"", budget)?;
+            let value = label_override
+                .filter(|(label, _)| *label == name.as_str())
+                .map_or(original.as_str(), |(_, replacement)| replacement);
+            let escaped_length = escaped_rendered_len(value, budget.saturating_sub(length))?;
+            length = length.checked_add(escaped_length)?;
+            length = add_rendered_len(length, "\"", budget)?;
+        }
+        length = add_rendered_len(length, "}", budget)?;
+    }
+    length = add_rendered_len(length, " ", budget)?;
+    length = add_rendered_len(length, &observation.value.to_string(), budget)?;
+    length = add_rendered_len(length, " ", budget)?;
+    length = add_rendered_len(length, &stamp_ms.to_string(), budget)?;
+    length = length.checked_add(1)?;
+    (length <= budget).then_some(length)
+}
+
+/// Add a known rendered fragment's bytes without exceeding `budget`.
+fn add_rendered_len(current: usize, fragment: &str, budget: usize) -> Option<usize> {
+    let length = current.checked_add(fragment.len())?;
+    (length <= budget).then_some(length)
+}
+
+/// Count escaped label bytes, stopping as soon as the result cannot fit `budget`.
+fn escaped_rendered_len(value: &str, budget: usize) -> Option<usize> {
+    let mut length = 0_usize;
+    for character in value.chars() {
+        let bytes = if matches!(character, '\\' | '"' | '\n') {
+            2
+        } else {
+            character.len_utf8()
+        };
+        length = length.checked_add(bytes)?;
+        if length > budget {
+            return None;
+        }
+    }
+    Some(length)
 }
 
 /// Epoch milliseconds for an observation collected `age` ago.
@@ -2331,8 +2433,12 @@ fn stamp_origin(observations: Vec<Observation>, peer: &str) -> Vec<Observation> 
 /// The most a bounded render returns, three quarters of the gateway's 1 MiB read ceiling.
 pub const MAX_RELAY_BYTES: usize = 768 * 1024;
 
-/// Lines one target may contribute to a bounded render.
-pub const MAX_RENDER_LINES_PER_TARGET: usize = 4096;
+/// Rows one provider batch may contribute to a bounded render, including revision metadata.
+///
+/// The publisher accepts at most [`grid_signals::revision::MAX_BATCH_SAMPLES`] metric rows;
+/// one more row carries the revision that binds them. Applying this 4096-row bound per
+/// provider keeps a large site from losing every provider after the aggregate row cap.
+pub const MAX_RENDER_LINES_PER_PROVIDER_BATCH: usize = grid_signals::revision::MAX_BATCH_SAMPLES + 1;
 
 /// A bounded render and what it left out.
 #[derive(Debug, Default)]
@@ -2341,10 +2447,58 @@ pub struct Rendered {
     pub body: String,
     /// Age of the oldest sample emitted.
     pub oldest: Duration,
-    /// Targets skipped because the body would have passed the budget.
+    /// Store targets from which every byte-over-budget provider batch was omitted.
     pub targets_dropped: usize,
-    /// Lines cut past the per-target cap.
+    /// Rows omitted because a provider batch exceeded its row bound.
     pub lines_cut: usize,
+    /// Provider batches omitted because their selected rows exceed the per-batch row bound.
+    pub providers_omitted_by_rows: usize,
+    /// Provider batches omitted because they exceed the remaining response byte budget.
+    pub providers_omitted_by_bytes: usize,
+    /// Provider batches refused because their revision metadata did not bind a complete batch.
+    pub invalid_batches: usize,
+}
+
+impl Rendered {
+    /// Whether capacity bounds omitted any otherwise renderable provider batch.
+    #[must_use]
+    pub const fn exceeded_capacity(&self) -> bool {
+        self.providers_omitted_by_rows > 0 || self.providers_omitted_by_bytes > 0
+    }
+}
+
+/// The latest outcome of the local Gateway's process-wide signals relay.
+///
+/// The HTTP handler records the result after constructing the response. The
+/// `GridNetwork` reconciler consumes this snapshot and writes a condition only
+/// when it changes; serving a request never writes Kubernetes status.
+#[derive(Clone, Debug, Default)]
+pub struct RelayCapacity(Arc<std::sync::atomic::AtomicU8>);
+
+impl RelayCapacity {
+    /// Record whether a completed relay omitted provider batches or poll-round rows for capacity.
+    pub fn observe(&self, site: &Rendered, peers: &Rendered, poll_rounds_omitted: usize) {
+        use std::sync::atomic::Ordering;
+
+        let observed = if site.exceeded_capacity() || peers.exceeded_capacity() || poll_rounds_omitted > 0 {
+            2
+        } else {
+            1
+        };
+        self.0.store(observed, Ordering::Relaxed);
+    }
+
+    /// Whether a completed relay has been observed and whether it exceeded capacity.
+    #[must_use]
+    pub fn exceeded(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+
+        match self.0.load(Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
 }
 
 /// Whether `metric` is one of the series a gateway routes on.
@@ -2353,26 +2507,66 @@ pub fn is_peer_signal(metric: &str) -> bool {
     PEER_SIGNAL_NAMES.contains(&metric)
 }
 
-/// One target's contract series, held for `held_for` and stamped from `wall`, as
-/// exposition text, its oldest sample age, and the lines cut past
-/// [`MAX_RENDER_LINES_PER_TARGET`].
+/// Render one contract block under the caller's remaining byte budget.
 fn render_contract_block(
     samples: &[Observation],
     collect: &[String],
     held_for: Duration,
     wall: SystemTime,
-) -> (String, Duration, usize) {
-    render_batches(samples, collect, held_for, wall, true)
+    budget: usize,
+) -> (String, Duration, RenderLoss) {
+    render_batches(
+        samples,
+        RenderContext {
+            collect,
+            held_for,
+            wall,
+            bounded: true,
+            budget,
+        },
+    )
 }
 
-/// Render whole provider batches, retaining metadata through metric selection.
-fn render_batches(
-    samples: &[Observation],
-    collect: &[String],
+/// Counts of complete provider batches omitted by a bounded render.
+#[derive(Debug, Default)]
+struct RenderLoss {
+    /// Rows omitted with batches that exceed the per-batch row bound.
+    lines_cut: usize,
+    /// Provider batches omitted because they exceed the per-batch row bound.
+    providers_omitted_by_rows: usize,
+    /// Provider batches omitted because they exceed the remaining byte budget.
+    providers_omitted_by_bytes: usize,
+    /// Provider batches with invalid revision metadata.
+    invalid_batches: usize,
+}
+
+/// Values shared while one set of provider batches is sized and rendered.
+#[derive(Clone, Copy)]
+struct RenderContext<'collect> {
+    /// Requested metric names.
+    collect: &'collect [String],
+    /// Age held since the original scrape.
     held_for: Duration,
+    /// Wall reading used for output stamps.
     wall: SystemTime,
+    /// Whether contract filtering and per-batch bounds apply.
     bounded: bool,
-) -> (String, Duration, usize) {
+    /// Remaining response bytes for this render.
+    budget: usize,
+}
+
+/// Byte-bound result for one complete provider batch.
+enum ProviderBatchCapacity {
+    /// This render does not impose a per-batch byte bound.
+    Unbounded,
+    /// The rendered batch fits in the remaining budget.
+    Fits(usize),
+    /// The rendered batch exceeds the remaining budget.
+    Exceeds,
+}
+
+/// Render complete provider batches, retaining metadata through metric selection.
+fn render_batches(samples: &[Observation], context: RenderContext<'_>) -> (String, Duration, RenderLoss) {
     let mut groups = BTreeMap::<_, Vec<&Observation>>::new();
     for sample in samples {
         let key = (sample.labels.get(SITE_LABEL), sample.labels.get(PROVIDER_LABEL));
@@ -2380,8 +2574,7 @@ fn render_batches(
     }
     let mut block = String::new();
     let mut oldest = Duration::ZERO;
-    let mut lines = 0_usize;
-    let mut cut = 0_usize;
+    let mut loss = RenderLoss::default();
     for group in groups.values() {
         let metadata = group
             .iter()
@@ -2390,47 +2583,160 @@ fn render_batches(
         if let Some(metadata) = metadata
             && !complete_batch(group, metadata)
         {
-            cut = cut.saturating_add(group.len());
+            loss.invalid_batches = loss.invalid_batches.saturating_add(1);
             continue;
         }
-        let selected: Vec<_> = group
+        let selected_count = group
             .iter()
-            .copied()
-            .filter(|sample| {
-                sample.metric != grid_signals::revision::METRIC
-                    && (!bounded || is_peer_signal(&sample.metric))
-                    && (collect.is_empty() || collect.iter().any(|name| name == &sample.metric))
-            })
-            .collect();
-        let count = selected.len().saturating_add(usize::from(metadata.is_some()));
-        if bounded && lines.saturating_add(count) > MAX_RENDER_LINES_PER_TARGET {
-            cut = cut.saturating_add(count);
+            .filter(|sample| selected_for_render(sample, context))
+            .count();
+        let count = selected_count.saturating_add(usize::from(metadata.is_some()));
+        if context.bounded && count > MAX_RENDER_LINES_PER_PROVIDER_BATCH {
+            loss.lines_cut = loss.lines_cut.saturating_add(count);
+            loss.providers_omitted_by_rows = loss.providers_omitted_by_rows.saturating_add(1);
             continue;
         }
-        if let Some(metadata) = metadata {
-            let mut metadata = metadata.clone();
-            metadata.labels.insert(
-                grid_signals::revision::SAMPLES_LABEL.to_owned(),
-                selected.len().to_string(),
-            );
-            let age = held_for.saturating_add(metadata.age);
-            render_sample(&mut block, &metadata, wall_millis(wall, age));
-            block.push('\n');
-            oldest = oldest.max(age);
+        let provider_context = RenderContext {
+            budget: context.budget.saturating_sub(block.len()),
+            ..context
+        };
+        let provider_capacity = match provider_batch_capacity(group, metadata, provider_context, selected_count) {
+            ProviderBatchCapacity::Unbounded => None,
+            ProviderBatchCapacity::Fits(capacity) => Some(capacity),
+            ProviderBatchCapacity::Exceeds => {
+                loss.providers_omitted_by_bytes = loss.providers_omitted_by_bytes.saturating_add(1);
+                continue;
+            },
+        };
+        let (provider_block, provider_oldest) =
+            render_provider_batch(group, metadata, provider_context, selected_count, provider_capacity);
+        if context.bounded
+            && (provider_capacity != Some(provider_block.len())
+                || block.len().saturating_add(provider_block.len()) > context.budget)
+        {
+            loss.providers_omitted_by_bytes = loss.providers_omitted_by_bytes.saturating_add(1);
+            continue;
         }
-        for sample in selected {
-            let age = held_for.saturating_add(sample.age);
-            render_sample(&mut block, sample, wall_millis(wall, age));
-            block.push('\n');
-            oldest = oldest.max(age);
-        }
-        lines = lines.saturating_add(count);
+        block.push_str(&provider_block);
+        oldest = oldest.max(provider_oldest);
     }
-    (block, oldest, cut)
+    (block, oldest, loss)
+}
+
+/// Whether a sample survives this render's metric and collection filters.
+fn selected_for_render(sample: &Observation, context: RenderContext<'_>) -> bool {
+    sample.metric != grid_signals::revision::METRIC
+        && (!context.bounded || is_peer_signal(&sample.metric))
+        && (context.collect.is_empty() || context.collect.iter().any(|name| name == &sample.metric))
+}
+
+/// Measure a batch only when the bounded renderer must enforce the remaining byte budget.
+fn provider_batch_capacity(
+    group: &[&Observation],
+    metadata: Option<&Observation>,
+    context: RenderContext<'_>,
+    selected_count: usize,
+) -> ProviderBatchCapacity {
+    if !context.bounded {
+        return ProviderBatchCapacity::Unbounded;
+    }
+    match provider_batch_rendered_len(group, metadata, context, selected_count) {
+        Some(capacity) => ProviderBatchCapacity::Fits(capacity),
+        None => ProviderBatchCapacity::Exceeds,
+    }
+}
+
+/// Count one complete provider batch without allocating its exposition body.
+fn provider_batch_rendered_len(
+    group: &[&Observation],
+    metadata: Option<&Observation>,
+    context: RenderContext<'_>,
+    selected_count: usize,
+) -> Option<usize> {
+    let mut length = 0;
+    if let Some(metadata) = metadata {
+        let samples = selected_count.to_string();
+        let age = context.held_for.saturating_add(metadata.age);
+        length = rendered_sample_line_len(
+            metadata,
+            wall_millis(context.wall, age),
+            Some((grid_signals::revision::SAMPLES_LABEL, &samples)),
+            context.budget,
+        )?;
+    }
+    for sample in group
+        .iter()
+        .copied()
+        .filter(|sample| selected_for_render(sample, context))
+    {
+        let age = context.held_for.saturating_add(sample.age);
+        let line_length = rendered_sample_line_len(
+            sample,
+            wall_millis(context.wall, age),
+            None,
+            context.budget.saturating_sub(length),
+        )?;
+        length = length.checked_add(line_length)?;
+    }
+    Some(length)
+}
+
+/// Render a provider batch only after its bounded size is known to fit.
+fn render_provider_batch(
+    group: &[&Observation],
+    metadata: Option<&Observation>,
+    context: RenderContext<'_>,
+    selected_count: usize,
+    capacity: Option<usize>,
+) -> (String, Duration) {
+    let mut block = capacity.map_or_else(String::new, String::with_capacity);
+    let mut oldest = Duration::ZERO;
+    if let Some(metadata) = metadata {
+        let samples = selected_count.to_string();
+        let age = context.held_for.saturating_add(metadata.age);
+        render_sample_with_label_override(
+            &mut block,
+            metadata,
+            wall_millis(context.wall, age),
+            Some((grid_signals::revision::SAMPLES_LABEL, &samples)),
+        );
+        block.push('\n');
+        oldest = oldest.max(age);
+    }
+    for sample in group
+        .iter()
+        .copied()
+        .filter(|sample| selected_for_render(sample, context))
+    {
+        let age = context.held_for.saturating_add(sample.age);
+        render_sample(&mut block, sample, wall_millis(context.wall, age));
+        block.push('\n');
+        oldest = oldest.max(age);
+    }
+    (block, oldest)
 }
 
 /// Whether metadata binds every row in its provider group at the same age.
 fn complete_batch(group: &[&Observation], metadata: &Observation) -> bool {
+    /// The revision parser bounds identity values at this size.
+    const MAX_REVISION_LABEL_VALUE_BYTES: usize = 256;
+    const REVISION_LABELS: [&str; 6] = [
+        SITE_LABEL,
+        PROVIDER_LABEL,
+        grid_signals::revision::UID_LABEL,
+        grid_signals::revision::EPOCH_LABEL,
+        grid_signals::revision::SEQUENCE_LABEL,
+        grid_signals::revision::SAMPLES_LABEL,
+    ];
+    if metadata.labels.len() != REVISION_LABELS.len()
+        || metadata.labels.iter().any(|(name, value)| {
+            !REVISION_LABELS.contains(&name.as_str())
+                || value.len() > MAX_REVISION_LABEL_VALUE_BYTES
+                || !grid_signals::revision::valid_target(value)
+        })
+    {
+        return false;
+    }
     let mut line = String::new();
     render_sample(&mut line, metadata, metadata.timestamp_ms.unwrap_or(1));
     let Some(revision) =
@@ -2540,6 +2846,8 @@ fn relay_age(date_ms: i64, stamp_ms: i64) -> Option<Duration> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::collections::BTreeSet as ProviderSet;
+
     use super::*;
     use crate::crd::inference_provider::ConditionStatus;
 
@@ -3525,6 +3833,132 @@ mod tests {
         (target.to_owned(), samples)
     }
 
+    /// A production-shaped EPP provider batch with three units and three flow-control priorities.
+    fn epp_provider_batch(index: usize) -> (String, Vec<Observation>) {
+        let provider = format!("pool-{index:03}");
+        let site = "site-a";
+        let mut payload = Vec::new();
+        let base_labels = || {
+            BTreeMap::from([
+                (PROVIDER_LABEL.to_owned(), provider.clone()),
+                (SITE_LABEL.to_owned(), site.to_owned()),
+            ])
+        };
+        for metric in [
+            "grid_provider_ready",
+            "grid_provider_ready_endpoints",
+            "grid_provider_in_flight_requests",
+            "grid_provider_ttft_p50_seconds",
+            "grid_provider_ttft_p90_seconds",
+            "grid_provider_tpot_seconds",
+            "grid_provider_error_ratio",
+            "inference_pool_average_queue_size",
+            "llm_d_epp_average_queue_size",
+            "inference_pool_average_running_requests",
+            "llm_d_epp_average_running_requests",
+            "inference_pool_average_kv_cache_utilization",
+            "llm_d_epp_average_kv_cache_utilization",
+            "llm_d_epp_std_dev_kv_cache_utilization",
+            "llm_d_epp_ready_endpoints",
+            "inference_pool_ready_pods",
+            "llm_d_epp_flow_control_pool_saturation",
+        ] {
+            payload.push(Observation {
+                metric: metric.to_owned(),
+                labels: base_labels(),
+                value: 1.0,
+                timestamp_ms: Some(2_000),
+                age: Duration::ZERO,
+            });
+        }
+        for endpoint in 0..3 {
+            let mut pod_labels = base_labels();
+            pod_labels.insert("pod".to_owned(), format!("pod-{endpoint}"));
+            payload.push(Observation {
+                metric: "inference_pool_per_pod_queue_size".to_owned(),
+                labels: pod_labels,
+                value: 1.0,
+                timestamp_ms: Some(2_000),
+                age: Duration::ZERO,
+            });
+            let mut endpoint_labels = base_labels();
+            endpoint_labels.insert("endpoint".to_owned(), format!("endpoint-{endpoint}"));
+            payload.push(Observation {
+                metric: "llm_d_epp_per_endpoint_queue_size".to_owned(),
+                labels: endpoint_labels,
+                value: 1.0,
+                timestamp_ms: Some(2_000),
+                age: Duration::ZERO,
+            });
+        }
+        for priority in 0..3 {
+            let mut labels = base_labels();
+            labels.insert("priority".to_owned(), priority.to_string());
+            payload.push(Observation {
+                metric: "llm_d_epp_flow_control_queue_size".to_owned(),
+                labels,
+                value: 1.0,
+                timestamp_ms: Some(2_000),
+                age: Duration::ZERO,
+            });
+        }
+        let mut metadata_labels = base_labels();
+        metadata_labels.insert(grid_signals::revision::UID_LABEL.to_owned(), format!("uid-{index:03}"));
+        metadata_labels.insert(grid_signals::revision::EPOCH_LABEL.to_owned(), "1".to_owned());
+        metadata_labels.insert(grid_signals::revision::SEQUENCE_LABEL.to_owned(), "1".to_owned());
+        metadata_labels.insert(
+            grid_signals::revision::SAMPLES_LABEL.to_owned(),
+            payload.len().to_string(),
+        );
+        payload.push(Observation {
+            metric: grid_signals::revision::METRIC.to_owned(),
+            labels: metadata_labels,
+            value: 1.0,
+            timestamp_ms: Some(2_000),
+            age: Duration::ZERO,
+        });
+        (provider, payload)
+    }
+
+    /// A complete revision batch with exactly `metric_rows` published metric samples.
+    fn revision_batch(provider: &str, metric_rows: usize) -> Vec<Observation> {
+        let labels = || {
+            BTreeMap::from([
+                (PROVIDER_LABEL.to_owned(), provider.to_owned()),
+                (SITE_LABEL.to_owned(), "site-a".to_owned()),
+            ])
+        };
+        let mut batch: Vec<_> = (0..metric_rows)
+            .map(|index| {
+                let mut sample_labels = labels();
+                sample_labels.insert("sample".to_owned(), index.to_string());
+                Observation {
+                    metric: "inference_pool_average_queue_size".to_owned(),
+                    labels: sample_labels,
+                    value: 1.0,
+                    timestamp_ms: Some(2_000),
+                    age: Duration::ZERO,
+                }
+            })
+            .collect();
+        let mut metadata_labels = labels();
+        metadata_labels.insert(grid_signals::revision::UID_LABEL.to_owned(), format!("uid-{provider}"));
+        metadata_labels.insert(grid_signals::revision::EPOCH_LABEL.to_owned(), "1".to_owned());
+        metadata_labels.insert(grid_signals::revision::SEQUENCE_LABEL.to_owned(), "1".to_owned());
+        metadata_labels.insert(
+            grid_signals::revision::SAMPLES_LABEL.to_owned(),
+            metric_rows.to_string(),
+        );
+        batch.push(Observation {
+            metric: grid_signals::revision::METRIC.to_owned(),
+            labels: metadata_labels,
+            value: 1.0,
+            timestamp_ms: Some(2_000),
+            age: Duration::ZERO,
+        });
+        batch
+    }
+
     /// One contract sample of provider `pool-a`, already `age` old when collected.
     fn aged(age: Duration) -> Observation {
         Observation {
@@ -3611,12 +4045,15 @@ mod tests {
         let at = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
         rounds.record(&["east".to_owned(), "west".to_owned()], at);
         assert_eq!(
-            rounds.render(),
+            rounds.render_bounded(usize::MAX).body,
             "grid_peer_poll_round{grid_site=\"east\",grid_provider=\"_poller\"} 1 1700000000123\n\
              grid_peer_poll_round{grid_site=\"west\",grid_provider=\"_poller\"} 1 1700000000123\n"
         );
         rounds.record(&["west".to_owned()], at);
-        assert!(!rounds.render().contains("east"), "a peer no longer polled has no row");
+        assert!(
+            !rounds.render_bounded(usize::MAX).body.contains("east"),
+            "a peer no longer polled has no row"
+        );
     }
 
     /// One round polling `site`, which answers `body` under the extra header lines `headers`.
@@ -3788,7 +4225,7 @@ mod tests {
         let parsed = parse(&revision_text().replace(" 2 2000", " -2 2000"));
         assert_eq!(parsed.len(), 3, "wire completeness precedes value policy");
         let bounded = bound_fresh(parsed, "east");
-        let (body, ..) = render_contract_block(&bounded, &[], Duration::ZERO, SystemTime::now());
+        let (body, ..) = render_contract_block(&bounded, &[], Duration::ZERO, SystemTime::now(), MAX_RELAY_BYTES);
         let rows = parse(&body);
         assert_eq!(rows.len(), 1, "rejected raw rows preserve only an ordered invalidation");
         assert_eq!(
@@ -3812,10 +4249,11 @@ mod tests {
             &[],
             Duration::from_secs(1),
             UNIX_EPOCH + Duration::from_secs(10),
+            MAX_RELAY_BYTES,
         );
         let reparsed = parse(&body);
         assert_eq!(reparsed.len(), 3, "all rows survive a relay: {body}");
-        assert_eq!(cut, 0);
+        assert_eq!(cut.lines_cut, 0);
         assert!(
             reparsed.iter().all(|row| row.timestamp_ms == Some(8000)),
             "the batch retains one relative age"
@@ -3910,6 +4348,7 @@ mod tests {
             &[],
             Duration::ZERO,
             UNIX_EPOCH + Duration::from_secs(10),
+            MAX_RELAY_BYTES,
         );
         receiver.ingest_at(&rendered, 10_000, 10_000, "east");
     }
@@ -3974,17 +4413,373 @@ mod tests {
     }
 
     #[test]
-    fn a_target_past_the_line_cap_is_cut_and_the_others_still_render() {
+    fn a_provider_batch_past_the_row_cap_is_cut_and_the_others_still_render() {
         let store = SignalStore::new();
-        let big = stocked("pool-big", MAX_RENDER_LINES_PER_TARGET + 10);
+        let big = stocked("pool-big", MAX_RENDER_LINES_PER_PROVIDER_BATCH + 10);
         let small = stocked("pool-small", 1);
         store.refresh(BTreeMap::from([big, small]), Duration::from_secs(60));
         let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
         let big_lines = rendered.body.lines().filter(|line| line.contains("pool-big")).count();
         assert_eq!(big_lines, 0, "a provider group is never rendered as a prefix");
-        assert_eq!(rendered.lines_cut, MAX_RENDER_LINES_PER_TARGET + 10);
+        assert_eq!(rendered.lines_cut, MAX_RENDER_LINES_PER_PROVIDER_BATCH + 10);
+        assert_eq!(rendered.providers_omitted_by_rows, 1);
+        assert_eq!(rendered.providers_omitted_by_bytes, 0);
         assert!(rendered.body.contains("pool-small"), "the small target still renders");
         assert_eq!(rendered.targets_dropped, 0);
+    }
+
+    #[test]
+    fn revision_batches_at_and_over_the_row_limit_are_kept_or_omitted_whole() {
+        let store = SignalStore::new();
+        let mut rows = stocked("a-over", MAX_RENDER_LINES_PER_PROVIDER_BATCH + 1).1;
+        rows.extend(revision_batch("z-exact", grid_signals::revision::MAX_BATCH_SAMPLES));
+        store.refresh(BTreeMap::from([("site-a".to_owned(), rows)]), Duration::from_secs(60));
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
+        let parsed = parse(&rendered.body);
+        assert_eq!(
+            parsed.len(),
+            MAX_RENDER_LINES_PER_PROVIDER_BATCH,
+            "the exact-bound batch keeps its metrics and revision"
+        );
+        assert!(
+            parsed
+                .iter()
+                .all(|sample| sample.labels.get(PROVIDER_LABEL).is_some_and(|p| p == "z-exact"))
+        );
+        let revision = parsed
+            .iter()
+            .find(|sample| sample.metric == grid_signals::revision::METRIC)
+            .expect("complete revision metadata");
+        assert_eq!(
+            revision
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .map(String::as_str),
+            Some("4095")
+        );
+        assert_eq!(rendered.lines_cut, MAX_RENDER_LINES_PER_PROVIDER_BATCH + 1);
+        assert_eq!(rendered.providers_omitted_by_rows, 1);
+        assert_eq!(rendered.providers_omitted_by_bytes, 0);
+        assert_eq!(rendered.invalid_batches, 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "the test emits its measured relay envelope for evidence capture"
+    )]
+    fn all_256_epp_providers_fit_with_three_endpoints_and_complete_revision_batches() {
+        let store = SignalStore::new();
+        let mut rows = Vec::new();
+        let mut expected = ProviderSet::new();
+        for index in 0..MAX_PEER_PROVIDERS {
+            let (provider, batch) = epp_provider_batch(index);
+            expected.insert(provider);
+            rows.extend(batch);
+        }
+        store.refresh(BTreeMap::from([("site-a".to_owned(), rows)]), Duration::from_secs(60));
+        let now = ClockReading {
+            instant: Instant::now(),
+            wall: UNIX_EPOCH + Duration::from_millis(1_795_190_400_000),
+        };
+        let round_sites: Vec<_> = (0..MAX_PEER_PROVIDERS)
+            .map(|index| format!("peer-{index:03}"))
+            .collect();
+        let rounds = PeerRounds::default();
+        rounds.record(&round_sites, now.wall);
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, now);
+        let round_metadata = rounds.render_bounded(MAX_RELAY_BYTES.saturating_sub(rendered.body.len()));
+        let parsed = parse(&rendered.body);
+        let emitted: ProviderSet<_> = parsed
+            .iter()
+            .filter(|sample| sample.metric == grid_signals::revision::METRIC)
+            .filter_map(|sample| sample.labels.get(PROVIDER_LABEL).cloned())
+            .collect();
+        println!(
+            "GRID_RELAY_CAPACITY_ENVELOPE={}",
+            serde_json::json!({
+                "providers": expected.len(),
+                "metrics_per_provider": 26,
+                "rows_per_provider_including_revision": 27,
+                "rendered_rows": parsed.len(),
+                "provider_body_bytes": rendered.body.len(),
+                "poll_round_metadata_rows": MAX_PEER_PROVIDERS,
+                "poll_round_metadata_bytes": round_metadata.body.len(),
+                "poll_round_rows_omitted": round_metadata.rows_omitted,
+                "total_bytes": rendered.body.len() + round_metadata.body.len(),
+                "max_relay_bytes": MAX_RELAY_BYTES,
+            })
+        );
+        assert_eq!(
+            emitted,
+            expected,
+            "all provider revisions survive: {} bytes",
+            rendered.body.len()
+        );
+        assert_eq!(
+            parsed.len(),
+            MAX_PEER_PROVIDERS * 27,
+            "all 26 metric rows and one revision row survive"
+        );
+        assert!(
+            rendered.body.len() + round_metadata.body.len() <= MAX_RELAY_BYTES,
+            "{} relay bytes including {} bytes of poll-round metadata",
+            rendered.body.len() + round_metadata.body.len(),
+            round_metadata.body.len()
+        );
+        assert_eq!(
+            round_metadata.rows_omitted, 0,
+            "all peer round metadata fits in the remaining budget"
+        );
+        assert_eq!(rendered.targets_dropped, 0);
+        assert_eq!(rendered.lines_cut, 0);
+        assert_eq!(rendered.providers_omitted_by_rows, 0);
+        assert_eq!(rendered.providers_omitted_by_bytes, 0);
+        assert_eq!(rendered.invalid_batches, 0);
+        for provider in &expected {
+            assert_eq!(
+                parsed
+                    .iter()
+                    .filter(|sample| sample.labels.get(PROVIDER_LABEL) == Some(provider))
+                    .count(),
+                27,
+                "{provider} retains one complete revision batch"
+            );
+        }
+    }
+
+    #[test]
+    fn the_257th_epp_provider_is_admission_capped_before_rendering_the_256_provider_envelope() {
+        let mut rows = Vec::new();
+        for index in 0..=MAX_PEER_PROVIDERS {
+            let (_, batch) = epp_provider_batch(index);
+            rows.extend(batch);
+        }
+
+        let admitted = bound_fresh(rows, "peer");
+        let expected: ProviderSet<_> = (0..MAX_PEER_PROVIDERS)
+            .map(|index| format!("pool-{index:03}"))
+            .collect();
+        let admitted_providers: ProviderSet<_> = admitted
+            .iter()
+            .filter(|sample| sample.metric == grid_signals::revision::METRIC)
+            .filter_map(|sample| sample.labels.get(PROVIDER_LABEL).cloned())
+            .collect();
+        assert_eq!(
+            admitted_providers, expected,
+            "the 257th sorted provider is outside the existing admission contract"
+        );
+        assert_eq!(
+            admitted.len(),
+            MAX_PEER_PROVIDERS * 27,
+            "admission retains complete provider batches"
+        );
+
+        let store = SignalStore::new();
+        store.refresh(BTreeMap::from([("peer".to_owned(), admitted)]), Duration::from_secs(60));
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
+        let parsed = parse(&rendered.body);
+        let emitted: ProviderSet<_> = parsed
+            .iter()
+            .filter(|sample| sample.metric == grid_signals::revision::METRIC)
+            .filter_map(|sample| sample.labels.get(PROVIDER_LABEL).cloned())
+            .collect();
+        assert_eq!(emitted, expected, "the full admitted provider envelope is rendered");
+        assert_eq!(parsed.len(), MAX_PEER_PROVIDERS * 27);
+        assert!(rendered.body.len() <= MAX_RELAY_BYTES);
+        assert_eq!(rendered.targets_dropped, 0);
+        assert_eq!(rendered.lines_cut, 0);
+        assert_eq!(rendered.providers_omitted_by_rows, 0);
+        assert_eq!(rendered.providers_omitted_by_bytes, 0);
+        assert_eq!(rendered.invalid_batches, 0);
+    }
+
+    #[test]
+    fn a_peer_site_keeps_later_complete_revision_batches_when_an_earlier_batch_exceeds_bytes() {
+        let store = SignalStore::new();
+        let now = ClockReading::now();
+        let small = revision_batch("z-small", 1);
+        let small_store = SignalStore::new();
+        small_store.refresh(
+            BTreeMap::from([("site-a".to_owned(), small.clone())]),
+            Duration::from_secs(60),
+        );
+        let small_bytes = small_store.render_bounded(None, &[], MAX_RELAY_BYTES, now).body.len();
+        let mut large = revision_batch("a-large", 1);
+        for sample in large
+            .iter_mut()
+            .filter(|sample| sample.metric != grid_signals::revision::METRIC)
+        {
+            sample.labels.insert("pod".to_owned(), "x".repeat(MAX_RELAY_BYTES * 8));
+        }
+        store.refresh(
+            BTreeMap::from([("site-a".to_owned(), large.into_iter().chain(small).collect())]),
+            Duration::from_secs(60),
+        );
+        let rendered = store.render_bounded(None, &[], small_bytes, now);
+        assert!(
+            !rendered.body.contains("grid_provider=\"a-large\""),
+            "oversized batches are never split"
+        );
+        assert!(
+            rendered.body.contains("grid_provider=\"z-small\""),
+            "later batches still fit"
+        );
+        assert_eq!(
+            parse(&rendered.body).len(),
+            2,
+            "the small provider's revision and sample survive together"
+        );
+        assert_eq!(rendered.providers_omitted_by_bytes, 1);
+        assert_eq!(
+            rendered.targets_dropped, 0,
+            "the site is not lost with its oversized batch"
+        );
+        assert_eq!(rendered.invalid_batches, 0);
+        assert!(rendered.body.len() <= small_bytes);
+    }
+
+    #[test]
+    fn an_oversized_revision_label_is_rejected_without_rendering_the_metadata_line() {
+        let store = SignalStore::new();
+        let mut batch = revision_batch("pool-large-metadata", 1);
+        let Some(metadata) = batch.last_mut() else {
+            std::process::abort();
+        };
+        metadata.labels.insert(
+            grid_signals::revision::UID_LABEL.to_owned(),
+            "u".repeat(MAX_RELAY_BYTES * 8),
+        );
+        store.refresh(BTreeMap::from([("site-a".to_owned(), batch)]), Duration::from_secs(60));
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
+        assert!(rendered.body.is_empty());
+        assert_eq!(rendered.invalid_batches, 1);
+        assert_eq!(rendered.providers_omitted_by_rows, 0);
+        assert_eq!(rendered.providers_omitted_by_bytes, 0);
+    }
+
+    #[test]
+    fn rendered_sample_byte_count_matches_escaped_output_and_label_override() {
+        let sample = Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([
+                ("batch_samples".to_owned(), "old".to_owned()),
+                ("grid_provider".to_owned(), "pool-\\\"a\n☃".to_owned()),
+            ]),
+            value: 1.25,
+            timestamp_ms: None,
+            age: Duration::ZERO,
+        };
+        let override_label = Some((grid_signals::revision::SAMPLES_LABEL, "4095"));
+        let mut exposition = String::new();
+        render_sample_with_label_override(&mut exposition, &sample, 1_700_000_000_000, override_label);
+        exposition.push('\n');
+        assert_eq!(
+            rendered_sample_line_len(&sample, 1_700_000_000_000, override_label, exposition.len()),
+            Some(exposition.len())
+        );
+        assert_eq!(
+            rendered_sample_line_len(&sample, 1_700_000_000_000, override_label, exposition.len() - 1),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_revision_payload_is_relayed_as_invalidation_not_capacity_truncation() {
+        let store = SignalStore::new();
+        let invalid = revision_text().replace("batch_samples=\"2\"", "batch_samples=\"3\"");
+        store.refresh(
+            BTreeMap::from([("site-a".to_owned(), parse(&invalid))]),
+            Duration::from_secs(60),
+        );
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
+        let parsed = parse(&rendered.body);
+        assert_eq!(parsed.len(), 1, "only the preserved revision fence is relayed");
+        let revision = parsed.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(revision.metric, grid_signals::revision::METRIC);
+        assert_eq!(
+            revision
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .map(String::as_str),
+            Some("0"),
+            "invalid payload rows are not advertised as current"
+        );
+        assert_eq!(
+            rendered.invalid_batches, 0,
+            "the parser already reduced it to a valid fence"
+        );
+        assert_eq!(rendered.providers_omitted_by_rows, 0);
+        assert_eq!(rendered.providers_omitted_by_bytes, 0);
+        assert!(!rendered.exceeded_capacity());
+    }
+
+    #[test]
+    fn a_complete_revision_batch_without_scrape_timestamps_is_still_relayed() {
+        let store = SignalStore::new();
+        let mut batch = revision_batch("pool-untimestamped", 1);
+        for sample in &mut batch {
+            sample.timestamp_ms = None;
+        }
+        store.refresh(BTreeMap::from([("site-a".to_owned(), batch)]), Duration::from_secs(60));
+
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
+        let parsed = parse(&rendered.body);
+
+        assert_eq!(
+            parsed.len(),
+            2,
+            "Prometheus samples without explicit timestamps retain their revision and payload"
+        );
+        assert_eq!(rendered.invalid_batches, 0);
+    }
+
+    #[test]
+    fn a_revision_declaring_more_than_the_publisher_limit_is_invalid_not_row_overflow() {
+        let store = SignalStore::new();
+        let invalid = revision_batch("pool-invalid", grid_signals::revision::MAX_BATCH_SAMPLES + 1);
+        store.refresh(
+            BTreeMap::from([("site-a".to_owned(), invalid)]),
+            Duration::from_secs(60),
+        );
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
+        assert!(rendered.body.is_empty());
+        assert_eq!(rendered.invalid_batches, 1);
+        assert_eq!(rendered.providers_omitted_by_rows, 0);
+        assert_eq!(rendered.providers_omitted_by_bytes, 0);
+        assert!(!rendered.exceeded_capacity());
+    }
+
+    #[test]
+    fn relay_capacity_observation_tracks_round_row_and_byte_omissions() {
+        let capacity = RelayCapacity::default();
+        assert_eq!(capacity.exceeded(), None, "no relay has completed yet");
+        capacity.observe(&Rendered::default(), &Rendered::default(), 0);
+        assert_eq!(capacity.exceeded(), Some(false));
+        let invalid = Rendered {
+            invalid_batches: 1,
+            ..Rendered::default()
+        };
+        capacity.observe(&Rendered::default(), &invalid, 0);
+        assert_eq!(
+            capacity.exceeded(),
+            Some(false),
+            "invalid batches are not capacity loss"
+        );
+        capacity.observe(&Rendered::default(), &Rendered::default(), 1);
+        assert_eq!(
+            capacity.exceeded(),
+            Some(true),
+            "omitted poll-round rows are capacity loss"
+        );
+        let overflow = Rendered {
+            providers_omitted_by_bytes: 1,
+            ..Rendered::default()
+        };
+        capacity.observe(&Rendered::default(), &overflow, 0);
+        assert_eq!(capacity.exceeded(), Some(true));
+        capacity.observe(&Rendered::default(), &Rendered::default(), 0);
+        assert_eq!(capacity.exceeded(), Some(false), "a later complete relay recovers");
     }
 
     #[test]
