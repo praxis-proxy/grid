@@ -13,6 +13,8 @@ Development and validation guidance for AI Grid Network (AGN) contributors.
   requirements, and environment dependencies.
 - [Release process](release.md): versioning, validation, artifact
   publication, and release workflow.
+- [Gateway stream-memory qualification](gateway-memory.md): opt-in Docker
+  builds and process-RSS trials for GNU/jemalloc and musl.
 - [Unicode audit](unicode-audit.md): tracked text inventory and intentional
   Unicode exceptions.
 
@@ -101,6 +103,7 @@ those targets.
 | `make crds-check-experimental` | Compare the opt-in A2A CRD with the feature-enabled Rust type. | Tests / lint when A2A changes. |
 | `make coverage-check` | 80% root line-coverage floor with documented exclusions. | Coverage / coverage. |
 | `make mutants`, `make semver`, `make publish-dry-run` | Opt-in specialist checks. | No corresponding scheduled Grid workflows. |
+| [Gateway stream-memory qualification](gateway-memory.md) | Explicit Docker image builds and process-RSS trials for GNU/jemalloc and musl; separate from ordinary tests. | Opt-in only; not invoked from GitHub Actions. |
 
 `make all` runs build, formatting, lint, rustdoc, root tests, and root audit.
 When `go` is found in `PATH` it also runs `go-types-check`, which regenerates
