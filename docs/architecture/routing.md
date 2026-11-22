@@ -1035,14 +1035,32 @@ there is no usable last-known-good sample.
 
 ### Silent sites
 
-The grid gateway marks a site silent when a full freshness window passes with
-no new load sample from it. A silent site takes no requests while any live site
-can serve the model. It routes again after two new samples. When every site is
-silent, all of them take requests and each pick counts as a fallback.
+For ordinary model-based selection, the gateway excludes a silent candidate
+while a non-silent eligible candidate remains in the selected regional group.
+This is the current availability decision: missing load readings cannot prove
+that a site has capacity or that its request path still works. Request successes
+do not replace load samples or clear silence, and this selection path does not
+send exploratory requests to a silent site. A healthy backend can therefore
+lose its share when only its signal path fails. Restore that signal path to
+restore its normal participation.
 
-The gateway cannot tell a site that is down from one whose signal path failed.
-A site that still answers requests therefore loses its share until its samples
-return, and the other sites carry that load.
+A previously measured site becomes silent after its last sample is older than
+the configured load freshness window. In an operator-relayed setup, the clock
+advances with completed peer-poll rounds; a stalled relay or poller preserves
+the last verdict rather than declaring every peer silent. A silent candidate
+returns after two distinct new samples, with no full freshness window between
+them. Existing admission, readiness, health and regional constraints still apply.
+When all otherwise eligible candidates are silent, selection uses the existing
+fallback and each pick counts as a fallback; this does not bypass those constraints
+or guarantee an equal share to every candidate.
+
+Never receiving telemetry is a separate case. A candidate expected to publish
+load becomes silent after a full window of reported operator rounds without a
+sample. Without such round evidence it remains unmeasured, and a cold start
+with no load readings can still distribute requests by configured capacity.
+A candidate declared with `publishes_load: false` is not marked silent solely
+for publishing nothing. It remains subject to the usual unmeasured/fallback
+selection rules when other candidates have usable readings.
 
 Alert on `grid_route_site_silent`. A steady rate of
 `grid_route_site_silent_transitions_total` is a flapping link, and a growing
