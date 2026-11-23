@@ -996,6 +996,12 @@
                       "type": "object",
                       "additionalProperties": false,
                       "description": "Rendered as the filter's prefix_affinity.",
+                      "not": {
+                        "anyOf": [
+                          {"required": ["prefix_tokens_per_queued_request", "prefill_tokens_per_second"]},
+                          {"required": ["prefix_tokens_per_queued_request", "queued_request_seconds"]}
+                        ]
+                      },
                       "properties": {
                         "capacity": {
                           "type": "integer",
@@ -1016,13 +1022,22 @@
                         "exploration": {
                           "type": "number"
                         },
+                        "prefix_tokens_per_queued_request": {
+                          "type": "number",
+                          "minimum": 0,
+                          "description": "Matching prefix tokens worth one queued request. Zero skips the queue-cost comparison."
+                        },
                         "prefill_tokens_per_second": {
-                          "type": "number"
+                          "type": "number",
+                          "exclusiveMinimum": 0,
+                          "deprecated": true,
+                          "description": "Legacy prefill rate. Use prefix_tokens_per_queued_request."
                         },
                         "queued_request_seconds": {
                           "type": "number",
                           "minimum": 0,
-                          "description": "Seconds added per queued request. Set to zero to skip the queue-cost comparison during prefix-affinity routing."
+                          "deprecated": true,
+                          "description": "Legacy wait per queued request. Use prefix_tokens_per_queued_request."
                         },
                         "tag_key_path": {
                           "type": [

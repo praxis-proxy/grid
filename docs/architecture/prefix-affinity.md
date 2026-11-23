@@ -32,13 +32,13 @@ A run under 4 blocks never counts, so identical short prompts spread by load. Se
 then takes the least-queued sticky site. A site that admits no new request is never a
 candidate, so it is never sticky.
 
-**When load wins.** The sticky set reopens when the best sticky site's queue is deeper than
-the best other site's by more than the match is worth. The match is worth the prefill it
-saves, priced at `prefill_tokens_per_second`, then turned into queued requests at
-`queued_request_seconds` each. A 40-block match saves about 2,560 tokens, or 0.26s at the
-defaults, which is worth 0.13 of a queued request. A 400-block match is worth 1.3. An
-unmeasured sticky site gives way to a measured one. Two percent of requests skip affinity,
-so a second site learns a shared prompt.
+**When load wins.** The sticky set reopens when the best sticky site's queue is
+deeper than the best other site's by more than the match is worth.
+`prefix_tokens_per_queued_request` prices matching prefix tokens in queued
+requests. At the default cost, a 40-block match saves about 2,560 tokens and is
+worth 0.13 of a queued request. A 400-block match is worth 1.3. When the comparison
+is enabled, an unmeasured sticky site gives way to a measured one. Two percent
+of requests skip affinity, so a second site learns a shared prompt.
 
 ## Stored responses and conversations
 
@@ -80,9 +80,28 @@ prefix_affinity:
 | `exploration` | 0.02 | Share of requests that skip affinity. Higher spreads a shared prompt sooner and costs more cache misses. |
 | `capacity` | 16384 | Maximum entries in each backend cluster's LRU, per gateway replica. Must be a positive integer. See [Memory sizing](#memory-sizing). |
 | `ttl_secs` | 600 | Lifetime after a successful response confirms an entry, in seconds. Must be a positive integer. |
-| `prefill_tokens_per_second` | 10000 | Prices the prefill a match saves. Lower makes a match worth more queue. Use a finite value greater than zero. |
-| `queued_request_seconds` | 2 | Estimated wait added per queued request. Set to zero to skip the queue-cost comparison during prefix-affinity routing. Zero can keep a prefix match even when queue depth is unknown. Eligibility, admission and pressure tiers still apply. Use a finite value of zero or greater. |
+| `prefix_tokens_per_queued_request` | 20000 | Matching prefix tokens worth one queued request. Zero skips the queue-cost comparison, including fallback from unknown to known queue depth. Eligibility, admission and pressure tiers still apply. Use a finite value of zero or greater. |
+| `prefill_tokens_per_second` | 10000 | Deprecated prefill rate, accepted for one release. Use a finite value greater than zero. |
+| `queued_request_seconds` | 2 | Deprecated wait per queued request, accepted for one release. Zero skips the comparison. Use a finite value of zero or greater. |
 | `tag_key_path` | none | A file holding at least 32 bytes that authenticate stored-state tags. Set it in production. A changed file re-applies the config. |
+
+Use `prefix_tokens_per_queued_request` for new configurations:
+
+```yaml
+prefix_affinity:
+  prefix_tokens_per_queued_request: 20000
+```
+
+The two timing keys remain accepted for one release and log a deprecation
+warning when explicitly configured. Their defaults and original calculation
+remain unchanged, including `queued_request_seconds: 0`. A missing legacy key
+keeps its original default. Do not combine the new setting with either legacy
+key. Helm and the gateway reject mixed configurations.
+
+For ordinary timing values, the equivalent new value is
+`prefill_tokens_per_second * queued_request_seconds`. Legacy configurations
+retain the original division order during migration, preserving floating-point
+edge cases. Per-model costs and automatic calibration are separate work.
 
 Each backend cluster has its own LRU, so traffic to one cluster cannot evict
 another cluster's entries. The replica's total entry capacity grows with the

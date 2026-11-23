@@ -435,7 +435,9 @@ impl GridSiteRouteFilter {
             .map_err(|error| -> FilterError { format!("grid_site_route: sovereignty.header: {error}").into() })?;
         let tuned = |error: String| -> FilterError { format!("grid_site_route: {error}").into() };
         cfg.availability.validate().map_err(tuned)?;
-        cfg.prefix_affinity.validate().map_err(tuned)?;
+        cfg.prefix_affinity
+            .validate_config(config.get("prefix_affinity"))
+            .map_err(tuned)?;
         // A tag key the block names must load here, where praxis refuses a bad config, or every
         // serving reload after it would fail on the same path.
         drop(crate::control::load_tag_key(&cfg.prefix_affinity)?);
@@ -488,9 +490,7 @@ impl GridSiteRouteFilter {
                     settings: &settings,
                     turn,
                 },
-                gate: QueueGate {
-                    queued_request_seconds: settings.queued_request_seconds,
-                },
+                gate: QueueGate::from(&**settings),
             };
             select_spread(snapshot, CapabilityKind::InferenceModel, model, turn, routable, &sticky)
         } else {
@@ -1973,25 +1973,32 @@ pub(crate) mod tests {
 
     #[test]
     fn zero_queue_cost_keeps_affinity_but_not_excluded_sites() {
-        let settings = AffinitySettings {
-            queued_request_seconds: 0.0,
-            ..steady()
-        };
-        let sticky = filter(queued(&[("a", 1.0, OPEN), ("b", 0.0, OPEN)]), settings.clone());
-        assert_eq!(
-            pick_for_a_prompt(&sticky).as_deref(),
-            Some("a"),
-            "a deeper queue does not reopen the match"
-        );
-        let excluded = filter(
-            queued(&[("a", 1.0, AdmissionState::Excluded), ("b", 0.0, OPEN)]),
-            settings,
-        );
-        assert_eq!(
-            pick_for_a_prompt(&excluded).as_deref(),
-            Some("b"),
-            "affinity cannot restore an excluded site"
-        );
+        for settings in [
+            AffinitySettings {
+                queued_request_seconds: 0.0,
+                ..steady()
+            },
+            AffinitySettings {
+                prefix_tokens_per_queued_request: Some(0.0),
+                ..steady()
+            },
+        ] {
+            let sticky = filter(queued(&[("a", 1.0, OPEN), ("b", 0.0, OPEN)]), settings.clone());
+            assert_eq!(
+                pick_for_a_prompt(&sticky).as_deref(),
+                Some("a"),
+                "a deeper queue does not reopen the match"
+            );
+            let excluded = filter(
+                queued(&[("a", 1.0, AdmissionState::Excluded), ("b", 0.0, OPEN)]),
+                settings,
+            );
+            assert_eq!(
+                pick_for_a_prompt(&excluded).as_deref(),
+                Some("b"),
+                "affinity cannot restore an excluded site"
+            );
+        }
     }
 
     #[test]
@@ -2538,6 +2545,36 @@ pub(crate) mod tests {
             *applied,
             "rejections preserve every previously applied setting"
         );
+    }
+
+    #[test]
+    fn load_cost_settings_are_validated_before_plugin_tuning_changes() {
+        let tuning = Tuning::default();
+        let build = |yaml: &str| build_tuned_filter(yaml, &tuning);
+        let _filter =
+            build("prefix_affinity: {prefix_tokens_per_queued_request: 0}").expect("zero disables the comparison");
+        assert_eq!(tuning.affinity().prefix_tokens_per_queued_request, Some(0.0));
+        let applied = tuning.affinity();
+        for value in ["-1", ".nan", ".inf", "-.inf", "null", "'0'"] {
+            assert!(
+                build(&format!(
+                    "prefix_affinity: {{prefix_tokens_per_queued_request: {value}}}"
+                ))
+                .is_err(),
+                "{value}"
+            );
+            assert_eq!(tuning.generation(), 1, "invalid values cannot change tuning");
+        }
+        for field in ["prefill_tokens_per_second", "queued_request_seconds"] {
+            let error = build(&format!(
+                "prefix_affinity: {{prefix_tokens_per_queued_request: 20000, {field}: 2}}"
+            ))
+            .err()
+            .expect("mixed settings are rejected");
+            assert!(error.to_string().contains("cannot be combined"), "{error}");
+            assert_eq!(tuning.generation(), 1, "mixed settings cannot change tuning");
+        }
+        assert_eq!(*tuning.affinity(), *applied, "rejections preserve applied tuning");
     }
 
     #[test]

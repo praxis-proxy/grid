@@ -135,7 +135,12 @@ mod tests {
 
     #[test]
     fn a_grid_serving_render_with_site_route_tuning_loads() {
-        for (setting, value) in [("enabled", "false"), ("queued_request_seconds", "0")] {
+        for (setting, value) in [
+            ("enabled", "false"),
+            ("queued_request_seconds", "0"),
+            ("prefix_tokens_per_queued_request", "0"),
+            ("prefix_tokens_per_queued_request", "20000"),
+        ] {
             let switch = format!("--set=praxisConfig.render.gridServing.siteRoute.prefixAffinity.{setting}={value}");
             let Some(yaml) = render(&[
                 "--set=image.flavor=grid-gateway",
