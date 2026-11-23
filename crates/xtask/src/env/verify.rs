@@ -301,6 +301,10 @@ fn check_body_shape(name: &str, ctx: &str, model: &str, body: &str, tally: &mut 
 pub(crate) struct PortForwardGuard {
     /// The port-forward child process.
     child: Option<Child>,
+    /// Startup announcements written only by this child.
+    startup: tempfile::NamedTempFile,
+    /// Pod target port, when no Service port remapping can occur.
+    target_port: Option<u16>,
 }
 
 impl PortForwardGuard {
@@ -315,16 +319,22 @@ impl PortForwardGuard {
         Self::start_inner(context, NAMESPACE, &resource, &mapping, Stdio::null())
     }
 
-    /// Start a port-forward to a resource in an explicit namespace.
-    pub(crate) fn start_resource(
+    /// Let kubectl select a loopback port and return it only after its own announcement.
+    pub(crate) fn start_resource_allocated(
         context: &str,
         namespace: &str,
         resource: &str,
-        local_port: u16,
         target_port: u16,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mapping = format!("{local_port}:{target_port}");
-        Self::start_inner(context, namespace, resource, &mapping, Stdio::null())
+    ) -> Result<(Self, u16), Box<dyn std::error::Error>> {
+        let mut guard = Self::start_inner(
+            context,
+            namespace,
+            resource,
+            &format!(":{target_port}"),
+            Stdio::inherit(),
+        )?;
+        let port = guard.wait_for_announced_port(None, PORT_FORWARD_STARTUP_TIMEOUT)?;
+        Ok((guard, port))
     }
 
     /// Start a port-forward with child diagnostics inherited by the xtask log.
@@ -347,42 +357,83 @@ impl PortForwardGuard {
         mapping: &str,
         stderr: Stdio,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let startup = tempfile::NamedTempFile::new()?;
+        let target_port = resource
+            .starts_with("pod/")
+            .then(|| mapping.rsplit_once(':').and_then(|(_, port)| port.parse().ok()))
+            .flatten();
         let child = Command::new("kubectl")
-            .args(["--context", context, "-n", namespace, "port-forward", resource, mapping])
-            .stdout(Stdio::null())
+            .args([
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "port-forward",
+                "--address",
+                "127.0.0.1",
+                resource,
+                mapping,
+            ])
+            .stdout(Stdio::from(startup.reopen()?))
             .stderr(stderr)
             .spawn()?;
-        Ok(Self { child: Some(child) })
+        Ok(Self {
+            child: Some(child),
+            startup,
+            target_port,
+        })
     }
 
-    /// Wait until this child is listening on its local port or report why startup failed.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "xtask is synchronous; no async runtime is available for bounded startup polling"
-    )]
+    /// Require an announcement from this child, not merely an unrelated local listener.
     pub(crate) fn wait_until_ready(&mut self, local_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        let deadline = Instant::now() + PORT_FORWARD_STARTUP_TIMEOUT;
+        self.wait_for_announced_port(Some(local_port), PORT_FORWARD_STARTUP_TIMEOUT)?;
+        Ok(())
+    }
+
+    /// Read the child's startup file until its reported port is listening or startup fails.
+    #[expect(clippy::disallowed_methods, reason = "synchronous child startup polling")]
+    fn wait_for_announced_port(
+        &mut self,
+        expected: Option<u16>,
+        timeout: Duration,
+    ) -> Result<u16, Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + timeout;
         loop {
-            let child = self.child.as_mut().ok_or("port-forward process is no longer running")?;
-            if let Some(status) = child.try_wait()? {
-                self.child = None;
-                return Err(format!(
-                    "kubectl port-forward exited with {status} before local port {local_port} became ready"
+            self.require_running()?;
+            let output = std::fs::read_to_string(self.startup.path())?;
+            let port = output
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .find_map(|line| announced_forward_port(line.trim_end(), expected, self.target_port));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if let Some(port) = port
+                && !remaining.is_zero()
+                && TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+                    remaining.min(PORT_FORWARD_RETRY_DELAY),
                 )
-                .into());
-            }
-            if TcpStream::connect(format!("127.0.0.1:{local_port}")).is_ok() {
-                return Ok(());
+                .is_ok()
+            {
+                self.require_running()?;
+                return Ok(port);
             }
             if Instant::now() >= deadline {
-                return Err(format!(
-                    "kubectl port-forward remained running but local port {local_port} did not become ready within {} seconds",
-                    PORT_FORWARD_STARTUP_TIMEOUT.as_secs()
-                )
-                .into());
+                return Err(
+                    format!("kubectl did not confirm its own loopback listener within {timeout:?}: {output}").into(),
+                );
             }
-            std::thread::sleep(PORT_FORWARD_RETRY_DELAY);
+            std::thread::sleep(PORT_FORWARD_RETRY_DELAY.min(deadline.saturating_duration_since(Instant::now())));
         }
+    }
+
+    /// Check that the process which owns the announcement has not exited.
+    fn require_running(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let child = self.child.as_mut().ok_or("port-forward process is no longer running")?;
+        if let Some(status) = child.try_wait()? {
+            self.child = None;
+            return Err(format!("kubectl port-forward exited with {status} before readiness").into());
+        }
+        Ok(())
     }
 
     /// Kill the port-forward process.
@@ -393,6 +444,18 @@ impl PortForwardGuard {
         }
         self.child = None;
     }
+}
+
+/// Parse only a child's IPv4 loopback forwarding announcement.
+fn announced_forward_port(line: &str, expected: Option<u16>, target: Option<u16>) -> Option<u16> {
+    let (local, remote) = line.strip_prefix("Forwarding from 127.0.0.1:")?.split_once(" -> ")?;
+    let port = local.parse::<u16>().ok()?;
+    let remote = remote.parse::<u16>().ok()?;
+    (port > 0
+        && remote > 0
+        && expected.is_none_or(|expected| expected == port)
+        && target.is_none_or(|target| target == remote))
+    .then_some(port)
 }
 
 impl Drop for PortForwardGuard {
@@ -574,6 +637,78 @@ pub(crate) fn safe_truncate(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarding_announcements_validate_local_owner_and_allow_service_remapping() {
+        assert_eq!(
+            announced_forward_port("Forwarding from 127.0.0.1:12345 -> 8000", None, Some(8000)),
+            Some(12345)
+        );
+        assert_eq!(
+            announced_forward_port("Forwarding from 127.0.0.1:12345 -> 8000", Some(12345), None),
+            Some(12345)
+        );
+        for line in [
+            "Forwarding from 0.0.0.0:12345 -> 8000",
+            "Forwarding from 127.0.0.1:0 -> 8000",
+            "error: address in use",
+            "Forwarding from 127.0.0.1:12345 -> invalid",
+        ] {
+            assert_eq!(announced_forward_port(line, None, Some(8000)), None);
+        }
+        assert_eq!(
+            announced_forward_port("Forwarding from 127.0.0.1:12345 -> 8000", Some(9), None),
+            None
+        );
+        assert_eq!(
+            announced_forward_port("Forwarding from 127.0.0.1:12345 -> 9000", None, Some(8000)),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alien_listener_cannot_make_a_silent_child_ready_and_child_is_reaped() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let mut guard = PortForwardGuard {
+            child: Some(Command::new("sleep").arg("30").spawn()?),
+            startup: tempfile::NamedTempFile::new()?,
+            target_port: Some(8000),
+        };
+        assert!(
+            guard
+                .wait_for_announced_port(Some(port), Duration::from_millis(20))
+                .is_err(),
+            "an unrelated listener cannot establish child readiness"
+        );
+        guard.stop();
+        assert!(guard.child.is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_announcement_is_required_and_an_exited_child_cannot_reuse_it() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let mut capture = tempfile::NamedTempFile::new()?;
+        std::io::Write::write_all(
+            capture.as_file_mut(),
+            format!("Forwarding from 127.0.0.1:{port} -> 8000\n").as_bytes(),
+        )?;
+        let mut guard = PortForwardGuard {
+            child: Some(Command::new("sleep").arg("30").spawn()?),
+            startup: capture,
+            target_port: Some(8000),
+        };
+        assert_eq!(guard.wait_for_announced_port(Some(port), Duration::from_secs(1))?, port);
+        guard.stop();
+        guard.child = Some(Command::new("sh").args(["-c", "exit 0"]).spawn()?);
+        guard.child.as_mut().ok_or("fixture child missing")?.wait()?;
+        assert!(guard.wait_until_ready(port).is_err());
+        Ok(())
+    }
 
     #[test]
     fn find_free_port_returns_nonzero() {

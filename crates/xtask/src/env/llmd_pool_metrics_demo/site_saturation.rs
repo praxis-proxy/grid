@@ -286,11 +286,12 @@ fn half_capacity_loss_reduces_share_and_recovers(
 
     // Restore the mutation even when the pressure or request assertions fail.
     let restore_capacity = scale_deployment(PUBLISHING_SITE, SHRINK_DEPLOYMENT, original_replicas);
-    let restore_load = if restore_capacity.is_ok() {
-        apply(PUBLISHING_SITE, CAPACITY_BASE_LOAD, mtls)
-    } else {
-        Ok(())
-    };
+    let restore_load = apply(PUBLISHING_SITE, CAPACITY_BASE_LOAD, mtls);
+    require_restorations(
+        during_result.as_ref().err().map(ToString::to_string),
+        restore_capacity.map_err(|error| error.to_string()),
+        restore_load.map_err(|error| error.to_string()),
+    )?;
     let recovery_result = (|| {
         let recovered = wait_for("pool-b ready-unit capacity returns while pool-a stays fixed", || {
             read_capacity_route_state(metrics, mtls, CAPACITY_BEFORE_LOSS)
@@ -307,8 +308,6 @@ fn half_capacity_loss_reduces_share_and_recovers(
 
     let (during, during_share, during_distribution) = during_result?;
     let (recovered, recovered_share, recovery_distribution) = recovery_result?;
-    restore_capacity?;
-    restore_load?;
     let expected_during_share = predicted_pool_b_capacity_share(&during);
     let gate =
         capacity_loss_share_transition_gate(baseline_share, during_share, recovered_share, expected_during_share)?;
@@ -325,6 +324,26 @@ fn half_capacity_loss_reduces_share_and_recovers(
         recovered_share
     ));
     Ok(())
+}
+
+/// Preserve primary and restoration errors before any recovery request is sent.
+fn require_restorations(
+    primary: Option<String>,
+    capacity: Result<(), String>,
+    load: Result<(), String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut errors: Vec<String> = primary.into_iter().collect();
+    if let Err(error) = capacity {
+        errors.push(format!("capacity restore: {error}"));
+    }
+    if let Err(error) = load {
+        errors.push(format!("load restore: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; ").into())
+    }
 }
 
 /// Read the Gateway and EPP state required for a fixed-load, non-backlogged capacity sample.
@@ -451,14 +470,15 @@ fn verify_capacity_route_sample(
         metrics,
         phase,
         CAPACITY_ROUTE_SAMPLE_REQUESTS,
+        128,
         &mut attribution,
-        |before_metrics, after_metrics| {
+        |before_metrics, after_metrics, batch, requests| {
             let before_window =
                 capacity_route_readings(before_metrics, expected_units).map_err(|error| error.to_string())?;
             let after_window =
                 capacity_route_readings(after_metrics, expected_units).map_err(|error| error.to_string())?;
             if before_window.stable_with(after_window) && before.stable_with(before_window) {
-                Ok(())
+                capacity_interval_gate(batch, requests, predicted_pool_b_capacity_share(&before_window))
             } else {
                 Err(format!(
                     "capacity or soft-pressure state changed during {phase}: initial={before:?}, before={before_window:?}, after={after_window:?}"
@@ -508,6 +528,24 @@ fn verify_capacity_route_sample(
             "pool-b predicted share={predicted:.3}, observed={pool_b_share:.3} (±{ROUTE_SHARE_TOLERANCE:.2}); state={before:?}; {selector_evidence}; per-response attribution={distribution}"
         ),
     ))
+}
+
+/// Require a positive, non-full share in every observed 128-request interval.
+/// The 0.20 interval tolerance is deliberately wider than the 1,024-request aggregate
+/// gate; at this fixture's probabilities it exceeds four standard deviations.
+fn capacity_interval_gate(distribution: &RouteDistribution, requests: usize, predicted: f64) -> Result<(), String> {
+    let share = site_share(distribution, "pool-b", requests).map_err(|error| error.to_string())?;
+    if requests < 128
+        || !predicted.is_finite()
+        || !(0.0..1.0).contains(&share)
+        || share == 0.0
+        || (share - predicted).abs() > 0.20
+    {
+        return Err(format!(
+            "observed capacity interval lost its expected positive share: requests={requests}, pool-b share={share:.3}, predicted={predicted:.3}; {distribution}"
+        ));
+    }
+    Ok(())
 }
 
 /// Pool-B's two-site pick probability from ready units and the same positive soft-pressure preference.
@@ -717,9 +755,13 @@ enum RoutePressure {
 #[derive(Clone, Copy, Debug)]
 struct RouteReadings {
     /// Pool-A's measured saturation.
-    pool_a_rho: f64,
+    a_rho: f64,
     /// Pool-B's measured saturation.
-    pool_b_rho: f64,
+    b_rho: f64,
+    /// Pool-A's ready-unit weight at this checkpoint.
+    a_weight: f64,
+    /// Pool-B's ready-unit weight at this checkpoint.
+    b_weight: f64,
 }
 
 /// Wait for fresh, stable Gateway readings and verify them against each EPP's live scrape.
@@ -755,7 +797,7 @@ fn wait_for_route_state(
             readings,
             format!(
                 "Gateway rho=({:.3}, {:.3}), full=0; {a_source}; {b_source}; {a_signal}; {b_signal}",
-                readings.pool_a_rho, readings.pool_b_rho
+                readings.a_rho, readings.b_rho
             ),
         ))
     })
@@ -777,7 +819,10 @@ fn check_epp_stimulus(epp: &str, stimulus: Stimulus, site: &str) -> Result<Strin
 
 /// Whether successive rho readings describe the same pressure sample window.
 fn route_readings_stable(left: &RouteReadings, right: &RouteReadings) -> bool {
-    (left.pool_a_rho - right.pool_a_rho).abs() <= TOLERANCE && (left.pool_b_rho - right.pool_b_rho).abs() <= TOLERANCE
+    (left.a_rho - right.a_rho).abs() <= TOLERANCE
+        && (left.b_rho - right.b_rho).abs() <= TOLERANCE
+        && (left.a_weight - right.a_weight).abs() <= f64::EPSILON
+        && (left.b_weight - right.b_weight).abs() <= f64::EPSILON
 }
 
 /// Input required to sample `grid_site_route` while checking live signals.
@@ -811,8 +856,9 @@ fn verify_signal_route_sample(sample: &SignalRouteSample<'_>) -> Result<(f64, St
         metrics,
         phase,
         SIGNAL_ROUTE_SAMPLE_REQUESTS,
+        32,
         &mut attribution,
-        |before_metrics, after_metrics| {
+        |before_metrics, after_metrics, _batch, _requests| {
             let before = readings_in_state(before_metrics, expected_pressure).map_err(|error| error.to_string())?;
             let after = readings_in_state(after_metrics, expected_pressure).map_err(|error| error.to_string())?;
             if route_readings_stable(&sample_state, &before) && route_readings_stable(&sample_state, &after) {
@@ -872,8 +918,7 @@ fn verify_signal_route_sample(sample: &SignalRouteSample<'_>) -> Result<(f64, St
 /// Compute the two-site share used by `grid_site_route` when both sites have equal capacity.
 fn predicted_pool_b_share(readings: &RouteReadings) -> f64 {
     let preference = |rho: f64| 1.0 / (1.0 + rho);
-    (preference(readings.pool_b_rho) / (preference(readings.pool_a_rho) + preference(readings.pool_b_rho)))
-        .clamp(0.1, 0.9)
+    (preference(readings.b_rho) / (preference(readings.a_rho) + preference(readings.b_rho))).clamp(0.1, 0.9)
 }
 
 /// Calculate one site's share from a complete attributed sample.
@@ -948,14 +993,20 @@ fn route_share_transition_gate(
 /// Read route metrics and verify the phase predicate between request batches.
 fn readings_in_state(metrics: &str, expected: RoutePressure) -> Result<RouteReadings, Box<dyn std::error::Error>> {
     let readings = RouteReadings {
-        pool_a_rho: gauge(metrics, "grid_route_site_rho", "pool-a", "llmd-pool-a-provider")
+        a_rho: gauge(metrics, "grid_route_site_rho", "pool-a", "llmd-pool-a-provider")
             .ok_or("no finite pool-a rho during request sample")?,
-        pool_b_rho: gauge(metrics, "grid_route_site_rho", "pool-b", "llmd-pool-b-provider")
+        b_rho: gauge(metrics, "grid_route_site_rho", "pool-b", "llmd-pool-b-provider")
             .ok_or("no finite pool-b rho during request sample")?,
+        a_weight: gauge(metrics, "grid_route_site_weight", "pool-a", "llmd-pool-a-provider")
+            .filter(|weight| *weight > 0.0)
+            .ok_or("no positive pool-a weight")?,
+        b_weight: gauge(metrics, "grid_route_site_weight", "pool-b", "llmd-pool-b-provider")
+            .filter(|weight| *weight > 0.0)
+            .ok_or("no positive pool-b weight")?,
     };
     let expected_rhos = match expected {
-        RoutePressure::Idle => readings.pool_a_rho <= IDLE_RHO_MAXIMUM && readings.pool_b_rho <= IDLE_RHO_MAXIMUM,
-        RoutePressure::PoolBSoftSaturated => readings.pool_a_rho <= IDLE_RHO_MAXIMUM && readings.pool_b_rho >= 1.0,
+        RoutePressure::Idle => readings.a_rho <= IDLE_RHO_MAXIMUM && readings.b_rho <= IDLE_RHO_MAXIMUM,
+        RoutePressure::PoolBSoftSaturated => readings.a_rho <= IDLE_RHO_MAXIMUM && readings.b_rho >= 1.0,
     };
     let both_not_full = SITES.iter().all(
         |(site, cluster)| matches!(gauge(metrics, "grid_route_site_full", site, cluster), Some(full) if full.abs() < f64::EPSILON),
@@ -1229,10 +1280,14 @@ fn scale_deployment(site: &str, deployment: &str, replicas: u64) -> Result<(), B
             "--timeout=120s".to_owned(),
         ],
     ] {
-        let output = Command::new("kubectl")
-            .args(["--context", &context, "-n", GRID_SYSTEM_NS])
-            .args(&args)
-            .output()?;
+        let mut command = Command::new("kubectl");
+        command.args(["--context", &context, "-n", GRID_SYSTEM_NS]).args(&args);
+        let output = super::super::operator_routing_qualification::bounded_command(
+            command,
+            Duration::from_secs(130),
+            "simulator replica restoration",
+        )
+        .map_err(std::io::Error::other)?;
         if !output.status.success() {
             return Err(format!(
                 "kubectl {} on {site}: {}",
@@ -1247,7 +1302,61 @@ fn scale_deployment(site: &str, deployment: &str, replicas: u64) -> Result<(), B
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    #[test]
+    fn recovery_requires_both_restorations_and_retains_all_errors() {
+        let result = require_restorations(
+            Some("pressure failed".to_owned()),
+            Err("scale failed".to_owned()),
+            Err("load failed".to_owned()),
+        );
+        let detail = result.err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(
+            detail.contains("pressure failed") && detail.contains("scale failed") && detail.contains("load failed")
+        );
+        assert!(
+            require_restorations(None, Ok(()), Ok(())).is_ok(),
+            "successful restoration permits recovery"
+        );
+    }
+
+    #[test]
+    fn route_checkpoints_reject_temporary_weight_changes_even_after_recovery() {
+        let initial = RouteReadings {
+            a_rho: 0.0,
+            b_rho: 1.125,
+            a_weight: 2.0,
+            b_weight: 2.0,
+        };
+        let changed = RouteReadings {
+            b_weight: 1.0,
+            ..initial
+        };
+        assert!(route_readings_stable(&initial, &initial));
+        assert!(!route_readings_stable(&initial, &changed));
+        assert!(!route_readings_stable(&changed, &initial));
+    }
+
+    #[test]
+    fn an_aggregate_pass_cannot_hide_an_empty_capacity_interval() {
+        let lost = RouteDistribution {
+            sites: BTreeMap::from([("pool-a".to_owned(), 512)]),
+            ..RouteDistribution::default()
+        };
+        let normal = RouteDistribution {
+            sites: BTreeMap::from([("pool-a".to_owned(), 94), ("pool-b".to_owned(), 34)]),
+            ..RouteDistribution::default()
+        };
+        assert!((225.0_f64 / 1024.0 - 0.269).abs() < ROUTE_SHARE_TOLERANCE);
+        assert!(capacity_interval_gate(&lost, 512, 0.269).is_err());
+        assert!(
+            capacity_interval_gate(&normal, 128, 0.269).is_ok(),
+            "a normal 128-request interval must pass"
+        );
+    }
 
     #[test]
     fn expected_derived_takes_the_larger_term_and_counts_held_per_unit() {
@@ -1427,7 +1536,7 @@ mod tests {
     #[test]
     fn route_sample_share_is_for_the_named_site() -> Result<(), Box<dyn std::error::Error>> {
         let distribution = RouteDistribution {
-            sites: std::collections::BTreeMap::from([("pool-a".to_owned(), 720), ("pool-b".to_owned(), 304)]),
+            sites: BTreeMap::from([("pool-a".to_owned(), 720), ("pool-b".to_owned(), 304)]),
             ..RouteDistribution::default()
         };
         let pool_a = site_share(&distribution, "pool-a", SIGNAL_ROUTE_SAMPLE_REQUESTS)?;
@@ -1441,12 +1550,16 @@ mod tests {
     #[test]
     fn pressure_sample_share_matches_the_live_two_site_selector_formula() {
         let idle = RouteReadings {
-            pool_a_rho: 0.0,
-            pool_b_rho: 0.0,
+            a_rho: 0.0,
+            a_weight: 2.0,
+            b_weight: 2.0,
+            b_rho: 0.0,
         };
         let pressure = RouteReadings {
-            pool_a_rho: 0.0,
-            pool_b_rho: 1.125,
+            a_rho: 0.0,
+            a_weight: 2.0,
+            b_weight: 2.0,
+            b_rho: 1.125,
         };
         assert!((predicted_pool_b_share(&idle) - 0.5).abs() < f64::EPSILON);
         assert!((predicted_pool_b_share(&pressure) - (1.0 / 2.125) / (1.0 + 1.0 / 2.125)).abs() < f64::EPSILON);

@@ -491,7 +491,7 @@ pub(crate) fn run(
             eprintln!("ENVIRONMENT READY - Starting proof scenarios");
             eprintln!("{OUTPUT_RULE}");
 
-            let results = run_proof_scenarios(&context, mode);
+            let results = run_proof_scenarios(&context, mode, &evidence_dir);
 
             let failed: Vec<&str> = results
                 .iter()
@@ -956,7 +956,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
 // ---------------------------------------------------------------------------
 
 /// Run the demo proof scenarios.
-fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String, ProofResult> {
+fn run_proof_scenarios(context: &DemoContext, mode: DemoMode, evidence_dir: &Path) -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
     if mode == DemoMode::Full
@@ -1000,7 +1000,7 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
         // Runtime metric updates are test-scoped; restore the simulator's original values before teardown.
         results.insert(
             "simulator_metric_restoration".to_owned(),
-            match restore_initial_metrics(mtls) {
+            match restore_initial_metrics(mtls, evidence_dir) {
                 Ok(observations) => ProofResult {
                     success: true,
                     description: "Simulator metric restoration: original runtime metrics and EPP values recovered"
@@ -1191,7 +1191,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
 
     eprintln!();
     eprintln!(
-        "  [PRESSURE] Persisting deterministic llm-d-sim {} pressure and rolling Pool A",
+        "  [PRESSURE] Updating active llm-d-sim {} pressure through /admin/config",
         context.scoring_flavor.label()
     );
     if let Err(e) = set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls) {
@@ -1203,14 +1203,14 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         };
     }
     observations.push(format!(
-        "llm-d-sim {} pressure set through persistent Deployment configuration",
+        "llm-d-sim {} pressure set through runtime /admin/config; verified in runtime values and EPP scrape",
         context.scoring_flavor.label()
     ));
 
     eprintln!();
     eprintln!("  Live Metrics Table");
     eprintln!("    Queue/KV/Score/Rank: derived from the Grid overlay (production scoring engine)");
-    eprintln!("    pressure source:     llm-d-sim /metrics (persistent fake-metrics)");
+    eprintln!("    pressure source:     runtime /admin/config values and the EPP scrape");
     eprintln!("    LAST_ROUTE:         most recent confirmed request destination");
     print_live_table_header();
     let deadline = Instant::now() + DATA_PLANE_WAIT;
@@ -1348,8 +1348,10 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
             observations,
         };
     }
-    observations
-        .push("llm-d-sim waiting-requests restored to 0 through persistent Deployment configuration".to_owned());
+    observations.push(
+        "llm-d-sim waiting-requests restored to 0 through runtime /admin/config and verified in the EPP scrape"
+            .to_owned(),
+    );
 
     eprintln!("  [RECOVERY] Pressure stopped; waiting for Pool A to drain and regain rank 0");
 
@@ -1482,18 +1484,16 @@ fn simulator_metrics(pressure: u32, scoring_flavor: ScoringFlavor) -> (u32, f64)
 fn simulator_desired_replicas(context: &str) -> Result<usize, Box<dyn std::error::Error>> {
     let mut replicas = 0_usize;
     for deployment in SIMULATOR_DEPLOYMENTS {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                context,
-                "-n",
-                GRID_SYSTEM_NS,
-                "get",
-                &format!("deployment/{deployment}"),
-                "-o",
-                "jsonpath={.spec.replicas}",
-            ])
-            .output()?;
+        let output = simulator_runtime::timed_kubectl(&[
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            &format!("deployment/{deployment}"),
+            "-o",
+            "jsonpath={.spec.replicas}",
+        ])?;
         if !output.status.success() {
             return Err(format!(
                 "read deployment/{deployment} replica count: {}",
@@ -1538,18 +1538,16 @@ impl SimulatorReadyReplicas {
 fn simulator_ready_replicas(context: &str) -> Result<SimulatorReadyReplicas, Box<dyn std::error::Error>> {
     let mut counts = SimulatorReadyReplicas::default();
     for deployment in SIMULATOR_DEPLOYMENTS {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                context,
-                "-n",
-                GRID_SYSTEM_NS,
-                "get",
-                &format!("deployment/{deployment}"),
-                "-o",
-                "json",
-            ])
-            .output()?;
+        let output = simulator_runtime::timed_kubectl(&[
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            &format!("deployment/{deployment}"),
+            "-o",
+            "json",
+        ])?;
         if !output.status.success() {
             return Err(format!(
                 "read deployment/{deployment} ready replicas: {}",
@@ -1649,18 +1647,16 @@ fn parse_simulator_service_endpoints(
 
 /// Read the Service endpoints that provider Gateways connect to.
 fn simulator_service_endpoints(context: &str) -> Result<SimulatorServiceEndpoints, Box<dyn std::error::Error>> {
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "get",
-            "endpoints/vcr-service",
-            "-o",
-            "json",
-        ])
-        .output()?;
+    let output = simulator_runtime::timed_kubectl(&[
+        "--context",
+        context,
+        "-n",
+        GRID_SYSTEM_NS,
+        "get",
+        "endpoints/vcr-service",
+        "-o",
+        "json",
+    ])?;
     if !output.status.success() {
         return Err(format!(
             "read vcr-service Endpoints: {}",
@@ -2217,52 +2213,49 @@ fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::er
 /// In direct-HTTP mode, uses the Kubernetes API server proxy to reach
 /// the metrics Service without requiring extra images or containers.
 fn kubectl_exec_epp_metrics(cluster: &str, mtls: bool) -> Result<String, Box<dyn std::error::Error>> {
+    kubectl_exec_epp_metrics_with_timeout(cluster, mtls, Duration::from_secs(15))
+}
+
+/// Limit the entire API/exec command, not just wget inside the remote Pod.
+fn kubectl_exec_epp_metrics_with_timeout(
+    cluster: &str,
+    mtls: bool,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
     let ctx = kind_context(cluster);
+    let mut command = Command::new("kubectl");
+    command.args(["--context", &ctx]);
     if mtls {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                &ctx,
-                "-n",
-                GRID_SYSTEM_NS,
-                "exec",
-                "deploy/llmd-epp",
-                "-c",
-                "metrics-tls-proxy",
-                "--",
-                "wget",
-                "-qO-",
-                "--timeout=5",
-                "http://127.0.0.1:9090/metrics",
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "kubectl exec metrics failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        command.args([
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "deploy/llmd-epp",
+            "-c",
+            "metrics-tls-proxy",
+            "--",
+            "wget",
+            "-qO-",
+            "--timeout=5",
+            "http://127.0.0.1:9090/metrics",
+        ]);
     } else {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                &ctx,
-                "get",
-                "--raw",
-                "/api/v1/namespaces/grid-system/services/llmd-epp-metrics:9090/proxy/metrics",
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "kubectl api proxy metrics failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        command.args([
+            "get",
+            "--raw",
+            "/api/v1/namespaces/grid-system/services/llmd-epp-metrics:9090/proxy/metrics",
+        ]);
     }
+    let output = super::operator_routing_qualification::bounded_command(command, timeout, "EPP metrics scrape")
+        .map_err(std::io::Error::other)?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl EPP metrics failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Captured output from a curl probe run in a temporary pod.
@@ -3003,7 +2996,11 @@ fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<d
 
         let imported_reference = imported_reference_for_digest(image, &references)
             .ok_or_else(|| format!("{image} was not found in {control_plane} after import"))?;
-        if imported_reference != image {
+        let normalized = normalized_requested_digest_alias(image);
+        for requested in std::iter::once(image).chain(normalized.as_deref()) {
+            if imported_reference == requested {
+                continue;
+            }
             let status = Command::new("docker")
                 .args([
                     "exec",
@@ -3014,15 +3011,16 @@ fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<d
                     "tag",
                     "--force",
                     imported_reference,
-                    image,
+                    requested,
                 ])
                 .status()?;
             if !status.success() {
-                return Err(
-                    format!("failed to tag imported image {imported_reference} as {image} in {control_plane}").into(),
-                );
+                return Err(format!(
+                    "failed to tag imported image {imported_reference} as {requested} in {control_plane}"
+                )
+                .into());
             }
-            eprintln!("  tagged imported image {imported_reference} as {image} in {control_plane}");
+            eprintln!("  tagged imported image {imported_reference} as {requested} in {control_plane}");
         }
     }
     Ok(())
@@ -3899,6 +3897,18 @@ fn canonicalized_unqualified_reference(reference: &str) -> Option<String> {
         format!("docker.io/library/{name}")
     };
     Some(format!("{normalized}@{digest}"))
+}
+
+/// Normalize a requested digest reference, dropping an optional tag before CRI lookup.
+fn normalized_requested_digest_alias(reference: &str) -> Option<String> {
+    let (name, digest) = reference.rsplit_once('@')?;
+    let untagged = match name.rsplit_once(':') {
+        Some((repository, tag)) if !tag.contains('/') => repository,
+        _ => name,
+    };
+    let digest_reference = format!("{untagged}@{digest}");
+    canonicalized_unqualified_reference(&digest_reference)
+        .or_else(|| (digest_reference != reference).then_some(digest_reference))
 }
 
 /// Find imported digest references whose Docker-normalized names need an alias.
@@ -4781,6 +4791,22 @@ mod tests {
     use serde::Deserialize as _;
 
     use super::*;
+
+    #[test]
+    fn requested_digest_aliases_follow_docker_lookup_names() {
+        for (input, expected) in [
+            ("sim@sha256:abc", Some("docker.io/library/sim@sha256:abc")),
+            ("sim:tag@sha256:abc", Some("docker.io/library/sim@sha256:abc")),
+            ("team/sim:tag@sha256:abc", Some("docker.io/team/sim@sha256:abc")),
+            (
+                "registry.local:5000/team/sim:tag@sha256:abc",
+                Some("registry.local:5000/team/sim@sha256:abc"),
+            ),
+            ("ghcr.io/team/sim@sha256:abc", None),
+        ] {
+            assert_eq!(normalized_requested_digest_alias(input).as_deref(), expected);
+        }
+    }
 
     #[test]
     fn imported_reference_for_digest_matches_the_requested_immutable_image() {

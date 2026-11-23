@@ -2221,8 +2221,9 @@ pub(super) fn verify_attributed_site_sample(
     gateway_metrics: &GatewayMetricsReader,
     phase: &str,
     request_count: usize,
+    batch_limit: usize,
     attribution: &mut RoutingAttributionDiagnostics,
-    mut validate_window: impl FnMut(&str, &str) -> Result<(), String>,
+    mut validate_window: impl FnMut(&str, &str, &RouteDistribution, usize) -> Result<(), String>,
 ) -> Result<(RouteDistribution, String), Box<dyn std::error::Error>> {
     let warmup = route_distribution(gateway_port, 1, phase, attribution)?;
     if warmup.sites.values().sum::<usize>() != 1 {
@@ -2234,19 +2235,24 @@ pub(super) fn verify_attributed_site_sample(
     let mut distribution = RouteDistribution::default();
     let mut metric_windows = Vec::new();
     let mut requests_remaining = request_count;
+    let window_clock = Instant::now();
     while requests_remaining > 0 {
-        let batch_requests = requests_remaining.min(WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS);
+        let batch_requests = requests_remaining.min(batch_limit.max(1));
+        let began_ms = window_clock.elapsed().as_millis();
         let batch_before_metrics = gateway_metrics.read()?;
         let batch = route_distribution(gateway_port, batch_requests, phase, attribution)?;
-        distribution.merge(batch);
         let batch_after_metrics = gateway_metrics.read()?;
-        validate_window(&batch_before_metrics, &batch_after_metrics)
-            .map_err(|error| format!("{phase} route sample crossed a signal window: {error}"))?;
-        metric_windows.push(format!(
-            "{batch_requests} requests: before={}, after={}",
+        let detail = format!(
+            "window={} start_ms={began_ms} end_ms={} requests={batch_requests} distribution={batch}: before={}, after={}",
+            metric_windows.len(),
+            window_clock.elapsed().as_millis(),
             route_metric_diagnostics(&batch_before_metrics),
             route_metric_diagnostics(&batch_after_metrics)
-        ));
+        );
+        validate_window(&batch_before_metrics, &batch_after_metrics, &batch, batch_requests)
+            .map_err(|error| format!("{phase} route sample crossed a signal window: {error}; {detail}"))?;
+        metric_windows.push(detail);
+        distribution.merge(batch);
         requests_remaining -= batch_requests;
     }
 
@@ -2987,6 +2993,28 @@ pub(super) fn read_operator_metrics(port: u16) -> Result<String, Box<dyn std::er
     read_metrics_url(port, true, None)
 }
 
+/// Construct a loopback scrape isolated from curlrc files and proxy environment settings.
+fn metrics_curl_command(url: &str, authenticated: bool) -> Command {
+    let mut command = Command::new("curl");
+    command.args([
+        "--disable",
+        "--noproxy",
+        "*",
+        "--silent",
+        "--show-error",
+        "--insecure",
+        "--max-time",
+        "5",
+        "--write-out",
+        "\n__GRID_METRICS_HTTP_STATUS__=%{http_code}\n",
+    ]);
+    if authenticated {
+        command.args(["--config", "-"]);
+    }
+    command.arg(url);
+    command
+}
+
 /// Fetch Prometheus exposition over the forwarded service port and require a successful HTTP response.
 fn read_metrics_url(
     port: u16,
@@ -3001,20 +3029,7 @@ fn read_metrics_url(
     let mut last_error = String::from("no HTTP response");
     for scheme in schemes {
         let url = format!("{scheme}://127.0.0.1:{port}/metrics");
-        let mut command = Command::new("curl");
-        command.args([
-            "--silent",
-            "--show-error",
-            "--insecure",
-            "--max-time",
-            "5",
-            "--write-out",
-            "\n__GRID_METRICS_HTTP_STATUS__=%{http_code}\n",
-        ]);
-        if bearer_token.is_some() {
-            command.args(["--config", "-"]);
-        }
-        command.arg(&url);
+        let mut command = metrics_curl_command(&url, bearer_token.is_some());
         let output = if let Some(token) = bearer_token {
             let mut child = command
                 .stdin(Stdio::piped())
@@ -3394,6 +3409,65 @@ fn kubectl_patch_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_scrape_ignores_curlrc_tracing_and_proxy_settings() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Read as _;
+        let directory = tempfile::tempdir()?;
+        let trace = directory.path().join("unexpected-trace.log");
+        std::fs::write(
+            directory.path().join(".curlrc"),
+            format!(
+                "trace-ascii = \"{}\"\nheader = \"X-Unwanted: curlrc\"\n",
+                trace.display()
+            ),
+        )?;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> std::io::Result<String> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+                        let mut request = [0_u8; 4096];
+                        let bytes = stream.read(&mut request)?;
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nx 1\n")?;
+                        return Ok(String::from_utf8_lossy(request.get(..bytes).unwrap_or_default()).into_owned());
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                        std::thread::park_timeout(Duration::from_millis(5));
+                    },
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+        let token = "test-only-not-a-secret";
+        let mut command = metrics_curl_command(&format!("http://127.0.0.1:{port}/metrics"), true);
+        command
+            .env("CURL_HOME", directory.path())
+            .env("http_proxy", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "");
+        assert!(command.get_args().all(|arg| !arg.to_string_lossy().contains(token)));
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut input = child.stdin.take().ok_or("curl stdin missing")?;
+        writeln!(input, "header = \"Authorization: Bearer {token}\"")?;
+        drop(input);
+        let output = child.wait_with_output()?;
+        let request = server.join().map_err(|_panic| "HTTP fixture thread failed")??;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(request.contains(token));
+        assert!(!request.contains("X-Unwanted"));
+        assert!(!trace.exists(), "a default curlrc must never enable credential tracing");
+        Ok(())
+    }
 
     #[test]
     fn metrics_reader_rejects_unauthorized_http_body_even_when_curl_succeeds() {

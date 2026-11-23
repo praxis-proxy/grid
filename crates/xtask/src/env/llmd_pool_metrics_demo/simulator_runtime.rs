@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    path::Path,
     process::Command,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -9,10 +10,10 @@ use std::{
 
 use super::{
     DATA_PLANE_INTERVAL, DATA_PLANE_WAIT, EPP_READY_METRICS, GRID_SYSTEM_NS, KV_CACHE_METRIC_TOLERANCE,
-    first_prom_value, kind_context, kubectl_exec_epp_metrics, parse_required_epp_metrics, simulator_kv_cache_mean,
-    simulator_ready_replicas, wait_for_simulator_service_endpoints,
+    first_prom_value, kind_context, kubectl_exec_epp_metrics_with_timeout, parse_required_epp_metrics,
+    simulator_kv_cache_mean, wait_for_simulator_service_endpoints,
 };
-use crate::env::verify::{PortForwardGuard, find_free_port};
+use crate::env::verify::PortForwardGuard;
 
 /// HTTP port exposed by the simulator's administrative API.
 const SIMULATOR_HTTP_PORT: u16 = 8000;
@@ -136,11 +137,9 @@ pub(crate) fn set_simulator_fake_metrics_with_endpoint_kv(
         let pod = before
             .first()
             .ok_or_else(|| format!("{cluster}/{deployment} has no Ready Pod"))?;
-        let port = find_free_port()?;
         let resource = format!("pod/{}", pod.name);
-        let mut forward =
-            PortForwardGuard::start_resource(&context, GRID_SYSTEM_NS, &resource, port, SIMULATOR_HTTP_PORT)?;
-        forward.wait_until_ready(port)?;
+        let (forward, port) =
+            PortForwardGuard::start_resource_allocated(&context, GRID_SYSTEM_NS, &resource, SIMULATOR_HTTP_PORT)?;
         let config = request_admin_config(port, None)?;
         let original_metrics = fake_metric_subset(&config)?;
         targets.push(SimulatorRuntimeTarget {
@@ -188,42 +187,148 @@ pub(crate) fn set_simulator_fake_metrics_with_endpoint_kv(
 }
 
 /// Restore each simulator's initial runtime metric values and verify the EPP has recovered.
-pub(crate) fn restore_initial_metrics(mtls: bool) -> Result<Vec<String>, Vec<String>> {
-    let originals = match original_metrics_store().lock() {
-        Ok(mut saved) => std::mem::take(&mut *saved),
-        Err(error) => {
-            return Err(vec![format!("initial metric state lock failed: {error}")]);
-        },
-    };
+pub(crate) fn restore_initial_metrics(mtls: bool, evidence_dir: &Path) -> Result<Vec<String>, Vec<String>> {
+    // Snapshot outside the lock: network recovery must not consume the authoritative saved values.
+    let originals = original_metrics_store()
+        .lock()
+        .map_err(|error| vec![format!("initial metric state lock failed: {error}")])?
+        .clone();
     if originals.is_empty() {
         return Ok(vec!["no simulator metrics were changed by this run".to_owned()]);
     }
-
-    let mut observations = Vec::new();
-    let mut failures = Vec::new();
-    for ((cluster, deployment), prior) in &originals {
-        match restore_one_deployment(cluster, deployment, prior) {
-            Ok(()) => observations.push(format!(
-                "{cluster}/{deployment}: original fake metrics restored through POST /admin/config without Pod restart"
-            )),
-            Err(error) => failures.push(format!("{cluster}/{deployment}: {error}")),
-        }
+    let path = evidence_dir.join("pending-simulator-restores.json");
+    let initial_evidence = pending_restore_evidence(&originals);
+    let initial_write = std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&initial_evidence).map_err(|error| vec![error.to_string()])?,
+    );
+    let mut outcome = restore_snapshot(
+        &originals,
+        |cluster, deployment, prior| {
+            retry_restoration(3, || {
+                restore_one_deployment(cluster, deployment, prior).map_err(|error| error.to_string())
+            })
+        },
+        |cluster| verify_restored_epp_metrics(cluster, mtls, &originals).map_err(|error| error.to_string()),
+    );
+    if let Err(error) = initial_write {
+        outcome
+            .failures
+            .push(format!("record initial restore targets: {error}"));
     }
-
-    let clusters: std::collections::BTreeSet<_> = originals.keys().map(|(cluster, _)| cluster.clone()).collect();
-    for cluster in clusters {
-        match verify_restored_epp_metrics(&cluster, mtls, &originals) {
-            Ok(description) => observations.push(description),
-            Err(error) => failures.push(format!("{cluster} EPP recovery: {error}")),
-        }
+    {
+        let mut saved = original_metrics_store()
+            .lock()
+            .map_err(|error| vec![error.to_string()])?;
+        retain_unverified(&mut saved, &originals, &outcome.verified);
     }
-
+    let mut observations = outcome.observations;
+    let mut failures = outcome.failures;
+    let pending = original_metrics_store()
+        .lock()
+        .map_err(|error| vec![error.to_string()])?;
+    let remaining = pending_restore_evidence(&pending);
+    drop(pending);
+    if let Err(error) = std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&remaining).map_err(|error| vec![error.to_string()])?,
+    ) {
+        failures.push(format!("write remaining restore values: {error}; pending={remaining}"));
+    }
     if failures.is_empty() {
         Ok(observations)
     } else {
         observations.extend(failures);
+        observations.push(format!(
+            "unverified restoration targets retained at {}: {remaining}",
+            path.display()
+        ));
         Err(observations)
     }
+}
+
+/// Restore results are committed by whole cluster only after EPP verification.
+struct RestoreOutcome {
+    /// Clusters whose writes and aggregate readings were verified.
+    verified: std::collections::BTreeSet<String>,
+    /// Successful observations for the run evidence.
+    observations: Vec<String>,
+    /// Errors retained alongside pending saved values.
+    failures: Vec<String>,
+}
+
+/// Execute a restoration round independently of process-global saved state.
+fn restore_snapshot(
+    originals: &OriginalMetrics,
+    mut restore: impl FnMut(&str, &str, &serde_json::Value) -> Result<(), String>,
+    mut verify: impl FnMut(&str) -> Result<String, String>,
+) -> RestoreOutcome {
+    let mut result = RestoreOutcome {
+        verified: std::collections::BTreeSet::new(),
+        observations: Vec::new(),
+        failures: Vec::new(),
+    };
+    let clusters: std::collections::BTreeSet<_> = originals.keys().map(|(cluster, _)| cluster.clone()).collect();
+    for cluster in clusters {
+        let mut complete = true;
+        for ((_, deployment), prior) in originals.iter().filter(|((site, _), _)| site == &cluster) {
+            match restore(&cluster, deployment, prior) {
+                Ok(()) => result.observations.push(format!(
+                    "{cluster}/{deployment}: original runtime metrics verified without Pod restart"
+                )),
+                Err(error) => {
+                    complete = false;
+                    result.failures.push(format!("{cluster}/{deployment}: {error}"));
+                },
+            }
+        }
+        if complete {
+            match verify(&cluster) {
+                Ok(description) => {
+                    result.verified.insert(cluster);
+                    result.observations.push(description);
+                },
+                Err(error) => result.failures.push(format!("{cluster} EPP recovery: {error}")),
+            }
+        }
+    }
+    result
+}
+
+/// Forget only the exact saved values from a completely verified cluster.
+fn retain_unverified(
+    saved: &mut OriginalMetrics,
+    snapshot: &OriginalMetrics,
+    verified: &std::collections::BTreeSet<String>,
+) {
+    saved.retain(|key, value| !verified.contains(&key.0) || snapshot.get(key) != Some(value));
+}
+
+/// Retry through a fresh forwarding session, retaining every failed attempt's diagnostic.
+fn retry_restoration(mut attempts: usize, mut restore: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+    let mut errors = Vec::new();
+    while attempts > 0 {
+        match restore() {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(error),
+        }
+        attempts -= 1;
+    }
+    Err(format!("restoration attempts failed: {}", errors.join("; ")))
+}
+
+/// Serialize tuple-keyed saved values without losing generated-string representations.
+fn pending_restore_evidence(pending: &OriginalMetrics) -> serde_json::Value {
+    serde_json::Value::Array(
+        pending
+            .iter()
+            .map(|((cluster, deployment), values)| {
+                serde_json::json!({
+                    "cluster": cluster, "deployment": deployment, "original_metrics": values,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Return the process-local metric restoration record.
@@ -248,20 +353,30 @@ fn remember_original_metrics(
     Ok(())
 }
 
+/// Run a Kubernetes API read with a host-side deadline.
+pub(super) fn timed_kubectl(args: &[&str]) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    let mut command = Command::new("kubectl");
+    command.args(args);
+    super::super::operator_routing_qualification::bounded_command(
+        command,
+        Duration::from_secs(15),
+        "simulator Kubernetes read",
+    )
+    .map_err(|error| std::io::Error::other(error).into())
+}
+
 /// Read the configured replica count for one simulator Deployment.
 fn deployment_replicas(context: &str, deployment: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "get",
-            &format!("deployment/{deployment}"),
-            "-o",
-            "jsonpath={.spec.replicas}",
-        ])
-        .output()?;
+    let output = timed_kubectl(&[
+        "--context",
+        context,
+        "-n",
+        GRID_SYSTEM_NS,
+        "get",
+        &format!("deployment/{deployment}"),
+        "-o",
+        "jsonpath={.spec.replicas}",
+    ])?;
     if !output.status.success() {
         return Err(format!(
             "read deployment/{deployment} replicas: {}",
@@ -288,20 +403,18 @@ fn wait_for_pod_identity(
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last = String::from("no simulator Pod was observed");
     while Instant::now() < deadline {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                context,
-                "-n",
-                GRID_SYSTEM_NS,
-                "get",
-                "pods",
-                "-l",
-                &selector,
-                "-o",
-                "json",
-            ])
-            .output()?;
+        let output = timed_kubectl(&[
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pods",
+            "-l",
+            &selector,
+            "-o",
+            "json",
+        ])?;
         if !output.status.success() {
             return Err(format!(
                 "read simulator Pod identity for {deployment}: {}",
@@ -391,6 +504,7 @@ fn request_admin_config(
     let url = format!("http://127.0.0.1:{local_port}/admin/config");
     let mut command = Command::new("curl");
     command.args([
+        "--disable",
         "--silent",
         "--show-error",
         "--fail-with-body",
@@ -519,19 +633,20 @@ fn restore_one_deployment(
     original_metrics: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let context = kind_context(cluster);
+    if deployment_replicas(&context, deployment)? != 1 {
+        return Err(format!("cannot restore {cluster}/{deployment} without exactly one desired replica").into());
+    }
     let before = wait_for_pod_identity(&context, deployment)?;
     let pod = before
         .first()
         .ok_or_else(|| format!("{cluster}/{deployment} has no Ready Pod"))?;
-    let port = find_free_port()?;
     let resource = format!("pod/{}", pod.name);
-    let mut forward = PortForwardGuard::start_resource(&context, GRID_SYSTEM_NS, &resource, port, SIMULATOR_HTTP_PORT)?;
-    forward.wait_until_ready(port)?;
-    request_admin_config(port, Some(&serde_json::json!({"fake-metrics": original_metrics})))?;
-    let actual = fake_metric_subset(&request_admin_config(port, None)?)?;
-    if !fake_metric_values_match(&actual, original_metrics)? {
-        return Err(format!("restored fake-metrics {actual}, expected {original_metrics}").into());
-    }
+    let (_forward, port) =
+        PortForwardGuard::start_resource_allocated(&context, GRID_SYSTEM_NS, &resource, SIMULATOR_HTTP_PORT)?;
+    restore_runtime_values(original_metrics, |body| {
+        request_admin_config(port, body).map_err(|error| error.to_string())
+    })
+    .map_err(std::io::Error::other)?;
     let after = wait_for_pod_identity(&context, deployment)?;
     if before != after {
         return Err(format!(
@@ -542,6 +657,27 @@ fn restore_one_deployment(
     Ok(())
 }
 
+/// Verify before writing and always read back after a write error, including ambiguous timeouts.
+fn restore_runtime_values(
+    original: &serde_json::Value,
+    mut request: impl FnMut(Option<&serde_json::Value>) -> Result<serde_json::Value, String>,
+) -> Result<(), String> {
+    let current = fake_metric_subset(&request(None)?).map_err(|error| error.to_string())?;
+    if fake_metric_values_match(&current, original).map_err(|error| error.to_string())? {
+        return Ok(());
+    }
+    let payload = serde_json::json!({"fake-metrics": original});
+    let posted = request(Some(&payload));
+    let readback = request(None).and_then(|config| fake_metric_subset(&config).map_err(|error| error.to_string()));
+    match readback {
+        Ok(actual) if fake_metric_values_match(&actual, original).map_err(|error| error.to_string())? => Ok(()),
+        actual => Err(format!(
+            "runtime restoration unverified: write_error={:?}, readback={actual:?}",
+            posted.err()
+        )),
+    }
+}
+
 /// Confirm EPP has returned to the saved aggregate simulator metric values.
 fn verify_restored_epp_metrics(
     cluster: &str,
@@ -549,8 +685,8 @@ fn verify_restored_epp_metrics(
     originals: &OriginalMetrics,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let context = kind_context(cluster);
-    let expected = expected_values_from_originals(cluster, originals)?;
     let ready = wait_for_simulator_service_endpoints(&context)?;
+    let expected = expected_values_from_originals(cluster, originals, ready)?;
     let endpoint_count = ready.total().map_err(std::io::Error::other)?;
     wait_for_epp_metrics(cluster, mtls, expected, endpoint_count, "saved-metric restoration")?;
     Ok(format!(
@@ -563,10 +699,10 @@ fn verify_restored_epp_metrics(
 fn expected_values_from_originals(
     cluster: &str,
     originals: &OriginalMetrics,
+    ready: super::SimulatorReadyReplicas,
 ) -> Result<SimulatorMetricValues, Box<dyn std::error::Error>> {
     let mut weighted = [0.0_f64; 3];
     let mut count = 0_usize;
-    let ready = simulator_ready_replicas(&kind_context(cluster))?;
     for (deployment, replicas) in [("vcr-1", ready.vcr_1), ("vcr-2", ready.vcr_2)] {
         if replicas == 0 {
             continue;
@@ -611,7 +747,11 @@ fn wait_for_epp_metrics(
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last = String::from("no valid EPP metric sample");
     while Instant::now() < deadline {
-        match kubectl_exec_epp_metrics(cluster, mtls) {
+        match kubectl_exec_epp_metrics_with_timeout(
+            cluster,
+            mtls,
+            Duration::from_secs(15).min(deadline.saturating_duration_since(Instant::now())),
+        ) {
             Ok(text) => match parse_required_epp_metrics(&text) {
                 Ok(metrics) => {
                     let running = first_prom_value(&text, &["llm_d_epp_average_running_requests"])
@@ -641,6 +781,125 @@ fn wait_for_epp_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restoration_keeps_failed_clusters_and_commits_only_verified_clusters() {
+        let originals = BTreeMap::from([
+            (
+                ("a".to_owned(), "vcr-1".to_owned()),
+                serde_json::json!({"running-requests": 1}),
+            ),
+            (
+                ("a".to_owned(), "vcr-2".to_owned()),
+                serde_json::json!({"running-requests": 2}),
+            ),
+            (
+                ("b".to_owned(), "vcr-1".to_owned()),
+                serde_json::json!({"running-requests": 3}),
+            ),
+        ]);
+        let mut attempts = Vec::new();
+        let result = restore_snapshot(
+            &originals,
+            |site, deployment, _| {
+                attempts.push((site.to_owned(), deployment.to_owned()));
+                if site == "a" && deployment == "vcr-1" {
+                    Err("unreachable".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            |site| Ok(format!("{site} EPP verified")),
+        );
+        assert_eq!(attempts.len(), 3, "one failure must not skip another target's cleanup");
+        assert!(!result.verified.contains("a"));
+        assert!(result.verified.contains("b"));
+        let mut saved = originals.clone();
+        retain_unverified(&mut saved, &originals, &result.verified);
+        assert_eq!(saved.len(), 2);
+        assert!(saved.keys().all(|(site, _)| site == "a"));
+        let failed_epp = restore_snapshot(&originals, |_, _, _| Ok(()), |_| Err("EPP unavailable".to_owned()));
+        assert!(failed_epp.verified.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_post_is_read_back_and_a_retry_does_not_rewrite_committed_values() {
+        let original = serde_json::json!({"waiting-requests": 0, "running-requests": 1, "kv-cache-usage": 0.2});
+        let mut actual = serde_json::json!({"waiting-requests": 9, "running-requests": 9, "kv-cache-usage": 0.9});
+        let mut writes = 0;
+        let mut lose_first_readback = false;
+        let mut sessions = 0;
+        let result = retry_restoration(3, || {
+            sessions += 1;
+            restore_runtime_values(&original, |body| {
+                if body.is_some() {
+                    writes += 1;
+                    actual = original.clone();
+                    lose_first_readback = true;
+                    Err("POST response timed out after commit".to_owned())
+                } else if lose_first_readback {
+                    lose_first_readback = false;
+                    Err("forward closed before readback".to_owned())
+                } else {
+                    Ok(serde_json::json!({"fake-metrics": actual}))
+                }
+            })
+        });
+        assert!(
+            result.is_ok(),
+            "readback on a fresh session must confirm the earlier commit"
+        );
+        assert_eq!(sessions, 2, "the failed session must be retried");
+        assert_eq!(writes, 1, "GET on the fresh session confirms the earlier commit");
+        let mut failures = 0;
+        assert!(
+            retry_restoration(3, || {
+                failures += 1;
+                Err("offline".to_owned())
+            })
+            .is_err()
+        );
+        assert_eq!(failures, 3);
+    }
+
+    #[test]
+    fn saved_values_use_the_converged_replica_snapshot_and_preserve_pending_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let originals = BTreeMap::from([
+            (
+                ("a".to_owned(), "vcr-1".to_owned()),
+                serde_json::json!({"waiting-requests": 0, "running-requests": 0, "kv-cache-usage": 0.2}),
+            ),
+            (
+                ("a".to_owned(), "vcr-2".to_owned()),
+                serde_json::json!({"waiting-requests": 0, "running-requests": 0, "kv-cache-usage": 0.8}),
+            ),
+        ]);
+        let two = expected_values_from_originals(
+            "a",
+            &originals,
+            super::super::SimulatorReadyReplicas { vcr_1: 1, vcr_2: 1 },
+        )?;
+        let one = expected_values_from_originals(
+            "a",
+            &originals,
+            super::super::SimulatorReadyReplicas { vcr_1: 1, vcr_2: 0 },
+        )?;
+        assert!((two.kv_cache - 0.5).abs() < f64::EPSILON);
+        assert!((one.kv_cache - 0.2).abs() < f64::EPSILON);
+        let generated = BTreeMap::from([(
+            ("a".to_owned(), "vcr-1".to_owned()),
+            serde_json::json!({"running-requests": "oscillate:1:3:1s"}),
+        )]);
+        let evidence = pending_restore_evidence(&generated);
+        assert_eq!(
+            evidence
+                .pointer("/0/original_metrics/running-requests")
+                .and_then(serde_json::Value::as_str),
+            Some("oscillate:1:3:1s")
+        );
+        Ok(())
+    }
 
     #[test]
     fn fake_metric_subset_preserves_the_original_fixed_and_generated_values() {
