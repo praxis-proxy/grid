@@ -93,7 +93,7 @@ the client-controlled `fairness_id` label collapses to `other`; otherwise the
 `x-llm-d-inference-fairness-id` header can grow the exposition past the budget.
 
 The verdict is also the provider's `Ready` condition, whose reason names the
-cause and, for a failed scrape, its class. See [crds.md](./crds.md).
+cause and, for a failed scrape, its class. See [crds.md](../reference/crds.md).
 
 The gateway does not read this verdict. It reads the EPP's ready-endpoint count the
 operator relays, and a site whose latest count is zero, or whose per-unit series stopped
@@ -221,7 +221,7 @@ and cancellation, so replacing a poller during refresh cannot lose a genuine
 skew drop. Feedback is scoped to the verified local operator identity.
 
 The operator exposes `GatewayAgesRejected` independently of peer diagnostics.
-Its [status and recovery rules](crds.md#gateway-age-evidence) preserve unresolved
+Its [status and recovery rules](../reference/crds.md#gateway-age-evidence) preserve unresolved
 replica evidence across silence, replacement, and operator restart. These
 conditions explain discarded signals; they do not alter network phase or add a
 routing failure mode.

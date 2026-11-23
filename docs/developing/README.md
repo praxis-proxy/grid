@@ -1,60 +1,230 @@
-# Developing Grid
+# Developing AGN
 
-Run a two-site grid on a laptop with kind: a hub and a site cluster with SPIFFE
-peer trust and polled signals. CI runs the same script on every pull request.
+Development and validation guidance for AI Grid Network (AGN) contributors.
 
-## Dependencies
+## Developer pages
 
-- Linux with Docker (macOS is not verified: images are linux/amd64 and kind
-  LoadBalancer addresses are not reachable from the host)
-- [kind](https://kind.sigs.k8s.io) v0.32.0, kubectl, [Helm](https://helm.sh) v3.17.3, Git
-- Rust from `rust-toolchain.toml`, used to install [Forge](forge.md)
-- 4 vCPU, 16 GB memory, 20 GB disk
+- [Development conventions](conventions.md): the canonical policy for coding
+  style, tests, documentation, commit attribution, and pull requests.
+- [Type design](type-design.md): examples of the type-design rules in the
+  conventions.
+- [Forge tooling](forge.md): the pinned Forge that creates test clusters.
+- [CI Kind E2E](ci-kind-e2e.md): validation tiers, gate sequence, sequencing
+  requirements, and environment dependencies.
+- [Release process](release.md): versioning, validation, artifact
+  publication, and release workflow.
+- [Unicode audit](unicode-audit.md): tracked text inventory and intentional
+  Unicode exceptions.
 
-## Bring it up
+To run a local two-site grid on kind, follow the
+[quickstart](../getting-started/quickstart.md).
 
-```bash
-git clone https://github.com/praxis-proxy/grid && cd grid
-./scripts/forge.sh install
+## Requirements
 
-# Use published images for this commit instead of building them
-export SKIP_BUILD=1 IMAGE_PREFIX=ghcr.io/praxis-proxy/grid- IMAGE_TAG=sha-$(git rev-parse HEAD | cut -c1-7)
-for i in operator gateway enrollment; do docker pull "$IMAGE_PREFIX$i:$IMAGE_TAG"; done
+- Rust stable 1.96+; edition 2024 and resolver 3.
+- `nightly-2026-03-28` with rustfmt, matching `NIGHTLY_RUSTFMT` in the Makefile.
+- Clippy, `cargo-machete`, `cargo-audit`, and `cargo-deny` for the Rust gates.
+- `typos`, `taplo`, `shellcheck`, and `actionlint` for `make lint-extra`.
+- `jq` and Mike Farah's `yq` v4 for CRD generation.
+- Go 1.24+ for `make generate-go-types` and `make go-types-check`.
+- `cargo-llvm-cov` and `llvm-tools-preview` for optional coverage runs.
+- Docker or Podman, kind, kubectl, Helm, and the topology-specific prerequisites
+  for live integration checks. Individual harnesses may require Docker.
 
-# Create the hub and site clusters
-./scripts/e2e-hub-site.sh up
+Node/npm are needed for the dashboard web application and Markdown lint tools.
+Read the relevant component guide before installing or running its tooling.
 
-# Install with SPIFFE trust (MODES=spiffe) and polled signals with
-# operator-generated routing (HUB_ROUTER=operator); leaves the grid running
-MODES=spiffe HUB_ROUTER=operator ./scripts/e2e-hub-site.sh test
+## Conventions
+
+[Development Conventions](conventions.md) is the canonical AGN policy. It
+covers coding style, documentation, tests, human review, and commit attribution,
+including the differences from the pinned shared Conventions baseline.
+
+## Workspace map
+
+Run root Make targets from this repository's top-level directory. Cargo package
+names stay the same regardless of their directory location. Root workspace
+crates live under `crates/`; Gateway is a separate workspace within that
+directory.
+
+| Package | Source | Responsibility |
+| --- | --- | --- |
+| `operator` | [`crates/operator/`](../../crates/operator/) | Kubernetes controllers, CRDs, and the operator binary. |
+| `grid-overlay-sync` | [`crates/overlay-sync/`](../../crates/overlay-sync/) | Watches overlay ConfigMaps and delivers local gateway files. |
+| `swim` | [`crates/swim/`](../../crates/swim/) | Membership, gossip transport, and encryption. |
+| `crdt` | [`crates/crdt/`](../../crates/crdt/) | Replicated state primitives and provider state. |
+| `scoring` | [`crates/scoring/`](../../crates/scoring/) | Provider scoring and overlay contract types. |
+| `certs` | [`crates/certs/`](../../crates/certs/) | Site certificates and certificate-provider interfaces. |
+| `enrollment` | [`crates/enrollment/`](../../crates/enrollment/) | Site enrollment service and API types. |
+| `grid-signals` | [`crates/signals/`](../../crates/signals/) | Shared load-signal store, Prometheus exposition parser, and labels. |
+| `grid-client` | [`crates/client/`](../../crates/client/) | Grid-root HTTP clients and the mTLS site-signal poller. |
+| `mock-providers` | [`crates/mock-providers/`](../../crates/mock-providers/) | Mock inference-provider APIs. |
+| `fleet-dashboard` | [`crates/fleet-dashboard/`](../../crates/fleet-dashboard/) | Optional fleet UI and Prometheus-backed views. |
+| `xtask` | [`crates/xtask/`](../../crates/xtask/) | Repository generation, environments, and qualification commands. |
+| `version` | [`crates/version/`](../../crates/version/) | Shared build identity for binaries and container provenance. |
+
+[`crates/gateway/`](../../crates/gateway/) is a separate Cargo workspace with
+its own lockfile. It contains `gateway` (the `grid-gateway` binary) and
+[`ai-grid-filters`](../../crates/gateway/crates/ai-grid-filters/). Root
+`cargo --workspace` commands do not include it. Keep its TLS feature choices and
+production no-ring check intact when changing shared dependencies.
+
+Forge is an upstream tool. Install it with `./scripts/forge.sh install` before
+running environment qualifications. Grid pins its source revision and resolves
+the executable through a shared wrapper. See [Forge tooling](forge.md)
+for installation, cache verification, development overrides, and upgrade
+checks.
+
+### Development images
+
+`make container`, `make images`, and `make dev-push` build the operator using
+`deploy/operator/Containerfile`. Their default `PROJECT_IMAGE` is now
+`grid-operator:dev`, replacing `praxis-grid:dev`; update scripts that load the
+old tag. To keep an existing local tag, pass `PROJECT_IMAGE=praxis-grid:dev` to
+those targets.
+`make dev-push` also loads the image into the selected kind cluster.
+
+## Verification
+
+| Local command | Scope | Checked-in CI |
+| --- | --- | --- |
+| `make build`, `make check`, `make release` | Build, check, or release-build the root workspace. | Test, MSRV, image, and release jobs compile the relevant configurations. |
+| `make fmt` | Format root and Gateway workspaces with the pinned nightly. | `make lint` checks formatting without rewriting files. |
+| `make lint` | Root and Gateway Clippy, formatting, unused dependencies, and Gateway production no-ring check. | Tests / lint; Gateway also has a dedicated workflow. |
+| `make lint-extra` | Spelling, TOML formatting, pre-commit-hook ShellCheck, actionlint. | No aggregate extra-lint job yet. |
+| `make doc` | Root rustdoc, including private items, with warnings denied. | Documentation / rustdoc, including documentation-only PRs. |
+| `make test` | Root workspace tests; ignored tests stay excluded. | Tests / test; separate FIPS and Gateway jobs cover their configurations. |
+| `make gateway-fips-check` | Gateway API-key, JWT-only and combined Policy FIPS builds, capability assessment and normal/build crypto graph. | Gateway / gateway-fips-check; runtime FIPS host validation remains separate. |
+| `make audit` | Root lockfile audit and dependency/license policy. | Supply Chain; Gateway policy is checked in its own workflow. |
+| `make codegen-check`, `make crds-check` | Compare generated enrollment types and stable CRDs with their source definitions. | Tests / lint. |
+| `make go-types-check` | Regenerate Go API types from `deploy/crds/` and fail if the committed files differ. Rewrites `go/api/v1alpha1/zz_generated_*.go` in place — run before staging. | Check Go API types match the CRD schemas. |
+| `make crds-check-experimental` | Compare the opt-in A2A CRD with the feature-enabled Rust type. | Tests / lint when A2A changes. |
+| `make coverage-check` | 80% root line-coverage floor with documented exclusions. | Coverage / coverage. |
+| `make mutants`, `make semver`, `make publish-dry-run` | Opt-in specialist checks. | No corresponding scheduled Grid workflows. |
+
+`make all` runs build, formatting, lint, rustdoc, root tests, and root audit.
+When `go` is found in `PATH` it also runs `go-types-check`, which regenerates
+the Go API types from the deployed CRD schemas and fails if the committed files
+differ. The check rewrites `go/api/v1alpha1/zz_generated_*.go` in place, so
+run it before staging. Without Go in `PATH` the check is skipped silently; CI
+always runs it via the `go-types-check` step regardless.
+Run `make lint-extra` separately for spelling, TOML, shell, and workflow checks.
+The `make all` aggregate does not run coverage, Gateway tests, FIPS checks,
+container builds, dashboard web checks, or live cluster qualifications. Run
+those when the changed contract requires them. The
+[release guide](release.md) records the integration qualification matrix.
+
+Tests and Coverage workflows skip their Rust jobs for documentation-only PRs;
+rustdoc and MSRV still run. The Gateway, Helm, and dashboard workflows have
+their own triggers and scopes. A skipped or absent job is not a passing test
+result. The [canonical conventions](conventions.md) require the local test
+suite before submitting any PR, including README or Markdown prose changes.
+Changes to examples, generated contracts, or executable commands also need
+checks appropriate to the affected behavior.
+
+### Formatting and documentation
+
+```console
+make fmt
+make lint
+make doc
 ```
 
-To build the images yourself, unset `SKIP_BUILD`, `IMAGE_PREFIX` and `IMAGE_TAG`.
+Nightly is required for rustfmt's `group_imports` and `imports_granularity`.
+All public and private items need documentation under the workspace lint policy;
+see the canonical policy for test-function exceptions. `.cargo/config.toml`
+also sets `rustdocflags = ["-D", "warnings"]`, including outside Make.
 
-## Look around
+Markdown style is configured in `.markdownlint.yaml`; external link-check
+settings are in `lychee.toml`. These checks are not part of `make lint-extra` or
+checked-in CI. Review relative links and anchors when moving or rewriting docs,
+and report whether automated Markdown/link checks were run.
 
-```bash
-kubectl --context kind-grid-hub-site-hub  -n grid get gridsites,gridnetworks,inferenceproviders
-kubectl --context kind-grid-hub-site-site -n grid get gridsites
+### Generated manifests
+
+`make generate-crds` writes `deploy/crds/` and
+`charts/grid-operator/templates/crds/` from `crates/operator/src/crd/`.
+`make generate-api-types` writes enrollment Rust types from
+`api/enrollment-v1alpha1.yaml`. Edit the sources and regenerate; do not edit the
+generated output directly. CRD doc-comment changes also affect field
+descriptions and require regeneration.
+
+`make generate-go-types` derives `go/api/v1alpha1/zz_generated_*.go` from
+`deploy/crds/`. Run it after any `make generate-crds` pass and commit the
+result. `make go-types-check` re-runs the generator and fails if the committed
+files differ; CI runs this step regardless of whether Go is in your local
+`PATH`.
+
+```console
+make generate-crds
+make crds-check
+make generate-crds-experimental
+make crds-check-experimental
+make generate-api-types
+make codegen-check
+make generate-go-types
+make go-types-check
 ```
 
-## Tear down
+### Coverage and supply chain
 
-```bash
-./scripts/e2e-hub-site.sh down
-```
+`make coverage` writes an HTML report under `target/coverage`;
+`make coverage-check` writes `coverage.json`. See the
+[coverage policy](conventions.md#coverage-floor) for the measured-scope limits
+and the path toward the shared 90% line / 80% region target. No threshold
+increase should be claimed without a report from the actual commands.
 
-## Notes
+`cargo audit` checks known advisories. `cargo deny check` enforces `deny.toml`,
+including license and source policy. Documented advisory exceptions belong to
+their actual dependency paths; refreshing a template must not silently remove
+or broaden them. Gateway has its own lockfile and `deny.toml`.
 
-- The Helm commands the script runs are in
-  [examples/helm/hub-site](../../examples/helm/hub-site/README.md).
-- `grid.membership.source` picks where a site learns its members. `Swim`, the default,
-  discovers them by SWIM gossip. `Local` means this site's configuration lists its peers
-  as `GridSite` objects, polls their signals, and runs no SWIM. Both are supported peer
-  options.
+### Hooks and worktrees
 
-## More
+Enable signing with your own Git identity and key before committing. Running
+`make setup-hooks` selects `.hooks` through `core.hooksPath`, which works when
+`.git` is a file in a linked worktree. This is repository Git configuration and
+can affect its other worktrees. The hook checks that signing is enabled, then
+runs `make lint`; it does not run tests or the complete `make all` aggregate.
 
-- [Forge tooling](forge.md)
-- [Conventions](conventions.md)
-- [Type design](type-design.md)
+Keep build outputs, cluster names, ports, and qualification evidence isolated
+when working in parallel. Worktrees isolate source edits, not Git configuration
+or container-daemon resources. Do not run cleanup against another run's state.
+
+## Project Management
+
+All repositories in the `praxis-proxy` organization
+use a consistent workflow for planning, prioritizing,
+and tracking work.
+
+### Milestones
+
+Milestones represent a body of work toward a shared
+goal (e.g. a release, a feature area, or a hardening
+pass). Every issue and pull request should belong to
+a milestone. Milestones provide scope boundaries and
+help answer "what ships together?"
+
+### Priority Labels
+
+Priority labels indicate the order in which work
+within a milestone should be addressed. Every issue
+should have exactly one priority label:
+
+| Label | Description |
+| --- | --- |
+| `priority/critical` | Must be worked on immediately before anything else |
+| `priority/high` | Needs to be worked on immediately, defer to critical work |
+| `priority/medium` | Resolve after high and critical |
+| `priority/low` | Resolve after all other priority levels |
+
+When picking up work, address issues in priority
+order: critical first, then high, medium, and low.
+
+### Project Boards
+
+GitHub project boards visualize the state of work
+across milestones. Use boards to track issues through
+their lifecycle (backlog, in progress, in review,
+done). Boards are the primary tool for stand-ups and
+status checks.

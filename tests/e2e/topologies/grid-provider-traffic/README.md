@@ -282,4 +282,4 @@ sequenceDiagram
 - [Round-robin selection in the AGN Routing Guide](../../../../docs/routing.md#3-round-robin-selection)
 - [Routing](../../../../docs/architecture/routing.md)
 - [Provider Scoring](../../../../docs/architecture/scoring.md)
-- [Consumer Config](../../../../docs/architecture/consumer-config.md)
+- [Consumer Config](../../../../docs/reference/consumer-config.md)

@@ -4,7 +4,7 @@ A site enrolls with a grid by redeeming a one-time token at the enrollment
 service. The service returns a certificate that carries a grid-assigned
 identity. Enrollment does not provision the mesh. The GridNetwork carries the
 SWIM key and seed peers, as [CRD-driven SWIM
-seeds](../architecture/crds.md#crd-driven-swim-seeds) describes.
+seeds](../reference/crds.md#crd-driven-swim-seeds) describes.
 
 ## Prerequisites
 

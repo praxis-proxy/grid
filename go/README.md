@@ -115,8 +115,9 @@ go get github.com/praxis-proxy/grid/go@v0.1.0
 
 Tags are intended to align with operator releases so the Go types match the CRD
 schemas shipped in that release. Tagging is a manual step not yet covered by
-the operator release automation in `docs/release.md`. After regenerating and
-merging Go types for a release, create and push the tag by hand:
+the operator release automation in `docs/developing/release.md`. After
+regenerating and merging Go types for a release, create and push the tag by
+hand:
 
 ```sh
 git tag go/v<X>.<Y>.<Z>

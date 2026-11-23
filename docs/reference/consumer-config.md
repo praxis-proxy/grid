@@ -127,8 +127,8 @@ Set `praxisConfig.telemetry` to add process-level OTLP settings and the
 config root and never enter the routing overlay. The consumer ConfigMap does
 not contain collector headers; configure `OTEL_EXPORTER_OTLP_HEADERS` on the
 gateway Deployment with a Secret-backed environment reference. See
-[OpenTelemetry for Grid gateways](opentelemetry.md) for examples and the
-Praxis 0.7.1 trace-linkage limitation.
+[OpenTelemetry for Grid gateways](../operations/opentelemetry.md) for examples
+and the Praxis 0.7.1 trace-linkage limitation.
 
 This generated config covers the direct API-provider path where the consumer
 gateway is also the final-hop gateway for the provider API call. A credential
@@ -187,7 +187,7 @@ the credential filter is already running and the matching Secret is mounted
 under `{credentialMountPath}/{namespace}/{name}`. If that Secret projection
 is not mounted, the request fails closed until the consumer installs it.
 
-See [`docs/architecture/crds.md`](crds.md#gatewayrefpraxisconfig) for the full
+See [`docs/reference/crds.md`](crds.md#gatewayrefpraxisconfig) for the full
 field reference.
 
 ## Grid-managed live-routing consumers
@@ -430,9 +430,9 @@ gateway grants it: with `mountReconciliation.enabled`, the praxis-gateway
 chart renders a Role in the gateway namespace allowing `get` and `patch` on
 that one Deployment, bound to the operator ServiceAccount. A Deployment the
 chart did not install needs the equivalent Role by hand; see
-[Deployment access](operations.md#deployment-access), which also covers the
-upgrade order from v0.2.0 and what the grant still allows. Without it the
-mount status reports `DeploymentForbidden` and nothing is patched. With a
+[Deployment access](../operations/operations.md#deployment-access), which also
+covers the upgrade order from v0.2.0 and what the grant still allows. Without it
+the mount status reports `DeploymentForbidden` and nothing is patched. With a
 nonempty candidate overlay and the feature disabled, the operator publishes
 the requirements document but does not read or patch gateway Deployments.
 
@@ -496,7 +496,8 @@ The operator could not apply the `ConfigMap`.  Common causes:
 
 - Missing RBAC: the operator's `ServiceAccount` lacks `configmaps` `create`
   and `patch` in the gateway namespace.  See the
-  [RBAC permissions](operations.md#rbac-permissions) in the operations guide.
+  [RBAC permissions](../operations/operations.md#rbac-permissions) in the
+  operations guide.
 - The namespace does not exist.  Create it before enabling `praxisConfig`.
 - Kubernetes API server is temporarily unavailable.  The reconcile will retry on
   the next requeue (default 5 minutes) or when the `GridNetwork` or any watched
@@ -592,8 +593,8 @@ rather than a `subPath`, enable overlay-file mode, and configure the expected
 overlay scope. A `ConfigMap` update is not serving evidence until Praxis AI
 reports that it accepted the distributed revision.
 
-See [External Client Ingress](external-ingress.md) for the full edge
-deployment architecture.
+See [External Client Ingress](../architecture/external-ingress.md) for the full
+edge deployment architecture.
 
 ## Reload and rollout
 
