@@ -72,6 +72,8 @@ mod tests {
     const PARTITIONED: u8 = 3;
     /// Fresh provider samples under a queue name the gateway does not recognize.
     const UNREADABLE: u8 = 4;
+    /// The telemetry endpoint answers successfully but contains no samples.
+    const NO_SIGNALS: u8 = 5;
 
     /// A peer operator's signals endpoint over mutual TLS, publishing per `mode`.
     struct Peer {
@@ -159,6 +161,7 @@ mod tests {
         let labels = format!(r#"grid_site="{site}",grid_provider="pool-{site}""#);
         let load = format!("llm_d_epp_average_queue_size{{{labels}}} 0 {stamp}\n");
         match mode {
+            NO_SIGNALS => String::new(),
             OMITTED => load,
             UNREADABLE => {
                 format!("vendor_queue_depth{{{labels}}} 0 {stamp}\nllm_d_epp_ready_endpoints{{{labels}}} 1 {stamp}\n")
@@ -379,6 +382,109 @@ mod tests {
             thread::sleep(PACE);
         }
         streak_start.duration_since(start)
+    }
+
+    #[test]
+    fn serving_backends_without_signals_are_unmeasured_then_silent_after_telemetry_loss() {
+        let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("provider-silence-{}", std::process::id()));
+        let identity = work.join("identity");
+        std::fs::create_dir_all(&identity).expect("identity dir");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let hub = generate_site_cert(&ca, "hub").expect("hub cert");
+        for (key, pem) in [
+            ("ca.crt", &ca.cert_pem),
+            ("tls.crt", &hub.cert_pem),
+            ("tls.key", &hub.key_pem),
+        ] {
+            std::fs::write(identity.join(key), pem).expect("identity file");
+        }
+        let peers: Vec<(&str, Peer)> = SITES.iter().map(|site| (*site, Peer::start(&ca, site))).collect();
+        for (_, peer) in &peers {
+            peer.mode.store(NO_SIGNALS, Ordering::SeqCst);
+        }
+        let backends: Vec<(&str, u16)> = SITES.iter().map(|site| (*site, backend(site))).collect();
+        let gateway = Gateway::start(
+            &work,
+            &backends,
+            &peers.iter().map(|(site, peer)| (*site, peer)).collect::<Vec<_>>(),
+            &identity,
+        );
+        gateway.eventually("cold-start backends serving without any telemetry", || {
+            let counts = split(&gateway, 30);
+            !counts.contains_key("error") && SITES.iter().all(|site| counts.contains_key(*site))
+        });
+        thread::sleep(WINDOW * 2);
+        for site in SITES {
+            assert!(
+                gateway.metrics().contains(&format!(
+                    "grid_route_site_silent{{site=\"{site}\",cluster=\"pool-{site}\"}} 0"
+                )),
+                "a never-measured backend without reported operator rounds is unmeasured"
+            );
+        }
+        for (_, peer) in &peers {
+            peer.mode.store(READY, Ordering::SeqCst);
+        }
+        gateway.eventually("all backends publish usable queue samples", || {
+            let metrics = gateway.metrics();
+            SITES.iter().all(|site| {
+                metrics.contains(&format!(
+                    "grid_route_site_score_unavailable{{site=\"{site}\",cluster=\"pool-{site}\",reason=\"absent\"}} 0"
+                ))
+            })
+        });
+        gateway.eventually("each measured backend serves requests", || {
+            let counts = split(&gateway, 30);
+            !counts.contains_key("error") && SITES.iter().all(|site| counts.contains_key(*site))
+        });
+        let site_b = &peers[1].1;
+        site_b.mode.store(NO_SIGNALS, Ordering::SeqCst);
+        gateway.eventually("site-b becomes silent after losing only telemetry", || {
+            gateway
+                .metrics()
+                .contains("grid_route_site_silent{site=\"site-b\",cluster=\"pool-site-b\"} 1")
+        });
+        let mut direct = TcpStream::connect(("127.0.0.1", backends[1].1)).expect("connect serving site-b");
+        direct
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("direct timeout");
+        direct
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: site-b\r\nConnection: close\r\n\r\n")
+            .expect("direct request");
+        let mut response = String::new();
+        direct.read_to_string(&mut response).expect("direct response");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK") && response.ends_with("\r\n\r\nsite-b"),
+            "site-b's request path still serves successfully while its telemetry is absent: {response}"
+        );
+        let excluded = split(&gateway, 100);
+        assert_eq!(
+            excluded.get("site-b"),
+            None,
+            "silent site gets no ordinary traffic: {excluded:?}"
+        );
+        assert_eq!(
+            excluded.get("error"),
+            None,
+            "remaining sites serve all requests: {excluded:?}"
+        );
+        for (_, peer) in &peers {
+            peer.mode.store(NO_SIGNALS, Ordering::SeqCst);
+        }
+        gateway.eventually("all sites become silent", || {
+            let metrics = gateway.metrics();
+            SITES.iter().all(|site| {
+                metrics.contains(&format!(
+                    "grid_route_site_silent{{site=\"{site}\",cluster=\"pool-{site}\"}} 1"
+                ))
+            })
+        });
+        gateway.eventually("all-silent fallback reaches every serving backend", || {
+            let counts = split(&gateway, 30);
+            !counts.contains_key("error") && SITES.iter().all(|site| counts.contains_key(*site))
+        });
+        drop(gateway);
+        std::fs::remove_dir_all(&work).expect("remove workdir");
     }
 
     #[test]
