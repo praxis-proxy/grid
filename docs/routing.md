@@ -829,7 +829,7 @@ appropriate ingress affinity when cross-request provider stickiness is required.
 
 **Praxis AI reference:**
 
-- [intelligent_route filter](https://github.com/praxis-proxy/ai/blob/main/docs/filters/intelligent_route.md)
+- [intelligent_route filter](https://github.com/praxis-proxy/ai/blob/main/docs/filters/routing/intelligent_route.md)
 
 ---
 
@@ -1378,7 +1378,7 @@ AGN:
 
 Praxis AI:
 
-- [`intelligent_route` filter](https://github.com/praxis-proxy/ai/blob/main/docs/filters/intelligent_route.md)
+- [`intelligent_route` filter](https://github.com/praxis-proxy/ai/blob/main/docs/filters/routing/intelligent_route.md)
 
 Runnable demos:
 
