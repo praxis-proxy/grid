@@ -97,7 +97,7 @@ const COUNTER_HELP: [(&str, &str); 15] = [
     ),
     (
         "grid_dial_refusals_total",
-        "Requests a provider gateway refused because its site does not serve the provider, by cluster. One orders that provider last for 10 seconds and leaves the dial up.",
+        "Requests a provider gateway refused because its site does not serve the candidate, by cluster. One orders that candidate last for 10 seconds and leaves the dial up.",
     ),
     (
         "grid_dial_server_errors_total",
