@@ -44,9 +44,16 @@ for i in operator gateway enrollment; do
 done
 ```
 
-CI publishes these `sha-<commit>` images for commits on `main` and for
-release commits. To build the images yourself instead, leave `SKIP_BUILD`,
-`IMAGE_PREFIX`, and `IMAGE_TAG` unset.
+The `Helm` workflow publishes these `sha-<commit>` images for commits pushed to
+`main` and for release commits, after its tests pass. A commit whose run is
+still in progress or failed has no images yet, and the pulls fail. Check out a
+commit whose `Helm` run succeeded, or wait for its run to finish.
+
+To build the images from source instead, clear the variables you exported:
+
+```console
+unset SKIP_BUILD IMAGE_PREFIX IMAGE_TAG
+```
 
 Create the hub and site clusters:
 
