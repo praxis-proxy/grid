@@ -3,10 +3,16 @@
 //! A pick rule that sends every request to the lightest site of the last snapshot builds a queue
 //! here. A test over a fixed load cannot see that, because nothing it routes changes what it reads.
 
+//! Three sites of 40 slots and 2 s requests serve 60 a second, so 3 a step is half of capacity,
+//! 4 is two thirds and 5 is five sixths. At count-only sites one waiting request is backlog.
+//! Scheduler sites compare physical KV use against the original capacity after a service-slot
+//! cut; half of original capacity is 80 percent of service capacity after the cut. The KV-binding
+//! five-sixths case gates the old selector's reported ~160-request queue at half that peak.
+
 use std::collections::VecDeque;
 
 use super::{Harness, KeepAll, MODEL, NOW_MS, SiteSpec};
-use crate::{descriptor::CapabilityKind, route::select_spread};
+use crate::{descriptor::CapabilityKind, route::select_spread, snapshot::RouteSnapshot};
 
 /// Simulated milliseconds per step.
 const STEP_MS: i64 = 100;
@@ -35,8 +41,8 @@ const DURATION_MS: i64 = 150_000;
 /// Simulated time every site idles after its ceiling is taught, so load starts on an idle grid.
 const IDLE_MS: i64 = 10_000;
 
-/// Simulated time before waiting is counted: the teaching sample reads every site as full until
-/// it leaves the horizon and the first snapshots after it settle.
+/// Simulated time before waiting is counted, allowing the seed to leave the horizon and
+/// subsequent snapshots to settle on measured load.
 const WARM_UP_MS: i64 = 30_000;
 
 /// How many starting points a run is repeated over. The loop is chaotic enough that one starting
@@ -92,9 +98,10 @@ enum Publish {
     /// A request count from one serving unit. The gateway learns a ceiling, and one waiting
     /// request is a backlog.
     Count,
-    /// What the llm-d scheduler publishes: averages per engine and KV-cache use, here `kv_at_full`
-    /// when every slot runs. Saturation is the greater of KV use over 0.8 and the queue per engine
-    /// over 5, and a backlog is one waiting request per engine.
+    /// What the llm-d scheduler publishes: averages per engine and physical KV-cache use.
+    /// `kv_at_full` is the use at the original 40-slot capacity; reducing concurrent service
+    /// slots does not reduce physical KV capacity or the number of engines. Saturation is the
+    /// greater of KV use over 0.8 and the queue per engine over 5; backlog starts at one per engine.
     Scheduler { kv_at_full: f64 },
 }
 
@@ -103,8 +110,8 @@ enum Publish {
 struct Scenario {
     /// Requests arriving per step.
     arriving: usize,
-    /// How long every site idles before requests arrive; zero starts with a burst onto sites the
-    /// teaching sample still reads as full.
+    /// How long every site idles before requests arrive; zero starts on the full-slot seed.
+    /// Its initial pressure depends on the selected publication mode.
     idle_ms: i64,
     /// What the sites publish.
     publish: Publish,
@@ -154,8 +161,7 @@ impl Scenario {
     )]
     fn run(&self, sites: &[SiteSpec], first_turn: usize) -> RunEvidence {
         let mut grid = Harness::new(HORIZON_MS);
-        // Teach every ceiling with one sample holding its slots and nothing waiting.
-        let mut snapshot = grid.refresh(sites, NOW_MS, |site| site.capacity, 0.0);
+        let mut snapshot = self.seed(&mut grid, sites);
         let mut serving: Vec<Serving> = sites.iter().map(|_| Serving::default()).collect();
         let (mut turn, mut peak) = (first_turn, 0_usize);
         let mut total_offered = 0_usize;
@@ -279,6 +285,23 @@ impl Scenario {
         }
     }
 
+    /// Seed the first snapshot with a full-slot observation in the scenario's publication mode.
+    fn seed(&self, grid: &mut Harness, sites: &[SiteSpec]) -> RouteSnapshot {
+        match self.publish {
+            Publish::Count => grid.refresh(sites, NOW_MS, |site| site.capacity, 0.0),
+            Publish::Scheduler { .. } => {
+                let full = Serving {
+                    running: std::iter::repeat_n(NOW_MS + SERVICE_MS, SLOTS).collect(),
+                    waiting: 0,
+                };
+                for spec in sites {
+                    self.publish(grid, spec, &full, NOW_MS);
+                }
+                grid.order(sites, NOW_MS)
+            },
+        }
+    }
+
     /// Publish what `site` holds at `at_ms`, as [`Publish`] says.
     fn publish(&self, grid: &Harness, spec: &SiteSpec, site: &Serving, at_ms: i64) {
         let (running, waiting) = (count(site.running.len()), count(site.waiting));
@@ -328,52 +351,41 @@ fn equal(names: &[&'static str]) -> Vec<SiteSpec> {
         .collect()
 }
 
-/// KV-cache use that binds before the slots do: saturation reads 1 when every slot runs.
+/// KV-cache use that reaches saturation 1 at the original 40-slot service capacity.
 const KV_BINDS: Publish = Publish::Scheduler { kv_at_full: 0.8 };
 
 /// KV-cache use that leaves the queue as the limit.
 const KV_SPARE: Publish = Publish::Scheduler { kv_at_full: 0.5 };
 
-// Three sites of 40 slots and 2 s requests serve 60 a second, so 3 a step is half of capacity,
-// 4 is two thirds and 5 is five sixths. Each bound is a few times what the pick leaves and well
-// under what taking the lighter of two outright leaves, which the comment beside it gives.
-
 #[test]
 fn three_equal_sites_at_half_of_capacity_build_no_queue() {
-    // Outright: 17. Above about two thirds a count-only site queues under either rule, because one
-    // waiting request is a backlog there and drops the site until the next snapshot.
     let peak = Scenario::steady(3, Publish::Count).peak_waiting(&equal(&["a", "b", "c"]));
     assert!(
         peak <= SLOTS / 10,
-        "with half of every site free, a queue of {peak} at one site is the pick herding"
+        "with half of every site free, a queue of {peak} at one site is the pick herding (lighter-of-two reference: 17)"
     );
 }
 
 #[test]
 fn sites_behind_the_scheduler_at_two_thirds_of_capacity_build_no_queue() {
-    // Outright: 51.
     for publish in [KV_BINDS, KV_SPARE] {
         let peak = Scenario::steady(4, publish).peak_waiting(&equal(&["a", "b", "c"]));
         assert!(
             peak <= SLOTS / 4,
-            "with a third of every site free, a queue of {peak} at one site is the pick herding"
+            "with a third of every site free, a queue of {peak} at one site is the pick herding (lighter-of-two reference: 51)"
         );
     }
 }
 
 #[test]
 fn sites_behind_the_scheduler_at_five_sixths_of_capacity_stay_near_empty_when_kv_has_room() {
-    // Outright: 154. Where KV binds, a site at saturation 1 has no room and is dropped, and about
-    // 160 wait under either rule.
     let peak = Scenario::steady(5, KV_SPARE).peak_waiting(&equal(&["a", "b", "c"]));
     assert!(
         peak <= SLOTS / 2,
-        "with a sixth of every site free, a queue of {peak} at one site is the pick herding"
+        "with a sixth of every site free, a queue of {peak} at one site is the pick herding (lighter-of-two reference: 154)"
     );
 }
 
-/// Emit the five-phase scheduler waveform and gate KV-binding pressure at half the reported base peak.
-/// The old selector removes a site at rho 1; the issue's unverified report puts its queue near 160.
 #[expect(
     clippy::print_stdout,
     reason = "machine-readable evidence is consumed by the qualification report"
@@ -431,7 +443,6 @@ fn sites_behind_the_scheduler_at_five_sixths_of_capacity_keep_soft_saturated_kv_
 
 #[test]
 fn sites_behind_the_scheduler_settle_after_a_burst() {
-    // Outright: 55. The first requests land on sites the teaching sample still reads as full.
     for publish in [KV_BINDS, KV_SPARE] {
         let burst = Scenario {
             idle_ms: 0,
@@ -440,14 +451,13 @@ fn sites_behind_the_scheduler_settle_after_a_burst() {
         let peak = burst.peak_waiting(&equal(&["a", "b", "c"]));
         assert!(
             peak <= SLOTS / 4,
-            "a queue of {peak} at one site long after the burst is the pick herding"
+            "a queue of {peak} at one site long after the burst is the pick herding (lighter-of-two reference: 55)"
         );
     }
 }
 
 #[test]
 fn a_site_that_loses_three_quarters_of_its_slots_is_shed() {
-    // Outright: 87 at the cut site. Half of capacity before the cut is 80 percent after it.
     let cut = Scenario {
         cut_to: Some(SLOTS / 4),
         ..Scenario::steady(3, KV_SPARE)
@@ -455,6 +465,42 @@ fn a_site_that_loses_three_quarters_of_its_slots_is_shed() {
     let peak = cut.peak_waiting(&equal(&["a", "b", "c"]));
     assert!(
         peak <= SLOTS * 3 / 2,
-        "a queue of {peak} at the cut site is the pick failing to move away from it"
+        "a queue of {peak} at one site after the cut is the pick failing to redistribute load (lighter-of-two reference: 87)"
     );
+}
+
+#[test]
+fn scheduler_seed_and_slot_cut_keep_the_declared_metric_units() {
+    let sites = equal(&["a"]);
+    for (publish, kv) in [(KV_SPARE, 0.5), (KV_BINDS, 0.8)] {
+        let scenario = Scenario::steady(4, publish);
+        let mut grid = Harness::new(HORIZON_MS);
+        let snapshot = scenario.seed(&mut grid, &sites);
+        for (metric, expected) in [
+            ("llm_d_epp_ready_endpoints", count(ENGINES)),
+            ("llm_d_epp_average_running_requests", count(SLOTS) / count(ENGINES)),
+            ("llm_d_epp_average_kv_cache_utilization", kv),
+        ] {
+            let sample = grid.store.latest("a/pool-a", metric).expect("seed metric");
+            assert!(
+                (sample.value - expected).abs() < 1e-12,
+                "{metric} must use scheduler units"
+            );
+        }
+        let candidate = snapshot.candidates.first().expect("seeded site");
+        assert!((candidate.rho.expect("scheduler pressure") - kv / 0.8).abs() < 1e-12);
+        let reduced = Serving {
+            running: std::iter::repeat_n(NOW_MS + SERVICE_MS, SLOTS / 4).collect(),
+            waiting: 0,
+        };
+        scenario.publish(&grid, &sites[0], &reduced, NOW_MS + SCRAPE_MS);
+        let sample = grid
+            .store
+            .latest("a/pool-a", "llm_d_epp_average_kv_cache_utilization")
+            .expect("cut metric");
+        assert!(
+            (sample.value - kv / 4.0).abs() < 1e-12,
+            "a service-slot cut retains physical KV capacity"
+        );
+    }
 }
