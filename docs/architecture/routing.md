@@ -1065,7 +1065,7 @@ selection rules when other candidates have usable readings.
 Alert on `grid_route_site_silent`. A steady rate of
 `grid_route_site_silent_transitions_total` is a flapping link, and a growing
 `grid_route_site_round_age_seconds` is a stalled poller. See
-[Metrics](../metrics.md).
+[Metrics](../reference/metrics.md).
 
 ### KV-cache affinity
 
@@ -1113,7 +1113,7 @@ kubelet and it does not provide the sidecar's validation or delivery status.
 
 Consumers without overlay-file reload must apply changes through supported
 `praxis.yaml` file watching or a deployment rollout. See
-[Consumer Config](consumer-config.md#reload-and-rollout).
+[Consumer Config](../reference/consumer-config.md#reload-and-rollout).
 
 ## Relevant files
 

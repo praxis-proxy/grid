@@ -16,7 +16,8 @@ build.
   [routing guide](routing.md).
 - AGN can select among configured, eligible inference providers across sites.
   The provider deployments, their credentials, and the networks connecting
-  sites must already exist. See [adding a provider](adding-provider.md).
+  sites must already exist. See
+  [adding a provider](operations/adding-provider.md).
 
 ## What The Deployment Owner Supplies
 
@@ -31,7 +32,7 @@ The [existing-cluster installation guide](installation/existing-clusters.md)
 shows one Helm-based setup. For gateways in a different cluster from the
 operator, the deployment owner must also deliver generated consumer
 configuration across that boundary; the operator does not write to a remote
-Kubernetes API server. See [cross-cluster limitations](architecture/operations.md#cross-cluster-limitations)
+Kubernetes API server. See [cross-cluster limitations](operations/operations.md#cross-cluster-limitations)
 and the [external ingress contract](architecture/external-ingress.md).
 
 ## Consumer And Provider Roles
@@ -76,5 +77,5 @@ AGN is not a tenant portal, model catalog or deployment service, customer
 identity provider, billing pipeline, or tenant observability UI. Those may
 integrate with AGN and Praxis, but they are separate platform responsibilities.
 AGN's routing and operational signals do not by themselves constitute an
-authoritative usage-metering or billing record. See [operations](architecture/operations.md)
+authoritative usage-metering or billing record. See [operations](operations/operations.md)
 for the signals AGN does expose.

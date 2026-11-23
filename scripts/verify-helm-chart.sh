@@ -2165,31 +2165,31 @@ else
 fi
 
 # Documentation exists
-if [[ -f "docs/adding-provider.md" ]]; then
-  pass "docs/adding-provider.md exists"
-  if grep -q 'fullnameOverride' docs/adding-provider.md; then
+if [[ -f "docs/operations/adding-provider.md" ]]; then
+  pass "docs/operations/adding-provider.md exists"
+  if grep -q 'fullnameOverride' docs/operations/adding-provider.md; then
     pass "docs: recommends fullnameOverride"
   else
     fail "docs: missing fullnameOverride recommendation"
   fi
-  if grep -q 'External HTTPS' docs/adding-provider.md; then
+  if grep -q 'External HTTPS' docs/operations/adding-provider.md; then
     pass "docs: covers external HTTPS providers"
   else
     fail "docs: missing external HTTPS provider section"
   fi
-  if grep -q 'Removing a Provider' docs/adding-provider.md; then
+  if grep -q 'Removing a Provider' docs/operations/adding-provider.md; then
     pass "docs: covers provider removal"
   else
     fail "docs: missing provider removal section"
   fi
-  if grep -q 'ca.crt.*tls.crt.*tls.key\|tls.crt.*tls.key.*ca.crt' docs/adding-provider.md \
-     || matches 'TLS Secret Key Contract' docs/adding-provider.md; then
+  if grep -q 'ca.crt.*tls.crt.*tls.key\|tls.crt.*tls.key.*ca.crt' docs/operations/adding-provider.md \
+     || matches 'TLS Secret Key Contract' docs/operations/adding-provider.md; then
     pass "docs: covers TLS Secret key contract"
   else
     fail "docs: missing TLS Secret key contract"
   fi
 else
-  fail "docs/adding-provider.md does not exist"
+  fail "docs/operations/adding-provider.md does not exist"
 fi
 
 # Docs linked from index
