@@ -95,6 +95,16 @@ pub(crate) fn in_pool(o: &Observation, pool: Option<&str>) -> bool {
 /// valid ordering fences.
 #[must_use]
 pub fn parse(text: &str) -> Vec<Observation> {
+    parse_peer_frame(text).0
+}
+
+/// Parse peer rows together with whether their revision framing was malformed.
+///
+/// A malformed frame can retain trusted invalidations for standalone callers of
+/// [`parse`], but must not replace an atomically paired provider catalog and signal
+/// snapshot. Genuine empty frames and valid zero-sample fences are not malformed.
+#[must_use]
+pub fn parse_peer_frame(text: &str) -> (Vec<Observation>, bool) {
     let now = SystemTime::now();
     if text.lines().any(|line| {
         split_metric_name(line.trim()).is_some_and(|(name, _)| name == grid_signals::revision::METRIC)
@@ -103,13 +113,35 @@ pub fn parse(text: &str) -> Vec<Observation> {
                 .filter(|revision| grid_signals::revision::valid_epoch(revision.publisher_epoch, now))
                 .is_none()
     }) {
-        return revision_fences(text, now);
+        return (revision_fences(text, now), true);
     }
     let observations: Vec<_> = parse_scrape(text)
         .into_iter()
         .filter_map(|(o, republishable)| republishable.then_some(o))
         .collect();
-    retain_complete_batches(observations)
+    let mut raw_revisions = 0_usize;
+    let malformed_sample = text
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .any(|line| {
+            let Some(row) = parse_sample(line) else { return true };
+            if row.metric == grid_signals::revision::METRIC {
+                raw_revisions = raw_revisions.saturating_add(1);
+            }
+            PEER_SIGNAL_NAMES.contains(&row.metric.as_str()) && !in_range(&row)
+        });
+    let retained_revisions = observations
+        .iter()
+        .filter(|row| row.metric == grid_signals::revision::METRIC)
+        .count();
+    let (observations, malformed_batch) = retain_complete_batches_checked(observations);
+    (
+        observations,
+        malformed_sample || malformed_batch || raw_revisions != retained_revisions,
+    )
 }
 
 /// Retain unique, strictly valid metadata as invalidations after a framing failure.
@@ -137,12 +169,18 @@ fn revision_fences(text: &str, now: SystemTime) -> Vec<Observation> {
 
 /// Refuse incomplete revision groups before timestamp-to-age conversion loses information.
 fn retain_complete_batches(observations: Vec<Observation>) -> Vec<Observation> {
+    retain_complete_batches_checked(observations).0
+}
+
+/// Preserve revision validation status before malformed groups become fences or disappear.
+fn retain_complete_batches_checked(observations: Vec<Observation>) -> (Vec<Observation>, bool) {
     if !observations
         .iter()
         .any(|sample| sample.metric == grid_signals::revision::METRIC)
     {
-        return observations;
+        return (observations, false);
     }
+    let mut malformed = false;
     let mut groups = BTreeMap::<_, Vec<Observation>>::new();
     for observation in observations {
         let key = (
@@ -151,7 +189,7 @@ fn retain_complete_batches(observations: Vec<Observation>) -> Vec<Observation> {
         );
         groups.entry(key).or_default().push(observation);
     }
-    groups
+    let kept = groups
         .into_values()
         .flat_map(|group| {
             let metadata: Vec<_> = group
@@ -161,11 +199,18 @@ fn retain_complete_batches(observations: Vec<Observation>) -> Vec<Observation> {
             match metadata.as_slice() {
                 [] => group,
                 [metadata] if complete_batch(&group.iter().collect::<Vec<_>>(), metadata) => group,
-                [metadata] => vec![invalidation(metadata)],
-                _ => Vec::new(),
+                [metadata] => {
+                    malformed = true;
+                    vec![invalidation(metadata)]
+                },
+                _ => {
+                    malformed = true;
+                    Vec::new()
+                },
             }
         })
-        .collect()
+        .collect();
+    (kept, malformed)
 }
 
 /// Preserve a trustworthy revision fence without qualifying unusable payload.
@@ -1317,7 +1362,7 @@ fn classify(error: &MetricsScrapeError) -> RequestOutcome {
                 Ok(outcome) => outcome,
             }
         },
-        MetricsScrapeError::Encoding(_) => RequestOutcome::Encoding,
+        MetricsScrapeError::Encoding(_) | MetricsScrapeError::InvalidAdmissionContract => RequestOutcome::Encoding,
         MetricsScrapeError::BodyTooLarge(_) => RequestOutcome::Transport,
         MetricsScrapeError::InvalidUrl(_)
         | MetricsScrapeError::HttpWithTls(_)
@@ -1863,6 +1908,22 @@ impl PollPeers {
     where
         Publish: FnMut(String, Vec<Observation>, usize, crate::metrics_scraper::Stamp),
     {
+        let slots = self.slots.clone();
+        self.collect_each_raw(sites, move |peer, observations, rejected, _malformed, stamp| {
+            publish(peer.clone(), slots.bound_legacy(&peer, observations), rejected, stamp);
+        })
+        .await;
+    }
+
+    /// Hand each peer's complete, aged rows to `publish` without applying receiver-local slots.
+    ///
+    /// The versioned source-admission path uses this to wait until the answer's catalog version
+    /// is known before choosing which rows to hold. The callback receives an explicit malformed-frame
+    /// flag before the response stamp. Legacy callers should use [`Self::collect_each`].
+    pub async fn collect_each_raw<Publish>(&self, sites: &[PeerSite], mut publish: Publish)
+    where
+        Publish: FnMut(String, Vec<Observation>, usize, bool, crate::metrics_scraper::Stamp),
+    {
         let collect_query = self
             .collect
             .iter()
@@ -1888,20 +1949,16 @@ impl PollPeers {
             };
             let (body, stamp) = self.poll_one(&target, (budget.min(left), left < budget)).await?;
             let peer = target.peer.to_owned();
-            // Ages first, so a row dropped for its age never takes a provider slot.
-            let (aged, rejected) = reexpress_peer_ages(stamp_origin(parse(&body), &peer), stamp.date, &peer);
-            let observations = {
-                let mut slots = self.slots.0.lock().unwrap_or_else(PoisonError::into_inner);
-                bound_peer(aged, &peer, slots.entry(peer.clone()).or_default())
-            };
-            Some((peer, observations, rejected, stamp))
+            let (parsed, malformed) = parse_peer_frame(&body);
+            let (observations, rejected) = reexpress_peer_ages(stamp_origin(parsed, &peer), stamp.date, &peer);
+            Some((peer, observations, rejected, malformed, stamp))
         });
 
         // A failed peer is absent, not empty, so silence stays distinct from nothing to report.
         let mut done = futures::stream::iter(fetches).buffer_unordered(self.dial_concurrency(sites.len()));
         while let Some(result) = done.next().await {
-            if let Some((peer, observations, rejected, stamp)) = result {
-                publish(peer, observations, rejected, stamp);
+            if let Some((peer, observations, rejected, malformed, stamp)) = result {
+                publish(peer, observations, rejected, malformed, stamp);
             }
         }
     }
@@ -1913,7 +1970,7 @@ impl PollPeers {
     pub async fn fetch_providers(
         &self,
         site: &PeerSite,
-    ) -> Option<(Vec<crate::site_providers::WireProvider>, Option<String>)> {
+    ) -> Option<(Vec<crate::site_providers::WireProvider>, Option<String>, Option<String>)> {
         let url = with_path(&site.url, crate::site_providers::PROVIDERS_PATH)?;
         let transport = self
             .peer_transport(&site.name, &site.pins, site.alias())
@@ -1934,13 +1991,25 @@ impl PollPeers {
         .await
         .ok()?;
         let (body, stamp) = answer?;
-        read_catalog(&site.name, &body, stamp.providers_contract.as_deref())
-            .map(|providers| (providers, stamp.providers_version))
+        read_catalog(
+            &site.name,
+            &body,
+            stamp.providers_contract.as_deref(),
+            stamp.providers_admission_contract.as_deref(),
+            stamp.providers_version.as_deref(),
+        )
+        .map(|providers| (providers, stamp.providers_version, stamp.providers_admission_contract))
     }
 }
 
 /// `peer`'s providers from `body`, `None` for an unsupported contract or a body the reader refuses.
-fn read_catalog(peer: &str, body: &str, contract: Option<&str>) -> Option<Vec<crate::site_providers::WireProvider>> {
+fn read_catalog(
+    peer: &str,
+    body: &str,
+    contract: Option<&str>,
+    admission_contract: Option<&str>,
+    version: Option<&str>,
+) -> Option<Vec<crate::site_providers::WireProvider>> {
     if !crate::site_providers::reads_contract(contract) {
         tracing::warn!(
             peer,
@@ -1953,7 +2022,68 @@ fn read_catalog(peer: &str, body: &str, contract: Option<&str>) -> Option<Vec<cr
     if providers.is_none() {
         tracing::warn!(peer, bytes = body.len(), "peer providers body refused");
     }
+    if !admission_contract_supported(peer, admission_contract) {
+        return None;
+    }
+    if !source_ranked_catalog_valid(peer, admission_contract, providers.as_deref()) {
+        return None;
+    }
+    if !catalog_version_valid(peer, body, admission_contract, version) {
+        return None;
+    }
     providers
+}
+
+/// Whether `peer` advertises an admission contract this reader understands.
+fn admission_contract_supported(peer: &str, contract: Option<&str>) -> bool {
+    if contract.is_none_or(|value| value.parse::<u32>().ok() == Some(crate::site_providers::ADMISSION_CONTRACT_VERSION))
+    {
+        return true;
+    }
+    tracing::warn!(peer, ?contract, "peer provider-admission contract unsupported");
+    false
+}
+
+/// Source-ranked catalogs require complete, valid identity and signal generations.
+fn source_ranked_catalog_valid(
+    peer: &str,
+    contract: Option<&str>,
+    providers: Option<&[crate::site_providers::WireProvider]>,
+) -> bool {
+    let invalid = contract.is_some()
+        && providers.is_some_and(|records| {
+            records.iter().any(|provider| {
+                provider
+                    .admission_rank
+                    .as_ref()
+                    .is_none_or(|rank| rank.uid.trim().is_empty() || rank.created_at_ns < 0)
+                    || provider
+                        .spec_generation
+                        .is_none_or(|generation| generation == 0 || generation > grid_signals::revision::MAX_GENERATION)
+            })
+        });
+    if invalid {
+        tracing::warn!(
+            peer,
+            "peer source-ranked catalog has a missing or invalid identity or spec generation"
+        );
+    }
+    !invalid
+}
+
+/// A supplied body version must match; source-ranked catalogs cannot omit the version.
+fn catalog_version_valid(peer: &str, body: &str, contract: Option<&str>, version: Option<&str>) -> bool {
+    match version {
+        Some(version) if version != crate::site_providers::body_version(body.as_bytes()) => {
+            tracing::warn!(peer, "peer provider catalog version does not match its body");
+            false
+        },
+        None if contract.is_some() => {
+            tracing::warn!(peer, "peer source-ranked catalog has no body version");
+            false
+        },
+        Some(_) | None => true,
+    }
 }
 
 /// `url` with its path replaced by `path` and no query, rebuilt through the URI parser.
@@ -2119,16 +2249,179 @@ const SLOT_MISSES: u32 = 12;
 /// Without it the cap keeps the first names in order every round, so a new provider that sorts
 /// early pushes out one that is serving.
 #[derive(Clone, Debug, Default)]
-pub struct PeerSlots(Arc<Mutex<HashMap<String, Slots>>>);
+pub struct PeerSlots(
+    Arc<Mutex<HashMap<String, Slots>>>,
+    Arc<Mutex<HashMap<String, RankedFenceHistory>>>,
+);
 
 impl PeerSlots {
+    /// Apply legacy receiver-local slot retention to one peer's rows.
+    pub fn bound_legacy(&self, peer: &str, observations: Vec<Observation>) -> Vec<Observation> {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        bound_peer(observations, peer, held.entry(peer.to_owned()).or_default())
+    }
+
+    /// Keep only rows for the source-authoritative provider labels in a matched catalog view.
+    pub fn bound_source_ranked(
+        &self,
+        peer: &str,
+        observations: Vec<Observation>,
+        admitted: &BTreeMap<String, BTreeMap<String, u64>>,
+    ) -> Vec<Observation> {
+        self.bound_source_ranked_with_status(peer, observations, admitted)
+            .observations
+    }
+
+    /// Filter a response and report any same-UID spec-generation mismatch.
+    pub fn bound_source_ranked_with_status(
+        &self,
+        peer: &str,
+        observations: Vec<Observation>,
+        admitted: &BTreeMap<String, BTreeMap<String, u64>>,
+    ) -> SourceRankedResult {
+        let (projected, mut malformed_batch) = retain_complete_batches_checked(project_peer(observations, peer));
+        let mut batches = BTreeMap::<String, Vec<Observation>>::new();
+        for observation in projected {
+            if let Some(provider) = observation.labels.get(PROVIDER_LABEL) {
+                batches.entry(provider.clone()).or_default().push(observation);
+            }
+        }
+        let mut histories = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        let history = histories.entry(peer.to_owned()).or_default();
+        let mut kept = Vec::new();
+        let mut accepted_payloads = Vec::new();
+        let mut spec_generation_mismatch = false;
+        for (provider, batch) in batches {
+            let Some(metadata) = batch.iter().find(|row| row.metric == grid_signals::revision::METRIC) else {
+                // Legacy parsing permits unversioned gauges; ranked providers require metadata.
+                malformed_batch |= admitted.contains_key(&provider);
+                continue;
+            };
+            let Some(uids) = admitted.get(&provider) else {
+                if metadata
+                    .labels
+                    .get(grid_signals::revision::SAMPLES_LABEL)
+                    .map(String::as_str)
+                    == Some("0")
+                    && metadata
+                        .labels
+                        .get(grid_signals::revision::UID_LABEL)
+                        .is_some_and(|uid| history.identities.contains_key(&(provider, uid.clone())))
+                {
+                    kept.push(metadata.clone());
+                }
+                continue;
+            };
+            let uid_matches = metadata
+                .labels
+                .get(grid_signals::revision::UID_LABEL)
+                .is_some_and(|uid| uids.contains_key(uid));
+            let expected_generation = metadata
+                .labels
+                .get(grid_signals::revision::UID_LABEL)
+                .and_then(|uid| uids.get(uid));
+            let generation_matches =
+                expected_generation.is_some_and(|generation| source_spec_generation(metadata) == Some(*generation));
+            if uid_matches && !generation_matches {
+                spec_generation_mismatch = true;
+            }
+            let samples = metadata
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .and_then(|value| value.parse::<usize>().ok());
+            if samples == Some(0) {
+                // Keep trusted ordering fences even when their provider has left the catalog.
+                kept.push(metadata.clone());
+            } else if uid_matches && generation_matches {
+                if let Some(uid) = metadata.labels.get(grid_signals::revision::UID_LABEL) {
+                    accepted_payloads.push((provider, uid.clone()));
+                }
+                kept.extend(batch);
+            } else {
+                // A complete batch from a replaced object must clear its previously learned rows.
+                kept.push(invalidation(metadata));
+            }
+        }
+        let accepted = !spec_generation_mismatch && !malformed_batch;
+        if accepted {
+            history.accept(admitted, accepted_payloads);
+        }
+        drop(histories);
+        if accepted {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).remove(peer);
+        }
+        SourceRankedResult {
+            observations: kept,
+            spec_generation_mismatch,
+            malformed_batch,
+        }
+    }
+
     /// Forget every site `keep` no longer names.
     pub fn retain_sites<Keep: Fn(&str) -> bool>(&self, keep: Keep) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|site, _| keep(site));
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|site, _| keep(site));
     }
+}
+
+/// Ordering-fence authority for identities whose payloads this receiver accepted.
+///
+/// At most twice the provider cap is retained. Identities outside the current catalog
+/// expire after twelve accepted ranked answers, independently of fence traffic; if
+/// churn reaches the cap sooner, the oldest retired identity is evicted first, with
+/// provider/UID order breaking ties. Rejected answers do not age or add authority.
+#[derive(Debug, Default)]
+struct RankedFenceHistory {
+    /// Previously accepted provider/UID identities and accepted answers since retirement.
+    identities: BTreeMap<(String, String), u32>,
+}
+
+impl RankedFenceHistory {
+    /// Commit authority only after the entire response passes ranked admission.
+    fn accept(&mut self, admitted: &BTreeMap<String, BTreeMap<String, u64>>, accepted_payloads: Vec<(String, String)>) {
+        let current =
+            |(provider, uid): &(String, String)| admitted.get(provider).is_some_and(|uids| uids.contains_key(uid));
+        self.identities.retain(|identity, misses| {
+            *misses = if current(identity) { 0 } else { misses.saturating_add(1) };
+            *misses < SLOT_MISSES
+        });
+        for identity in accepted_payloads {
+            self.identities.insert(identity, 0);
+        }
+        while self.identities.len() > MAX_PEER_PROVIDERS.saturating_mul(2) {
+            let oldest = self
+                .identities
+                .iter()
+                .filter(|(identity, _)| !current(identity))
+                .max_by_key(|(identity, misses)| (**misses, *identity))
+                .map(|(identity, _)| identity.clone());
+            let Some(oldest) = oldest else { break };
+            self.identities.remove(&oldest);
+        }
+    }
+}
+
+/// Result of filtering one response against its source-ranked provider catalog.
+#[derive(Debug)]
+pub struct SourceRankedResult {
+    /// Complete metric batches authorized by the supplied catalog.
+    pub observations: Vec<Observation>,
+    /// Whether any batch for a catalog UID had a different spec generation.
+    pub spec_generation_mismatch: bool,
+    /// Whether corrupt or incomplete ranked payload remained after deliberate projection.
+    pub malformed_batch: bool,
+}
+
+/// The positive spec generation encoded in a complete source publication's metadata value.
+fn source_spec_generation(metadata: &Observation) -> Option<u64> {
+    let generation = metadata.value.to_string().parse::<u64>().ok()?;
+    (generation > 0 && generation <= grid_signals::revision::MAX_GENERATION).then_some(generation)
 }
 
 /// One peer's provider slots.
@@ -2540,6 +2833,8 @@ fn relay_age(date_ms: i64, stamp_ms: i64) -> Option<Duration> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::crd::inference_provider::ConditionStatus;
 
@@ -2628,6 +2923,74 @@ mod tests {
             kept.first().and_then(|o| o.labels.get(SITE_LABEL)).map(String::as_str),
             Some("retail"),
             "a correctly labelled row survives and keeps its site"
+        );
+    }
+
+    #[test]
+    fn source_ranked_catalogs_require_every_provider_identity_to_be_complete() {
+        let provider = |admission_rank, spec_generation| crate::site_providers::WireProvider {
+            network_id: "net".to_owned(),
+            provider_id: "provider".to_owned(),
+            routing_cluster: "pool".to_owned(),
+            models: vec!["model".to_owned()],
+            tools: Vec::new(),
+            backend_kind: "local".to_owned(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            match_labels: BTreeMap::new(),
+            revision: 1,
+            spec_generation,
+            admission_rank,
+        };
+        let ranked = serde_json::json!({
+            "providers": [provider(
+                Some(crate::site_providers::AdmissionRank {
+                    created_at_ns: 1,
+                    uid: "provider-uid".to_owned(),
+                }),
+                Some(1),
+            )],
+            "truncated": false
+        })
+        .to_string();
+        let unranked = serde_json::json!({ "providers": [provider(None, None)], "truncated": false }).to_string();
+        let ranked_version = crate::site_providers::body_version(ranked.as_bytes());
+        let unranked_version = crate::site_providers::body_version(unranked.as_bytes());
+
+        assert!(
+            read_catalog("east", &ranked, Some("1"), Some("1"), Some(&ranked_version)).is_some(),
+            "a complete source-ranked view is accepted"
+        );
+        assert!(
+            read_catalog("east", &unranked, Some("1"), Some("1"), Some(&unranked_version)).is_none(),
+            "a partial ranked view cannot be used to select some providers"
+        );
+        assert!(
+            read_catalog("east", &unranked, Some("1"), None, Some(&unranked_version)).is_some(),
+            "a legacy catalog remains readable"
+        );
+        assert!(
+            read_catalog("east", &ranked, Some("1"), Some("2"), Some(&ranked_version)).is_none(),
+            "an unsupported extension is refused"
+        );
+        assert!(
+            read_catalog("east", &ranked, Some("1"), Some("1"), None).is_none(),
+            "a ranked catalog without a version cannot be paired safely"
+        );
+        assert!(
+            read_catalog("east", &ranked, Some("1"), Some("1"), Some("0000000000000000")).is_none(),
+            "a catalog whose version does not name its body is refused"
+        );
+    }
+
+    #[test]
+    fn a_source_ranked_catalog_without_spec_generation_is_not_authoritative() {
+        let body = r#"{"providers":[{"networkId":"net","providerId":"provider","routingCluster":"pool","models":["model"],"tools":[],"backendKind":"local","capacityWeight":1,"phase":"Available","matchLabels":{},"revision":1,"admissionRank":{"createdAtNs":1,"uid":"provider-uid"}}],"truncated":false}"#;
+        let version = crate::site_providers::body_version(body.as_bytes());
+
+        assert!(
+            read_catalog("east", body, Some("1"), Some("1"), Some(&version)).is_none(),
+            "a catalog without the provider spec generation cannot authorize cached prior-generation samples"
         );
     }
 
@@ -2748,8 +3111,40 @@ mod tests {
             .collect()
     }
 
+    /// A complete source publication with one gauge row and its Kubernetes object identity.
+    fn source_batch(provider: &str, uid: &str, sequence: u64, value: f64) -> Vec<Observation> {
+        source_batch_generation(provider, uid, 7, sequence, value)
+    }
+
+    fn source_batch_generation(
+        provider: &str,
+        uid: &str,
+        generation: u64,
+        sequence: u64,
+        value: f64,
+    ) -> Vec<Observation> {
+        parse(&format!(
+            "grid_provider_config_generation{{grid_site=\"retail\",grid_provider=\"{provider}\",provider_uid=\"{uid}\",publisher_epoch=\"1\",batch_sequence=\"{sequence}\",batch_samples=\"1\"}} {generation} 2000\n\
+             llm_d_epp_average_queue_size{{grid_site=\"retail\",grid_provider=\"{provider}\"}} {value} 2000\n"
+        ))
+    }
+
+    fn source_generations(provider: &str, uid: &str, generation: u64) -> BTreeMap<String, BTreeMap<String, u64>> {
+        BTreeMap::from([(provider.to_owned(), BTreeMap::from([(uid.to_owned(), generation)]))])
+    }
+
+    fn source_uids(provider: &str, uid: &str) -> BTreeMap<String, BTreeMap<String, u64>> {
+        source_generations(provider, uid, 7)
+    }
+
+    fn ingest_relay(receiver: &grid_signals::LoadStore, observations: &[Observation]) {
+        let wall = UNIX_EPOCH + Duration::from_secs(10);
+        let (body, ..) = render_contract_block(observations, &[], Duration::ZERO, wall);
+        receiver.ingest_at(&body, 10_000, 10_000, "retail");
+    }
+
     /// The providers `rows` name.
-    fn named(rows: &[Observation]) -> std::collections::BTreeSet<&str> {
+    fn named(rows: &[Observation]) -> BTreeSet<&str> {
         rows.iter()
             .filter_map(|row| row.labels.get(PROVIDER_LABEL).map(String::as_str))
             .collect()
@@ -2772,6 +3167,528 @@ mod tests {
             slots.held.len() <= MAX_PEER_PROVIDERS,
             "and no more slots are held than the cap"
         );
+    }
+
+    #[test]
+    fn legacy_receivers_with_different_histories_keep_different_sets_for_the_same_answer() {
+        let mut first_history = Slots {
+            held: serving()
+                .take(MAX_PEER_PROVIDERS)
+                .map(|provider| (provider, 0))
+                .collect(),
+            ..Slots::default()
+        };
+        let mut second_history = Slots {
+            held: serving()
+                .skip(1)
+                .take(MAX_PEER_PROVIDERS)
+                .map(|provider| (provider, 0))
+                .collect(),
+            ..Slots::default()
+        };
+        let answer = ready(serving().chain(["a000".to_owned()]));
+
+        let first = bound_peer(answer.clone(), "retail", &mut first_history);
+        let second = bound_peer(answer, "retail", &mut second_history);
+
+        assert_ne!(
+            named(&first),
+            named(&second),
+            "legacy admission is history-dependent and reproduces the issue"
+        );
+    }
+
+    #[test]
+    fn source_ranked_admission_converges_and_discards_legacy_slot_history() {
+        let history = |providers: Vec<String>| Slots {
+            held: providers.into_iter().map(|provider| (provider, 0)).collect(),
+            waiting: BTreeSet::default(),
+        };
+        let first = PeerSlots::default();
+        first
+            .0
+            .lock()
+            .expect("slot lock")
+            .insert("retail".to_owned(), history(serving().collect()));
+        let second = PeerSlots::default();
+        second.0.lock().expect("slot lock").insert(
+            "retail".to_owned(),
+            history((1..=MAX_PEER_PROVIDERS).map(|index| format!("p{index:03}")).collect()),
+        );
+        let admitted: BTreeMap<String, BTreeMap<String, u64>> = (0..MAX_PEER_PROVIDERS)
+            .map(|index| {
+                let provider = format!("p{index:03}");
+                (provider.clone(), BTreeMap::from([(format!("uid-{provider}"), 7)]))
+            })
+            .collect();
+        let answer: Vec<Observation> = (0..=MAX_PEER_PROVIDERS)
+            .map(|index| {
+                let provider = format!("p{index:03}");
+                source_batch(&provider, &format!("uid-{provider}"), 1, 1.0)
+            })
+            .chain([source_batch("a000", "uid-a000", 1, 1.0)])
+            .flatten()
+            .collect();
+
+        let first_rows = first.bound_source_ranked("retail", answer.clone(), &admitted);
+        let second_rows = second.bound_source_ranked("retail", answer, &admitted);
+
+        assert_eq!(
+            named(&first_rows),
+            named(&second_rows),
+            "source rank replaces receiver history"
+        );
+        assert_eq!(
+            named(&first_rows).len(),
+            MAX_PEER_PROVIDERS,
+            "the source limit is retained"
+        );
+        assert!(
+            !named(&first_rows).contains("a000"),
+            "a later-ranked early name cannot displace incumbents"
+        );
+        assert!(
+            !first.0.lock().expect("slot lock").contains_key("retail"),
+            "ranked admission discards legacy history"
+        );
+        assert!(
+            !second.0.lock().expect("slot lock").contains_key("retail"),
+            "ranked admission discards every local history"
+        );
+    }
+
+    #[test]
+    fn rendered_source_catalog_converges_receivers_with_different_slot_histories() {
+        let wire_provider = |id: String, created_at_ns: i128| crate::site_providers::WireProvider {
+            network_id: "net".to_owned(),
+            provider_id: id.clone(),
+            routing_cluster: id.clone(),
+            models: vec!["model".to_owned()],
+            tools: Vec::new(),
+            backend_kind: "local".to_owned(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            match_labels: BTreeMap::new(),
+            revision: 1,
+            spec_generation: Some(7),
+            admission_rank: Some(crate::site_providers::AdmissionRank {
+                created_at_ns,
+                uid: format!("uid-{id}"),
+            }),
+        };
+        let mut records: Vec<_> = (0..MAX_PEER_PROVIDERS)
+            .map(|index| wire_provider(format!("p{index:03}"), i128::try_from(index).expect("source rank fits")))
+            .collect();
+        records.push(wire_provider(
+            "a000".to_owned(),
+            i128::try_from(MAX_PEER_PROVIDERS).expect("source rank fits"),
+        ));
+        let source = crate::site_providers::LocalProviders::default();
+        source.replace("net", records);
+        let rendered = source
+            .rendered(crate::site_providers::Reader::Local)
+            .expect("source catalog is published");
+        assert_eq!(
+            rendered.admission_contract,
+            Some(crate::site_providers::ADMISSION_CONTRACT_VERSION),
+            "the complete immutable source ranks opt into deterministic admission"
+        );
+        let catalog_providers =
+            crate::site_providers::parse(std::str::from_utf8(&rendered.body).expect("catalog is UTF-8"))
+                .expect("source catalog parses");
+        let admitted: BTreeMap<_, BTreeMap<_, _>> = catalog_providers
+            .into_iter()
+            .filter_map(|provider_record| {
+                Some((
+                    provider_record.routing_cluster,
+                    provider_record.admission_rank?.uid,
+                    provider_record.spec_generation?,
+                ))
+            })
+            .fold(BTreeMap::new(), |mut by_cluster, (cluster, uid, generation)| {
+                by_cluster
+                    .entry(cluster)
+                    .or_insert_with(BTreeMap::new)
+                    .insert(uid, generation);
+                by_cluster
+            });
+        assert_eq!(admitted.len(), MAX_PEER_PROVIDERS, "the source provider cap is honored");
+        assert!(
+            !admitted.contains_key("a000"),
+            "the newer early name waits for the next source slot"
+        );
+
+        let history = |held_providers: Vec<String>| Slots {
+            held: held_providers.into_iter().map(|provider_id| (provider_id, 0)).collect(),
+            waiting: BTreeSet::default(),
+        };
+        let first = PeerSlots::default();
+        first
+            .0
+            .lock()
+            .expect("first slot lock")
+            .insert("east".to_owned(), history(serving().collect()));
+        let second = PeerSlots::default();
+        second.0.lock().expect("second slot lock").insert(
+            "east".to_owned(),
+            history(
+                (1..MAX_PEER_PROVIDERS)
+                    .map(|index| format!("p{index:03}"))
+                    .chain(["a000".to_owned()])
+                    .collect(),
+            ),
+        );
+        let answer: Vec<Observation> = serving()
+            .map(|provider_id| source_batch(&provider_id, &format!("uid-{provider_id}"), 1, 1.0))
+            .chain([source_batch("a000", "uid-a000", 1, 1.0)])
+            .flatten()
+            .collect();
+
+        let first_rows = first.bound_source_ranked("east", answer.clone(), &admitted);
+        let second_rows = second.bound_source_ranked("east", answer, &admitted);
+
+        assert_eq!(
+            named(&first_rows),
+            named(&second_rows),
+            "the actual source-ranked catalog makes different receiver histories converge"
+        );
+        let admitted_labels = admitted.keys().map(String::as_str).collect();
+        assert_eq!(
+            named(&first_rows),
+            admitted_labels,
+            "receivers accept exactly the catalog's routed labels"
+        );
+    }
+
+    #[test]
+    fn recreated_provider_rejects_old_uid_and_stale_invalidation_cannot_clear_new_uid() {
+        let receiver = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(30_000);
+
+        // The old provider is admitted while its catalog entry is current.
+        let old_allowed = source_uids("pool", "old-uid");
+        let old = source_batch("pool", "old-uid", 1, 1.0);
+        let admitted_old = PeerSlots::default().bound_source_ranked("retail", old, &old_allowed);
+        ingest_relay(&receiver, &admitted_old);
+        assert_eq!(
+            receiver
+                .latest("retail/pool", "llm_d_epp_average_queue_size")
+                .map(|sample| sample.value),
+            Some(1.0),
+            "the current provider's complete signal batch is initially usable"
+        );
+
+        // The catalog now names a replacement object. A newer old-UID batch is
+        // converted to an ordered invalidation, so its stale payload is not kept.
+        let replacement_allowed = source_uids("pool", "new-uid");
+        let stale_old = source_batch("pool", "old-uid", 2, 2.0);
+        let invalidated = PeerSlots::default().bound_source_ranked("retail", stale_old, &replacement_allowed);
+        assert_eq!(invalidated.len(), 1, "only the trusted revision fence survives");
+        assert_eq!(
+            invalidated
+                .first()
+                .expect("the invalidation fence is present")
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .map(String::as_str),
+            Some("0"),
+            "a complete batch for the replaced UID becomes an invalidation"
+        );
+        ingest_relay(&receiver, &invalidated);
+        assert!(
+            receiver.latest("retail/pool", "llm_d_epp_average_queue_size").is_none(),
+            "the invalidation retires the old provider's metrics"
+        );
+
+        // A current-UID publication restores data. A delayed old-UID
+        // invalidation has a lower source sequence and must not erase it.
+        let current = source_batch("pool", "new-uid", 3, 3.0);
+        let admitted_current = PeerSlots::default().bound_source_ranked("retail", current, &replacement_allowed);
+        ingest_relay(&receiver, &admitted_current);
+        assert_eq!(
+            receiver
+                .latest("retail/pool", "llm_d_epp_average_queue_size")
+                .map(|sample| sample.value),
+            Some(3.0),
+            "the replacement provider is admitted"
+        );
+
+        let delayed_old = source_batch("pool", "old-uid", 2, 99.0);
+        let stale_invalidation = PeerSlots::default().bound_source_ranked("retail", delayed_old, &replacement_allowed);
+        assert_eq!(stale_invalidation.len(), 1);
+        assert_eq!(
+            stale_invalidation
+                .first()
+                .expect("the stale invalidation fence is present")
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .map(String::as_str),
+            Some("0")
+        );
+        ingest_relay(&receiver, &stale_invalidation);
+        assert_eq!(
+            receiver
+                .latest("retail/pool", "llm_d_epp_average_queue_size")
+                .map(|sample| sample.value),
+            Some(3.0),
+            "LoadStore ordering rejects an older UID's invalidation after newer data"
+        );
+    }
+
+    #[test]
+    fn corrupt_ranked_payload_is_distinct_from_deliberate_metric_projection() {
+        let slots = PeerSlots::default();
+        let admitted = source_uids("pool", "uid");
+        let corrupt = slots.bound_source_ranked_with_status("retail", source_batch("pool", "uid", 1, -1.0), &admitted);
+        assert!(
+            corrupt.malformed_batch,
+            "refusing a corrupt payload must not silently promote its fence"
+        );
+        let mut projected = source_batch("pool", "uid", 2, 1.0);
+        for row in &mut projected {
+            if row.metric != grid_signals::revision::METRIC {
+                row.metric = "custom_pressure".to_owned();
+            }
+        }
+        let projected = slots.bound_source_ranked_with_status("retail", projected, &admitted);
+        assert!(
+            !projected.malformed_batch,
+            "deliberate name projection adjusts the batch count"
+        );
+        assert_eq!(projected.observations.len(), 1);
+        assert_eq!(
+            projected
+                .observations
+                .first()
+                .and_then(|row| row.labels.get(grid_signals::revision::SAMPLES_LABEL))
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn unversioned_ranked_payload_rejects_the_answer_without_aging_fence_authority() {
+        let slots = PeerSlots::default();
+        let old = source_uids("pool", "old-uid");
+        drop(slots.bound_source_ranked("retail", source_batch("pool", "old-uid", 1, 1.0), &old));
+        let replacement = source_uids("other", "other-uid");
+        let unversioned = || {
+            source_batch("other", "other-uid", 2, 1.0)
+                .into_iter()
+                .filter(|row| row.metric != grid_signals::revision::METRIC)
+                .collect()
+        };
+        for _ in 0..SLOT_MISSES {
+            let rejected = slots.bound_source_ranked_with_status("retail", unversioned(), &replacement);
+            assert!(rejected.malformed_batch);
+        }
+        assert_eq!(
+            slots
+                .bound_source_ranked("retail", source_fence("pool", "old-uid", 3), &replacement)
+                .len(),
+            1,
+            "malformed ranked payload does not age accepted fence authority"
+        );
+        let unknown = slots.bound_source_ranked_with_status("retail", unversioned(), &BTreeMap::new());
+        assert!(
+            !unknown.malformed_batch,
+            "out-of-catalog payload remains intentional projection"
+        );
+    }
+
+    #[test]
+    fn retired_provider_fences_survive_promotion_without_admitting_payload_or_unknown_uids() {
+        let slots = PeerSlots::default();
+        let allowed = source_uids("pool", "old-uid");
+        let receiver = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(30_000);
+        let accepted = slots.bound_source_ranked("retail", source_batch("pool", "old-uid", 1, 3.0), &allowed);
+        ingest_relay(&receiver, &accepted);
+        let replacement = source_uids("other", "other-uid");
+        assert!(slots.bound_source_ranked("retail", Vec::new(), &replacement).is_empty());
+        let cloned = slots.clone();
+        assert!(
+            cloned
+                .bound_source_ranked("retail", source_batch("pool", "old-uid", 2, 9.0), &replacement)
+                .is_empty(),
+            "a retired provider's payload cannot re-enter through fence authority"
+        );
+        assert!(
+            cloned
+                .bound_source_ranked("retail", source_fence("pool", "forged-uid", 3), &replacement)
+                .is_empty(),
+            "a provider name alone does not authorize a never-admitted identity"
+        );
+        assert!(
+            cloned
+                .bound_source_ranked("retail", source_fence("unknown", "old-uid", 3), &replacement)
+                .is_empty(),
+            "a UID alone does not authorize a different provider"
+        );
+        let fence = cloned.bound_source_ranked("retail", source_fence("pool", "old-uid", 4), &replacement);
+        assert_eq!(
+            fence.len(),
+            1,
+            "the retired identity's explicit fence survives after promotion"
+        );
+        ingest_relay(&receiver, &fence);
+        assert!(receiver.latest("retail/pool", "llm_d_epp_average_queue_size").is_none());
+        assert_eq!(
+            cloned
+                .bound_source_ranked("retail", source_fence("pool", "old-uid", 5), &replacement)
+                .len(),
+            1,
+            "a later response retains authority independently of the immediately prior catalog"
+        );
+        slots.retain_sites(|_| false);
+        assert!(
+            cloned
+                .bound_source_ranked("retail", source_fence("pool", "old-uid", 6), &replacement)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn retired_provider_fence_authority_expires_and_rejected_responses_do_not_age_it() {
+        let slots = PeerSlots::default();
+        let allowed = source_uids("pool", "old-uid");
+        drop(slots.bound_source_ranked("retail", source_batch("pool", "old-uid", 1, 1.0), &allowed));
+        let replacement = source_uids("other", "other-uid");
+        for sequence in 2..=u64::from(SLOT_MISSES).saturating_add(2) {
+            let rejected = slots.bound_source_ranked_with_status(
+                "retail",
+                source_batch_generation("other", "other-uid", 6, sequence, 1.0),
+                &replacement,
+            );
+            assert!(rejected.spec_generation_mismatch);
+        }
+        assert_eq!(
+            slots
+                .bound_source_ranked("retail", source_fence("pool", "old-uid", 20), &replacement)
+                .len(),
+            1,
+            "rejected answers neither consume the retention window nor replace its identities"
+        );
+        for sequence in 1..SLOT_MISSES {
+            assert_eq!(
+                slots
+                    .bound_source_ranked(
+                        "retail",
+                        source_fence("pool", "old-uid", 20_u64.saturating_add(u64::from(sequence))),
+                        &replacement
+                    )
+                    .len(),
+                1,
+                "valid fence traffic does not immediately discard retired authority"
+            );
+        }
+        assert!(
+            slots
+                .bound_source_ranked("retail", source_fence("pool", "old-uid", 40), &replacement)
+                .is_empty(),
+            "fence traffic cannot renew expired authority"
+        );
+    }
+
+    #[test]
+    fn ranked_fence_history_is_bounded_under_catalog_churn_and_unknown_fences() {
+        let slots = PeerSlots::default();
+        for round in 0..3 {
+            let admitted: BTreeMap<_, _> = (0..MAX_PEER_PROVIDERS)
+                .map(|index| {
+                    let provider = format!("p{round}-{index}");
+                    (provider.clone(), BTreeMap::from([(format!("uid-{provider}"), 7)]))
+                })
+                .collect();
+            let answer = admitted
+                .iter()
+                .flat_map(|(provider, uids)| source_batch(provider, uids.keys().next().expect("one uid"), 1, 1.0))
+                .collect();
+            drop(slots.bound_source_ranked("retail", answer, &admitted));
+            let history = slots.1.lock().expect("history lock");
+            let identities = &history.get("retail").expect("peer history").identities;
+            assert!(identities.len() <= MAX_PEER_PROVIDERS * 2);
+            if round == 2 {
+                assert!(!identities.keys().any(|(provider, _)| provider.starts_with("p0-")));
+                assert!(identities.keys().any(|(provider, _)| provider.starts_with("p1-")));
+            }
+            drop(history);
+        }
+        let unknown = (0..MAX_PEER_PROVIDERS * 3)
+            .flat_map(|index| source_fence(&format!("unknown-{index}"), "unknown-uid", 2))
+            .collect();
+        assert!(
+            slots
+                .bound_source_ranked("retail", unknown, &BTreeMap::new())
+                .is_empty()
+        );
+        assert!(
+            slots
+                .1
+                .lock()
+                .expect("history lock")
+                .get("retail")
+                .expect("peer history")
+                .identities
+                .len()
+                <= MAX_PEER_PROVIDERS * 2
+        );
+    }
+
+    /// A complete zero-payload ordering fence from the authenticated source.
+    fn source_fence(provider: &str, uid: &str, sequence: u64) -> Vec<Observation> {
+        source_batch(provider, uid, sequence, 0.0)
+            .iter()
+            .find(|row| row.metric == grid_signals::revision::METRIC)
+            .map(invalidation)
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn same_uid_cached_samples_from_a_prior_spec_generation_are_not_admitted() {
+        let allowed = source_generations("pool", "same-uid", 8);
+        let cached = source_batch_generation("pool", "same-uid", 7, 2, 7.0);
+        let slots = PeerSlots::default();
+        slots.0.lock().expect("slot lock").insert(
+            "retail".to_owned(),
+            Slots {
+                held: BTreeMap::from([("legacy-provider".to_owned(), 0)]),
+                waiting: BTreeSet::default(),
+            },
+        );
+
+        let rejected = slots.bound_source_ranked_with_status("retail", cached, &allowed);
+
+        assert!(rejected.spec_generation_mismatch);
+        assert_eq!(
+            rejected.observations.len(),
+            1,
+            "only the source ordering fence survives"
+        );
+        assert_eq!(
+            rejected.observations.first().map(|row| row.metric.as_str()),
+            Some(grid_signals::revision::METRIC),
+            "cached payload from the old spec generation is not admitted"
+        );
+        assert_eq!(
+            rejected
+                .observations
+                .first()
+                .and_then(|row| row.labels.get(grid_signals::revision::SAMPLES_LABEL))
+                .map(String::as_str),
+            Some("0"),
+            "the old generation is converted to a complete invalidation"
+        );
+        assert!(slots.0.lock().expect("slot lock").contains_key("retail"));
+
+        let current = source_batch_generation("pool", "same-uid", 8, 3, 8.0);
+        let admitted = slots.bound_source_ranked_with_status("retail", current, &allowed);
+        assert!(!admitted.spec_generation_mismatch);
+        assert_eq!(
+            admitted.observations.len(),
+            2,
+            "the catalog's current spec generation is admitted"
+        );
+        assert!(!slots.0.lock().expect("slot lock").contains_key("retail"));
     }
 
     #[test]
@@ -3715,6 +4632,56 @@ mod tests {
             );
             assert!(rows.iter().all(|row| row.timestamp_ms == metadata.timestamp_ms));
         }
+    }
+
+    #[tokio::test]
+    async fn raw_peer_collection_keeps_frame_validity_distinct_from_emptiness() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let valid = revision_text().replace(" 2000", &format!(" {date_ms}"));
+        let revision = valid.lines().next().expect("revision metadata");
+        for (body, expected_malformed) in [
+            (String::new(), false),
+            (revision.replace("batch_samples=\"2\"", "batch_samples=\"0\""), false),
+            (format!("{valid}{revision}\n"), true),
+            ("not exposition".to_owned(), true),
+        ] {
+            let peer = dated_peer("frame-validity", body, date.clone()).await;
+            let mut result = None;
+            one_attempt()
+                .collect_each_raw(&[peer], |_, _, _, malformed, _| result = Some(malformed))
+                .await;
+            assert_eq!(result, Some(expected_malformed));
+        }
+    }
+
+    #[test]
+    fn peer_frame_validation_distinguishes_malformed_empty_and_valid_fences() {
+        let valid = revision_text();
+        let metadata = valid.lines().next().expect("metadata").to_owned();
+        for text in [
+            format!("{valid}{metadata}\n"),
+            "not a sample".to_owned(),
+            "llm_d_epp_average_queue_size{grid_site=\"peer\",grid_provider=\"pool\"} NaN".to_owned(),
+            "llm_d_epp_average_queue_size{grid_site=\"peer\",grid_provider=\"pool\"} -1".to_owned(),
+            "llm_d_epp_average_kv_cache_utilization{grid_site=\"peer\",grid_provider=\"pool\"} 2".to_owned(),
+            format!("# TYPE {} counter\n{metadata}\n", grid_signals::revision::METRIC),
+            valid.replace("batch_samples=\"2\"", "batch_samples=\"3\""),
+            valid.replace("publisher_epoch=\"1\"", "publisher_epoch=\"0\""),
+        ] {
+            assert!(parse_peer_frame(&text).1, "malformed framing cannot look empty");
+        }
+        for text in [
+            String::new(),
+            "# intentionally empty\n".to_owned(),
+            valid,
+            metadata.replace("batch_samples=\"2\"", "batch_samples=\"0\""),
+        ] {
+            assert!(!parse_peer_frame(&text).1, "empty frames and fences are valid");
+        }
+        let (rows, malformed) = parse_peer_frame("# TYPE requests_total counter\nrequests_total 1\n");
+        assert!(rows.is_empty(), "intentional metric filtering is not malformed framing");
+        assert!(!malformed);
     }
 
     #[test]

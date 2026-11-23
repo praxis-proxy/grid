@@ -407,12 +407,14 @@ async fn main() {
                 signals_enabled.then(|| SignalsListener {
                     bind: config.signals.addr,
                     client: client.clone(),
+                    publication: Arc::clone(&ctx),
                     published: Published {
                         site: ctx.signals(),
                         peers: ctx.peers(),
                         rounds: ctx.peer_rounds(),
                         providers: ctx.local_providers(),
                         membership: ctx.membership().as_str(),
+                        ordered_publication: false,
                         feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
                     },
                     peer_identities: ctx.peer_identities(),
@@ -2333,6 +2335,8 @@ struct Published {
     providers: operator::site_providers::LocalProviders,
     /// This site's membership mode, named on every answer.
     membership: &'static str,
+    /// Whether settled startup reserved an ordered signal publisher for this source.
+    ordered_publication: bool,
 }
 
 /// What the signals listener needs from startup.
@@ -2341,6 +2345,8 @@ struct SignalsListener {
     bind: Option<SocketAddr>,
     /// Kube client, for this site's TLS material.
     client: Client,
+    /// The actual publisher reservation, inspected after startup settles.
+    publication: Arc<OperatorCtx>,
     /// What is served.
     published: Published,
     /// Keys peers have declared, and the labels held for each.
@@ -2364,13 +2370,13 @@ async fn run_signals_server(
     swim: SwimStartup,
     shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(listener) = listener else {
+    let Some(mut listener) = listener else {
         return Ok(());
     };
     // Peers learn this listener from the advertised address, so it waits for SWIM to settle.
-    let advertised = swim_settled(swim)
-        .await
-        .and_then(|handle| handle.signals_address().map(str::to_owned));
+    let swim = swim_settled(swim).await;
+    listener.published.ordered_publication = ordered_publication_capable(&listener.publication);
+    let advertised = swim.and_then(|handle| handle.signals_address().map(str::to_owned));
     let app = signals_app(listener.published.clone());
 
     // The opt-in listener rebinds on every material change, so a transient
@@ -2390,6 +2396,13 @@ async fn run_signals_server(
         }
     }
     Ok(())
+}
+
+/// Whether settled startup installed a publisher that can emit provider revision rows.
+///
+/// A configured mode or site name alone does not establish a reserved publisher.
+fn ordered_publication_capable(ctx: &OperatorCtx) -> bool {
+    ctx.publisher().is_some()
 }
 
 impl SignalsListener {
@@ -3271,14 +3284,31 @@ fn with_catalog_version(
     published: &Published,
     reader: operator::site_providers::Reader<'_>,
 ) -> axum::response::Response {
-    if let Some(version) = published
-        .providers
-        .version_for(reader)
-        .and_then(|version| http::HeaderValue::from_str(&version).ok())
+    if let Some(rendered) = published.providers.rendered(reader) {
+        if let Ok(version) = http::HeaderValue::from_str(&rendered.version) {
+            response
+                .headers_mut()
+                .insert(operator::site_providers::VERSION_HEADER, version);
+        }
+        response = with_admission_contract(
+            response,
+            rendered.admission_contract.filter(|_| published.ordered_publication),
+        );
+    }
+    response
+}
+
+/// Name the source-ranked admission extension only when the paired provider view is complete.
+fn with_admission_contract(
+    mut response: axum::response::Response,
+    admission_contract: Option<u32>,
+) -> axum::response::Response {
+    if let Some(contract) = admission_contract
+        && let Ok(value) = http::HeaderValue::from_str(&contract.to_string())
     {
         response
             .headers_mut()
-            .insert(operator::site_providers::VERSION_HEADER, version);
+            .insert(operator::site_providers::ADMISSION_CONTRACT_HEADER, value);
     }
     response
 }
@@ -3299,7 +3329,7 @@ async fn providers_handler(
     };
     let contract = operator::site_providers::CONTRACT_VERSION.to_string();
     // The version and the body come from one render, so the reader records what it read.
-    (
+    let response = (
         [
             (http::header::CONTENT_TYPE.as_str(), "application/json"),
             (operator::site_providers::CONTRACT_HEADER, contract.as_str()),
@@ -3307,7 +3337,11 @@ async fn providers_handler(
         ],
         rendered.body,
     )
-        .into_response()
+        .into_response();
+    with_admission_contract(
+        response,
+        rendered.admission_contract.filter(|_| published.ordered_publication),
+    )
 }
 
 /// This site's own gateway's read: the poller's rounds, then the site, then its peers, in one
@@ -3389,6 +3423,19 @@ async fn signals_identity(client: &Client) -> (Option<ServerTlsConfig>, Option<g
 /// The `GridNetwork` this operator serves, `None` when absent or unlistable.
 async fn sole_network(client: &Client) -> Option<GridNetwork> {
     Box::pin(operator::site_name::sole_network(client)).await.ok().flatten()
+}
+
+/// Refresh the receiver's one selected network without losing it to transient API failure.
+async fn selected_peer_network(client: &Client, selected: &mut Option<String>) -> Option<String> {
+    if let Ok(Ok(network)) = tokio::time::timeout(
+        PEER_AGES_WRITE_TIMEOUT,
+        Box::pin(operator::site_name::sole_network(client)),
+    )
+    .await
+    {
+        *selected = network.and_then(|network| network.metadata.name);
+    }
+    selected.clone()
 }
 
 /// TLS for the listener, or `None` when unconfigured or unreadable.
@@ -3599,6 +3646,9 @@ async fn run_peer_poller(
         catalogs: operator::peer_reach::PeerReach::none(&operator::peer_reach::CATALOGS),
         sites_written: false,
         catalog_versions: std::collections::HashMap::new(),
+        catalog_admission_contracts: std::collections::HashMap::new(),
+        pending_catalogs: std::collections::HashMap::new(),
+        selected_network: None,
         remembered: BTreeMap::new(),
         unanswered: BTreeSet::new(),
         turn: 0,
@@ -3612,6 +3662,321 @@ async fn run_peer_poller(
 /// last read.
 fn catalog_stale(named: Option<&str>, last_read: Option<&str>, scheduled: bool) -> bool {
     scheduled || named.is_some_and(|version| last_read != Some(version))
+}
+
+/// Whether this poll may use receiver-local legacy slots or the source's version-matched set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderAdmissionMode {
+    /// Both answers predate the source-ranked extension.
+    Legacy,
+    /// Both answers name the supported extension and the same catalog body.
+    SourceRanked,
+    /// The source views differ or an unsupported extension was advertised.
+    Unmatched,
+}
+
+/// One fetched peer catalog waiting for a signal answer that names its body version.
+#[derive(Clone, Debug)]
+struct PendingProviderCatalog {
+    /// Providers from the bounded, access-filtered body.
+    providers: Vec<operator::site_providers::WireProvider>,
+    /// The response header naming the exact body, absent only for a legacy response.
+    version: Option<String>,
+    /// The supported source-admission extension, absent for legacy providers.
+    admission_contract: Option<String>,
+}
+
+/// Contract and version headers attached to one provider catalog response.
+#[derive(Clone, Copy)]
+struct ProviderCatalogIdentity<'headers> {
+    /// Published provider-admission contract.
+    contract: Option<&'headers str>,
+    /// Digest of the exact response body.
+    version: Option<&'headers str>,
+}
+
+/// A peer signal response admitted against one catalog view.
+struct AdmittedPeerSignal {
+    /// Signal rows after applying the selected catalog's admission rules.
+    observations: Vec<operator::signals::Observation>,
+    /// Whether the catalog paired with these rows should replace the held catalog.
+    use_pending: bool,
+}
+
+/// Applies completed peer polls against their selected provider catalog versions.
+struct PeerSignalApply<'round> {
+    /// Shared provider signal store.
+    peers: &'round operator::signals::SignalStore,
+    /// Providers that have sent load rows.
+    heard: &'round operator::signals::LoadHeard,
+    /// Current peer provider catalogs.
+    catalogs: &'round operator::site_providers::PeerProviders,
+    /// Provider slot state used by legacy admission and source-ranked filtering.
+    slots: &'round operator::signals::PeerSlots,
+    /// Active `GridNetwork`, when one is selected.
+    active_network: Option<String>,
+    /// Signal TTL for the peer store.
+    ttl: std::time::Duration,
+    /// Catalog versions currently accepted for each peer.
+    catalog_versions: &'round mut std::collections::HashMap<String, String>,
+    /// Admission contracts currently accepted for each peer.
+    catalog_admission_contracts: &'round mut std::collections::HashMap<String, String>,
+    /// Catalogs staged until a matching signal response arrives.
+    pending_catalogs: &'round mut std::collections::HashMap<String, PendingProviderCatalog>,
+}
+
+impl PeerSignalApply<'_> {
+    /// Select and apply one peer's signal response, promoting a matching staged catalog afterward.
+    fn apply(
+        &mut self,
+        peer: &str,
+        offered_rows: Vec<operator::signals::Observation>,
+        malformed: bool,
+        stamp: &operator::metrics_scraper::Stamp,
+    ) {
+        if malformed {
+            tracing::warn!(
+                peer,
+                "malformed peer signal frame; retaining the prior catalog and signals"
+            );
+            return;
+        }
+        let Some(admitted) = self.admit(peer, offered_rows, stamp) else {
+            return;
+        };
+        self.heard.record(peer, &admitted.observations);
+        self.peers
+            .refresh(BTreeMap::from([(peer.to_owned(), admitted.observations)]), self.ttl);
+        if admitted.use_pending
+            && let Some(candidate) = self.pending_catalogs.remove(peer)
+        {
+            self.promote(peer, candidate);
+        }
+    }
+
+    /// Match one peer's signal and catalog versions, then filter the samples they authorize.
+    fn admit(
+        &self,
+        peer: &str,
+        offered_rows: Vec<operator::signals::Observation>,
+        stamp: &operator::metrics_scraper::Stamp,
+    ) -> Option<AdmittedPeerSignal> {
+        let signal_contract = stamp.providers_admission_contract.as_deref();
+        let catalog_contract = self.catalog_admission_contracts.get(peer).map(String::as_str);
+        let catalog_version = self.catalog_versions.get(peer).map(String::as_str);
+        let selection = select_provider_admission(
+            signal_contract,
+            stamp.providers_version.as_deref(),
+            catalog_contract,
+            catalog_version,
+            self.pending_catalogs.get(peer),
+        );
+        let admitted = match selection.mode {
+            ProviderAdmissionMode::Legacy if self.catalogs.holds(peer) || selection.use_pending => {
+                Some(self.slots.bound_legacy(peer, offered_rows))
+            },
+            ProviderAdmissionMode::SourceRanked => self.admit_ranked(peer, offered_rows, selection),
+            ProviderAdmissionMode::Legacy | ProviderAdmissionMode::Unmatched => None,
+        };
+        let Some(admitted_rows) = admitted else {
+            tracing::warn!(
+                peer,
+                mode = ?selection.mode,
+                signal_contract = ?signal_contract,
+                catalog_contract = ?catalog_contract,
+                signal_version = ?stamp.providers_version,
+                ?catalog_version,
+                "peer signals were not applied because their provider catalog view is not matched"
+            );
+            return None;
+        };
+        Some(AdmittedPeerSignal {
+            observations: admitted_rows,
+            use_pending: selection.use_pending,
+        })
+    }
+
+    /// Filter ranked rows against the exact selected catalog without advancing a malformed pair.
+    fn admit_ranked(
+        &self,
+        peer: &str,
+        offered_rows: Vec<operator::signals::Observation>,
+        selection: ProviderAdmissionSelection,
+    ) -> Option<Vec<operator::signals::Observation>> {
+        let network = self.active_network.as_deref()?;
+        let held_providers = (!selection.use_pending)
+            .then(|| self.catalogs.providers_for(peer))
+            .flatten();
+        let source_providers = if selection.use_pending {
+            self.pending_catalogs
+                .get(peer)
+                .map(|catalog| catalog.providers.as_slice())
+        } else {
+            held_providers.as_deref()
+        };
+        let allowed = source_ranked_provider_generations(source_providers.unwrap_or_default(), network);
+        let filtered = self.slots.bound_source_ranked_with_status(peer, offered_rows, &allowed);
+        if filtered.malformed_batch {
+            tracing::warn!(peer, "malformed ranked peer batch; retaining the prior pair");
+            return None;
+        }
+        if !selection.accepts_signal_generation(filtered.spec_generation_mismatch) {
+            tracing::warn!(
+                peer,
+                "peer signal/catalog digest matched but a provider spec generation did not; retaining the prior pair"
+            );
+            return None;
+        }
+        Some(filtered.observations)
+    }
+
+    /// Replace the held catalog with the staged catalog paired to the applied signals.
+    fn promote(&mut self, peer: &str, candidate: PendingProviderCatalog) {
+        self.catalogs.replace(peer, candidate.providers);
+        operator::metrics::record_peer_catalog(peer, "replaced");
+        match candidate.version {
+            Some(version) => self.catalog_versions.insert(peer.to_owned(), version),
+            None => self.catalog_versions.remove(peer),
+        };
+        match candidate.admission_contract {
+            Some(contract) => self.catalog_admission_contracts.insert(peer.to_owned(), contract),
+            None => self.catalog_admission_contracts.remove(peer),
+        };
+    }
+}
+
+/// Select whether signal rows can use the receiver's legacy catalog or its version-matched view.
+fn provider_admission_mode(
+    signal_contract: Option<&str>,
+    catalog_contract: Option<&str>,
+    signal_version: Option<&str>,
+    catalog_version: Option<&str>,
+) -> ProviderAdmissionMode {
+    match (signal_contract, catalog_contract) {
+        (None, None) => ProviderAdmissionMode::Legacy,
+        (Some(signal), Some(catalog))
+            if signal.parse::<u32>().ok() == Some(operator::site_providers::ADMISSION_CONTRACT_VERSION)
+                && catalog.parse::<u32>().ok() == Some(operator::site_providers::ADMISSION_CONTRACT_VERSION)
+                && signal_version.is_some_and(provider_version_is_digest)
+                && signal_version == catalog_version =>
+        {
+            ProviderAdmissionMode::SourceRanked
+        },
+        _ => ProviderAdmissionMode::Unmatched,
+    }
+}
+
+/// Whether a catalog header carries the 64-bit digest format used by provider responses.
+fn provider_version_is_digest(version: &str) -> bool {
+    version.len() == 16 && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether both legacy responses name the same catalog version, or both predate version headers.
+fn catalog_versions_match(signal_version: Option<&str>, catalog_version: Option<&str>) -> bool {
+    matches!((signal_version, catalog_version), (Some(signal), Some(catalog)) if signal == catalog)
+        || matches!((signal_version, catalog_version), (None, None))
+}
+
+/// Match a fetched catalog against one signal answer before promoting the catalog.
+fn pending_admission_mode(
+    signal_contract: Option<&str>,
+    catalog_contract: Option<&str>,
+    signal_version: Option<&str>,
+    catalog_version: Option<&str>,
+) -> ProviderAdmissionMode {
+    let mode = provider_admission_mode(signal_contract, catalog_contract, signal_version, catalog_version);
+    if mode == ProviderAdmissionMode::Unmatched {
+        return mode;
+    }
+    if catalog_versions_match(signal_version, catalog_version) {
+        mode
+    } else {
+        ProviderAdmissionMode::Unmatched
+    }
+}
+
+/// The accepted current or pending catalog view for one signals answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProviderAdmissionSelection {
+    /// The compatibility/admission path to use for the answer.
+    mode: ProviderAdmissionMode,
+    /// Whether the exact pending catalog should be promoted after its rows are applied.
+    use_pending: bool,
+}
+
+impl ProviderAdmissionSelection {
+    /// Refuse a source-ranked catalog promotion until its signal batches name matching generations.
+    fn accepts_signal_generation(self, spec_generation_mismatch: bool) -> bool {
+        self.mode != ProviderAdmissionMode::SourceRanked || !spec_generation_mismatch
+    }
+}
+
+/// Keep the current pair while it matches; otherwise use only a pending pair with the exact digest.
+fn select_provider_admission(
+    signal_contract: Option<&str>,
+    signal_version: Option<&str>,
+    current_contract: Option<&str>,
+    current_version: Option<&str>,
+    pending: Option<&PendingProviderCatalog>,
+) -> ProviderAdmissionSelection {
+    let current_mode = provider_admission_mode(signal_contract, current_contract, signal_version, current_version);
+    let current_mode =
+        if current_mode == ProviderAdmissionMode::Legacy && !catalog_versions_match(signal_version, current_version) {
+            ProviderAdmissionMode::Unmatched
+        } else {
+            current_mode
+        };
+    let pending_mode = pending.map_or(ProviderAdmissionMode::Unmatched, |candidate| {
+        pending_admission_mode(
+            signal_contract,
+            candidate.admission_contract.as_deref(),
+            signal_version,
+            candidate.version.as_deref(),
+        )
+    });
+    let use_pending =
+        current_mode == ProviderAdmissionMode::Unmatched && pending_mode != ProviderAdmissionMode::Unmatched;
+    ProviderAdmissionSelection {
+        mode: if use_pending { pending_mode } else { current_mode },
+        use_pending,
+    }
+}
+
+/// Whether a catalog read must be staged until it matches the signals contract that named it.
+fn catalog_read_requires_pair(
+    signal: ProviderCatalogIdentity<'_>,
+    current_contract: Option<&str>,
+    has_pending: bool,
+    fetched: ProviderCatalogIdentity<'_>,
+) -> bool {
+    let unversioned_legacy_source = signal.contract.is_none()
+        && signal.version.is_none()
+        && fetched.contract.is_none()
+        && fetched.version.is_none();
+    !unversioned_legacy_source
+        && (signal.contract.is_some()
+            || signal.version.is_some()
+            || current_contract.is_some()
+            || has_pending
+            || fetched.contract.is_some()
+            || fetched.version.is_some())
+}
+
+/// Metric labels admitted by the exact active-network catalog view.
+fn source_ranked_provider_generations(
+    providers: &[operator::site_providers::WireProvider],
+    network: &str,
+) -> BTreeMap<String, BTreeMap<String, u64>> {
+    let mut admitted = BTreeMap::<String, BTreeMap<String, u64>>::new();
+    for provider in providers.iter().filter(|provider| provider.network_id == network) {
+        if let (Some(rank), Some(generation)) = (&provider.admission_rank, provider.spec_generation) {
+            admitted
+                .entry(provider.routing_cluster.clone())
+                .or_default()
+                .insert(rank.uid.clone(), generation);
+        }
+    }
+    admitted
 }
 
 /// Rounds between reads of a peer's catalog, which changes with its providers, not its load.
@@ -3645,6 +4010,12 @@ struct PeerPoller {
     sites_written: bool,
     /// Each peer's catalog version as last read, so a changed one is read in the next round.
     catalog_versions: std::collections::HashMap<String, String>,
+    /// Each peer's source-admission extension, absent for legacy catalog producers.
+    catalog_admission_contracts: std::collections::HashMap<String, String>,
+    /// Versioned catalogs kept out of candidate selection until a signal answer names them.
+    pending_catalogs: std::collections::HashMap<String, PendingProviderCatalog>,
+    /// The last successfully selected receiver network, retained across transient API failure.
+    selected_network: Option<String>,
     /// Each peer where it was last polled, so one SWIM no longer lists is still polled there.
     remembered: BTreeMap<String, operator::signals::PeerSite>,
     /// Peers polled last round that did not answer, polled last and briefly.
@@ -3909,28 +4280,54 @@ impl PeerPoller {
         let heard = self.ctx.load_heard();
         heard.retain_sites(|site| identities.knows(site));
         self.ctx.peer_slots().retain_sites(|site| identities.knows(site));
+        let catalogs = self.ctx.peer_providers();
+        let slots = source.slots.clone();
+        let active_network = selected_peer_network(&self.client, &mut self.selected_network).await;
+        let mut catalog_versions = self.catalog_versions.clone();
+        let mut catalog_admission_contracts = self.catalog_admission_contracts.clone();
+        let mut pending_catalogs = self.pending_catalogs.clone();
         let ttl = self.settings.peer_ttl();
         let mut answered = BTreeMap::new();
         let mut modes = BTreeMap::new();
         let mut versions = std::collections::HashMap::<String, Option<String>>::new();
-        source
-            .collect_each(&sites, |peer, observations, rejected, stamp| {
-                answered.insert(peer.clone(), rejected);
-                modes.insert(peer.clone(), stamp.membership);
-                versions.insert(peer.clone(), stamp.providers_version);
-                heard.record(&peer, &observations);
-                peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
-            })
-            .await;
+        let mut admission_versions = std::collections::HashMap::<String, Option<String>>::new();
+        {
+            let mut apply_signals = PeerSignalApply {
+                peers: &peers,
+                heard: &heard,
+                catalogs: &catalogs,
+                slots: &slots,
+                active_network,
+                ttl,
+                catalog_versions: &mut catalog_versions,
+                catalog_admission_contracts: &mut catalog_admission_contracts,
+                pending_catalogs: &mut pending_catalogs,
+            };
+            source
+                .collect_each_raw(&sites, |peer, observations, rejected, malformed, stamp| {
+                    answered.insert(peer.clone(), rejected);
+                    modes.insert(peer.clone(), stamp.membership.clone());
+                    versions.insert(peer.clone(), stamp.providers_version.clone());
+                    admission_versions.insert(peer.clone(), stamp.providers_admission_contract.clone());
+                    if rejected > 0 {
+                        tracing::debug!(peer, rejected, "peer signal rows rejected during collection");
+                    }
+                    apply_signals.apply(&peer, observations, malformed, &stamp);
+                })
+                .await;
+        }
+        self.catalog_versions.clone_from(&catalog_versions);
+        self.catalog_admission_contracts
+            .clone_from(&catalog_admission_contracts);
+        self.pending_catalogs.clone_from(&pending_catalogs);
         // A round stood down by shutdown learned nothing, and writing would hold termination open.
         if self.shutdown.is_triggered() {
             return;
         }
         // Catalogs change rarely: a peer's is read when none is held, then every
         // CATALOG_ROUNDS rounds, within one round. A silent peer keeps what it last served.
-        let catalogs = self.ctx.peer_providers();
         let due = self.turn.is_multiple_of(CATALOG_ROUNDS);
-        let read_at = &self.catalog_versions;
+        let read_at = &catalog_versions;
         let stale = |site: &str| {
             catalog_stale(
                 versions.get(site).and_then(Option::as_deref),
@@ -3938,24 +4335,78 @@ impl PeerPoller {
                 due,
             )
         };
-        let wanted = sites
-            .iter()
-            .filter(|site| answered.contains_key(&site.name) && (stale(&site.name) || !catalogs.holds(&site.name)));
+        let admission_changed = |site: &str| {
+            admission_versions.get(site).map(Option::as_deref)
+                != Some(catalog_admission_contracts.get(site).map(String::as_str))
+        };
+        let wanted = sites.iter().filter(|site| {
+            answered.contains_key(&site.name)
+                && (stale(&site.name) || admission_changed(&site.name) || !catalogs.holds(&site.name))
+        });
         let concurrency = source.dial_concurrency(sites.len());
-        let Some(read) = read_catalogs(source, wanted, concurrency, &catalogs, &self.shutdown).await else {
+        let Some(read) = read_catalogs(source, wanted, concurrency, &self.shutdown).await else {
             return;
         };
-        // The version the providers answer itself named, not the one the signals answer did.
-        for (site, version) in read {
-            match version {
-                Some(version) => self.catalog_versions.insert(site, version),
-                None => self.catalog_versions.remove(&site),
-            };
+        // A source-ranked catalog is staged until a signal answer names the same version. This
+        // keeps the previous candidate set paired with its last accepted signal snapshot.
+        for (site, providers, version, admission_contract) in read {
+            let signal_contract = admission_versions.get(&site).and_then(Option::as_deref);
+            let signal_version = versions.get(&site).and_then(Option::as_deref);
+            let current_contract = catalog_admission_contracts.get(&site).map(String::as_str);
+            let has_pending = pending_catalogs.contains_key(&site);
+            let uses_source_admission = catalog_read_requires_pair(
+                ProviderCatalogIdentity {
+                    contract: signal_contract,
+                    version: signal_version,
+                },
+                current_contract,
+                has_pending,
+                ProviderCatalogIdentity {
+                    contract: admission_contract.as_deref(),
+                    version: version.as_deref(),
+                },
+            );
+            if uses_source_admission {
+                let same_as_held = version.as_deref() == catalog_versions.get(&site).map(String::as_str)
+                    && admission_contract.as_deref() == catalog_admission_contracts.get(&site).map(String::as_str)
+                    && catalogs.providers_for(&site).as_deref() == Some(providers.as_slice());
+                if same_as_held {
+                    operator::metrics::record_peer_catalog(&site, "unchanged");
+                    pending_catalogs.remove(&site);
+                } else {
+                    operator::metrics::record_peer_catalog(&site, "staged");
+                    pending_catalogs.insert(
+                        site,
+                        PendingProviderCatalog {
+                            providers,
+                            version,
+                            admission_contract,
+                        },
+                    );
+                }
+            } else {
+                catalogs.replace(&site, providers);
+                operator::metrics::record_peer_catalog(&site, "replaced");
+                match version {
+                    Some(version) => catalog_versions.insert(site.clone(), version),
+                    None => catalog_versions.remove(&site),
+                };
+                match admission_contract {
+                    Some(contract) => catalog_admission_contracts.insert(site.clone(), contract),
+                    None => catalog_admission_contracts.remove(&site),
+                };
+                pending_catalogs.remove(&site);
+            }
         }
         let urls: std::collections::HashMap<String, String> =
             sites.iter().map(|site| (site.name.clone(), site.url.clone())).collect();
         let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
-        self.catalog_versions.retain(|site, _| polled.contains(site));
+        catalog_versions.retain(|site, _| polled.contains(site));
+        catalog_admission_contracts.retain(|site, _| polled.contains(site));
+        pending_catalogs.retain(|site, _| polled.contains(site));
+        self.catalog_versions = catalog_versions;
+        self.catalog_admission_contracts = catalog_admission_contracts;
+        self.pending_catalogs = pending_catalogs;
         self.ctx
             .peer_providers()
             .retain_sites(|site| polled.iter().any(|polled| polled == site));
@@ -4003,17 +4454,24 @@ async fn read_catalogs(
     source: &operator::signals::PollPeers,
     wanted: impl Iterator<Item = &operator::signals::PeerSite>,
     concurrency: usize,
-    catalogs: &operator::site_providers::PeerProviders,
     shutdown: &operator::shutdown::Shutdown,
-) -> Option<Vec<(String, Option<String>)>> {
+) -> Option<
+    Vec<(
+        String,
+        Vec<operator::site_providers::WireProvider>,
+        Option<String>,
+        Option<String>,
+    )>,
+> {
     let read = std::sync::Mutex::new(Vec::new());
     let reads = futures::stream::iter(wanted).for_each_concurrent(concurrency, |site| async {
-        if let Some((providers, version)) = source.fetch_providers(site).await {
-            operator::metrics::record_peer_catalog(&site.name, "replaced");
-            catalogs.replace(&site.name, providers);
-            read.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((site.name.clone(), version));
+        if let Some((providers, version, admission_contract)) = source.fetch_providers(site).await {
+            read.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((
+                site.name.clone(),
+                providers,
+                version,
+                admission_contract,
+            ));
         } else {
             operator::metrics::record_peer_catalog(&site.name, "failed");
         }
@@ -4797,6 +5255,7 @@ mod tests {
             rounds: operator::signals::PeerRounds::default(),
             providers: operator::site_providers::LocalProviders::default(),
             membership: "Swim",
+            ordered_publication: false,
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
@@ -5335,17 +5794,26 @@ mod tests {
     /// A provider served to every site, and one only `tier=gold` sites may read.
     #[cfg(not(feature = "fips"))]
     fn open_and_gold() -> operator::site_providers::LocalProviders {
-        let provider = |id: &str, labels: BTreeMap<String, String>| operator::site_providers::WireProvider {
-            network_id: "net".to_owned(),
-            provider_id: id.to_owned(),
-            routing_cluster: id.to_owned(),
-            models: vec!["m".to_owned()],
-            tools: Vec::new(),
-            backend_kind: "local".to_owned(),
-            capacity_weight: 2,
-            phase: crdt::ProviderPhase::Available,
-            match_labels: labels,
-            revision: 1,
+        let provider = |id: &str, labels: BTreeMap<String, String>| {
+            operator::site_providers::WireProvider {
+                network_id: "net".to_owned(),
+                provider_id: id.to_owned(),
+                routing_cluster: id.to_owned(),
+                models: vec!["m".to_owned()],
+                tools: Vec::new(),
+                backend_kind: "local".to_owned(),
+                capacity_weight: 2,
+                phase: crdt::ProviderPhase::Available,
+                match_labels: labels,
+                revision: 1,
+                spec_generation: Some(1),
+                admission_rank: None,
+            }
+            .ranked(operator::site_providers::AdmissionRank {
+                created_at_ns: if id == "open" { 1 } else { 2 },
+                uid: format!("uid-{id}"),
+            })
+            .with_spec_generation(1)
         };
         let local = operator::site_providers::LocalProviders::default();
         local.replace(
@@ -5367,6 +5835,7 @@ mod tests {
             rounds: operator::signals::PeerRounds::default(),
             providers: open_and_gold(),
             membership: "Swim",
+            ordered_publication: true,
             feedback: operator::gateway_ages::GatewayFeedback::new(
                 stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0))),
                 operator::shutdown::Shutdown::never(),
@@ -5406,7 +5875,12 @@ mod tests {
             answering: true,
             alias: None,
         };
-        let (read, _) = poll.fetch_providers(&east).await.expect("east answered");
+        let (read, _, admission_contract) = poll.fetch_providers(&east).await.expect("east answered");
+        assert_eq!(
+            admission_contract.as_deref(),
+            Some("1"),
+            "the source exposes its ranked-admission extension"
+        );
         let ids: Vec<&str> = read.iter().map(|p| p.provider_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -5478,6 +5952,721 @@ mod tests {
         assert!(!catalog_stale(None, Some("a"), false), "no version, not due");
     }
 
+    #[test]
+    fn source_admission_requires_matching_supported_catalog_and_signal_versions() {
+        let version_a = "a".repeat(16);
+        let version_b = "b".repeat(16);
+        assert_eq!(
+            provider_admission_mode(None, None, None, None),
+            ProviderAdmissionMode::Legacy,
+            "old peers retain their receiver-local slot behavior"
+        );
+        assert_eq!(
+            provider_admission_mode(Some("1"), Some("1"), Some(&version_a), Some(&version_a)),
+            ProviderAdmissionMode::SourceRanked,
+            "a matched source catalog enables source-ranked admission"
+        );
+        for (signal_contract, catalog_contract, signal_version, catalog_version) in [
+            (Some("1"), Some("1"), Some(version_a.as_str()), Some(version_b.as_str())),
+            (Some("1"), None, Some(version_a.as_str()), Some(version_a.as_str())),
+            (None, Some("1"), Some(version_a.as_str()), Some(version_a.as_str())),
+            (Some("2"), Some("2"), Some(version_a.as_str()), Some(version_a.as_str())),
+            (Some("1"), Some("1"), None, None),
+            (Some("1"), Some("1"), Some("catalog-a"), Some("catalog-a")),
+        ] {
+            assert_eq!(
+                provider_admission_mode(signal_contract, catalog_contract, signal_version, catalog_version),
+                ProviderAdmissionMode::Unmatched,
+                "unpaired or unsupported source views must not be partially applied"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pending_catalog_promotes_only_for_its_exact_signal_version() {
+        let version_a = "a".repeat(16);
+        let version_b = "b".repeat(16);
+        assert_eq!(
+            pending_admission_mode(Some("1"), Some("1"), Some(&version_b), Some(&version_b)),
+            ProviderAdmissionMode::SourceRanked,
+            "a pending source-ranked catalog is usable only after its named signal arrives"
+        );
+        assert_eq!(
+            pending_admission_mode(Some("1"), Some("1"), Some(&version_a), Some(&version_b)),
+            ProviderAdmissionMode::Unmatched,
+            "a stale signal cannot promote a newer catalog"
+        );
+        assert_eq!(
+            pending_admission_mode(None, None, Some(&version_b), Some(&version_b)),
+            ProviderAdmissionMode::Legacy,
+            "a version-matched pre-extension catalog retains legacy slot semantics"
+        );
+        assert_eq!(
+            pending_admission_mode(None, None, None, None),
+            ProviderAdmissionMode::Legacy,
+            "a legacy source with no version headers remains compatible"
+        );
+        assert_eq!(
+            pending_admission_mode(None, None, Some(&version_a), Some(&version_b)),
+            ProviderAdmissionMode::Unmatched,
+            "even a legacy pending catalog needs matching body versions for promotion"
+        );
+    }
+
+    #[test]
+    fn the_accepted_catalog_pair_stays_active_until_the_pending_digest_is_named() {
+        let version_a = "a".repeat(16);
+        let version_b = "b".repeat(16);
+        let version_c = "c".repeat(16);
+        let pending = PendingProviderCatalog {
+            providers: Vec::new(),
+            version: Some(version_b.clone()),
+            admission_contract: Some("1".to_owned()),
+        };
+
+        let old_pair =
+            select_provider_admission(Some("1"), Some(&version_a), Some("1"), Some(&version_a), Some(&pending));
+        assert_eq!(
+            old_pair,
+            ProviderAdmissionSelection {
+                mode: ProviderAdmissionMode::SourceRanked,
+                use_pending: false,
+            },
+            "the previously accepted catalog remains paired with its matching signals"
+        );
+
+        let new_pair =
+            select_provider_admission(Some("1"), Some(&version_b), Some("1"), Some(&version_a), Some(&pending));
+        assert_eq!(
+            new_pair,
+            ProviderAdmissionSelection {
+                mode: ProviderAdmissionMode::SourceRanked,
+                use_pending: true,
+            },
+            "the pending catalog can be promoted only when its exact digest is named"
+        );
+
+        let mismatch =
+            select_provider_admission(Some("1"), Some(&version_c), Some("1"), Some(&version_a), Some(&pending));
+        assert_eq!(
+            mismatch,
+            ProviderAdmissionSelection {
+                mode: ProviderAdmissionMode::Unmatched,
+                use_pending: false,
+            },
+            "an answer naming neither held nor pending catalog leaves the accepted pair untouched"
+        );
+    }
+
+    #[test]
+    fn a_legacy_catalog_cannot_replace_an_active_pair_named_by_extended_signals() {
+        let version_a = "a".repeat(16);
+        let version_b = "b".repeat(16);
+        let fetched_legacy = PendingProviderCatalog {
+            providers: Vec::new(),
+            version: Some(version_b.clone()),
+            admission_contract: None,
+        };
+
+        assert!(
+            catalog_read_requires_pair(
+                ProviderCatalogIdentity {
+                    contract: Some("1"),
+                    version: Some(&version_a),
+                },
+                None,
+                false,
+                ProviderCatalogIdentity {
+                    contract: None,
+                    version: None,
+                },
+            ),
+            "an extended signals response requires pairing even when no extended catalog is held yet"
+        );
+        assert!(
+            catalog_read_requires_pair(
+                ProviderCatalogIdentity {
+                    contract: Some("1"),
+                    version: Some(&version_a),
+                },
+                Some("1"),
+                false,
+                ProviderCatalogIdentity {
+                    contract: None,
+                    version: None,
+                },
+            ),
+            "an existing extended catalog also keeps reads version-paired"
+        );
+        assert!(
+            !catalog_read_requires_pair(
+                ProviderCatalogIdentity {
+                    contract: None,
+                    version: None,
+                },
+                None,
+                false,
+                ProviderCatalogIdentity {
+                    contract: None,
+                    version: None,
+                },
+            ),
+            "a genuinely legacy source retains its legacy catalog update behavior"
+        );
+        let selection = select_provider_admission(
+            Some("1"),
+            Some(&version_b),
+            Some("1"),
+            Some(&version_a),
+            Some(&fetched_legacy),
+        );
+        assert_eq!(
+            selection,
+            ProviderAdmissionSelection {
+                mode: ProviderAdmissionMode::Unmatched,
+                use_pending: false,
+            },
+            "a mixed-version legacy catalog cannot replace the last accepted source-ranked view"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the rollback scenario is one staged-catalog state sequence"
+    )]
+    fn a_changed_legacy_catalog_promotes_after_a_staged_upgrade_rolls_back() {
+        let legacy_a = "a".repeat(16);
+        let upgraded = "b".repeat(16);
+        let legacy_b = "c".repeat(16);
+        let mut accepted_contract = None;
+        let mut accepted_version = Some(legacy_a);
+        let mut pending: Option<PendingProviderCatalog> = None;
+
+        let upgrade_answer = select_provider_admission(
+            Some("1"),
+            Some(&upgraded),
+            accepted_contract.as_deref(),
+            accepted_version.as_deref(),
+            pending.as_ref(),
+        );
+        assert_eq!(
+            upgrade_answer,
+            ProviderAdmissionSelection {
+                mode: ProviderAdmissionMode::Unmatched,
+                use_pending: false,
+            },
+            "the current legacy catalog remains active until its upgraded pair arrives"
+        );
+        pending = Some(PendingProviderCatalog {
+            providers: Vec::new(),
+            version: Some(upgraded),
+            admission_contract: Some("1".to_owned()),
+        });
+
+        let rollback_answer = select_provider_admission(
+            None,
+            Some(&legacy_b),
+            accepted_contract.as_deref(),
+            accepted_version.as_deref(),
+            pending.as_ref(),
+        );
+        assert_eq!(
+            rollback_answer,
+            ProviderAdmissionSelection {
+                mode: ProviderAdmissionMode::Unmatched,
+                use_pending: false,
+            },
+            "a changed legacy signal remains fail-closed until its own catalog is staged"
+        );
+        assert!(catalog_read_requires_pair(
+            ProviderCatalogIdentity {
+                contract: None,
+                version: Some(&legacy_b),
+            },
+            None,
+            true,
+            ProviderCatalogIdentity {
+                contract: None,
+                version: Some(&legacy_b),
+            }
+        ));
+        pending = Some(PendingProviderCatalog {
+            providers: Vec::new(),
+            version: Some(legacy_b.clone()),
+            admission_contract: None,
+        });
+
+        let recovered_legacy_answer = select_provider_admission(
+            None,
+            Some(&legacy_b),
+            accepted_contract.as_deref(),
+            accepted_version.as_deref(),
+            pending.as_ref(),
+        );
+        assert_eq!(
+            recovered_legacy_answer,
+            ProviderAdmissionSelection {
+                mode: ProviderAdmissionMode::Legacy,
+                use_pending: true,
+            },
+            "the exact version-matched rollback catalog replaces the older legacy view"
+        );
+        if recovered_legacy_answer.use_pending {
+            accepted_contract = pending.as_ref().and_then(|catalog| catalog.admission_contract.clone());
+            accepted_version = pending.as_ref().and_then(|catalog| catalog.version.clone());
+            pending = None;
+        }
+        assert_eq!(accepted_contract, None);
+        assert_eq!(accepted_version.as_deref(), Some(legacy_b.as_str()));
+        assert!(pending.is_none());
+        let stable_legacy_answer = select_provider_admission(
+            None,
+            accepted_version.as_deref(),
+            accepted_contract.as_deref(),
+            accepted_version.as_deref(),
+            None,
+        );
+        assert!(
+            !stable_legacy_answer.use_pending && stable_legacy_answer.mode == ProviderAdmissionMode::Legacy,
+            "the promoted legacy catalog remains active when its digest still matches"
+        );
+        assert!(!catalog_read_requires_pair(
+            ProviderCatalogIdentity {
+                contract: None,
+                version: None,
+            },
+            None,
+            true,
+            ProviderCatalogIdentity {
+                contract: None,
+                version: None,
+            },
+        ));
+    }
+
+    #[test]
+    fn a_matching_catalog_digest_does_not_promote_until_provider_generation_matches() {
+        let version_a = "a".repeat(16);
+        let version_b = "b".repeat(16);
+        let pending = PendingProviderCatalog {
+            providers: Vec::new(),
+            version: Some(version_b.clone()),
+            admission_contract: Some("1".to_owned()),
+        };
+        let allowed = BTreeMap::from([("pool".to_owned(), BTreeMap::from([("same-uid".to_owned(), 8)]))]);
+        let make_batch = |generation: f64, sequence: &str| {
+            let labels = || {
+                BTreeMap::from([
+                    (operator::signals::SITE_LABEL.to_owned(), "peer".to_owned()),
+                    (operator::signals::PROVIDER_LABEL.to_owned(), "pool".to_owned()),
+                ])
+            };
+            let mut revision_labels = labels();
+            revision_labels.insert(grid_signals::revision::UID_LABEL.to_owned(), "same-uid".to_owned());
+            revision_labels.insert(grid_signals::revision::EPOCH_LABEL.to_owned(), "1".to_owned());
+            revision_labels.insert(grid_signals::revision::SEQUENCE_LABEL.to_owned(), sequence.to_owned());
+            revision_labels.insert(grid_signals::revision::SAMPLES_LABEL.to_owned(), "1".to_owned());
+            vec![
+                operator::signals::Observation {
+                    metric: grid_signals::revision::METRIC.to_owned(),
+                    labels: revision_labels,
+                    value: generation,
+                    timestamp_ms: Some(2_000),
+                    age: std::time::Duration::ZERO,
+                },
+                operator::signals::Observation {
+                    metric: "llm_d_epp_average_queue_size".to_owned(),
+                    labels: labels(),
+                    value: generation,
+                    timestamp_ms: Some(2_000),
+                    age: std::time::Duration::ZERO,
+                },
+            ]
+        };
+        let mut accepted_version = Some(version_a.clone());
+        let mut pending_catalog = Some(pending);
+        let selection = select_provider_admission(
+            Some("1"),
+            Some(&version_b),
+            Some("1"),
+            accepted_version.as_deref(),
+            pending_catalog.as_ref(),
+        );
+        assert!(selection.use_pending, "the new digest has an exact staged catalog");
+        let mut accepted_signals = vec![42.0];
+        let stale = operator::signals::PeerSlots::default().bound_source_ranked_with_status(
+            "peer",
+            make_batch(7.0, "1"),
+            &allowed,
+        );
+        assert!(stale.spec_generation_mismatch);
+        if selection.accepts_signal_generation(stale.spec_generation_mismatch) && selection.use_pending {
+            accepted_version = pending_catalog.as_ref().and_then(|catalog| catalog.version.clone());
+            accepted_signals = stale
+                .observations
+                .iter()
+                .filter(|row| row.metric != grid_signals::revision::METRIC)
+                .map(|row| row.value)
+                .collect();
+            pending_catalog = None;
+        }
+        assert_eq!(accepted_version.as_deref(), Some(version_a.as_str()));
+        assert_eq!(accepted_signals, [42.0]);
+        assert_eq!(
+            pending_catalog.as_ref().and_then(|catalog| catalog.version.as_deref()),
+            Some(version_b.as_str()),
+            "the prior catalog and signal snapshot stay accepted while the new version remains pending"
+        );
+
+        let current = operator::signals::PeerSlots::default().bound_source_ranked_with_status(
+            "peer",
+            make_batch(8.0, "2"),
+            &allowed,
+        );
+        assert!(!current.spec_generation_mismatch);
+        if selection.accepts_signal_generation(current.spec_generation_mismatch) && selection.use_pending {
+            accepted_version = pending_catalog.as_ref().and_then(|catalog| catalog.version.clone());
+            accepted_signals = current
+                .observations
+                .iter()
+                .filter(|row| row.metric != grid_signals::revision::METRIC)
+                .map(|row| row.value)
+                .collect();
+            pending_catalog = None;
+        }
+        assert_eq!(accepted_version.as_deref(), Some(version_b.as_str()));
+        assert_eq!(accepted_signals, [8.0]);
+        assert!(pending_catalog.is_none());
+    }
+
+    #[test]
+    fn pending_catalog_is_retained_on_rejection_and_consumed_after_signal_admission() {
+        let provider = |name: &str| {
+            serde_json::from_value::<operator::site_providers::WireProvider>(serde_json::json!({
+                "networkId": "net", "providerId": name, "routingCluster": name,
+                "capacityWeight": 1, "phase": "Available", "revision": 1,
+                "specGeneration": 1, "admissionRank": { "createdAtNs": 1, "uid": "uid" }
+            }))
+            .expect("ranked provider fixture")
+        };
+        let peers = operator::signals::SignalStore::new();
+        let heard = operator::signals::LoadHeard::default();
+        let catalogs = operator::site_providers::PeerProviders::default();
+        let slots = operator::signals::PeerSlots::default();
+        catalogs.replace("peer", vec![provider("old")]);
+        let mut versions = std::collections::HashMap::from([("peer".to_owned(), "a".repeat(16))]);
+        let mut contracts = std::collections::HashMap::from([("peer".to_owned(), "1".to_owned())]);
+        let mut pending = std::collections::HashMap::from([(
+            "peer".to_owned(),
+            PendingProviderCatalog {
+                providers: vec![provider("new")],
+                version: Some("b".repeat(16)),
+                admission_contract: Some("1".to_owned()),
+            },
+        )]);
+        peers.refresh(
+            BTreeMap::from([(
+                "peer".to_owned(),
+                operator::signals::parse("llm_d_epp_ready_endpoints{grid_site=\"peer\",grid_provider=\"old\"} 42"),
+            )]),
+            std::time::Duration::from_secs(60),
+        );
+        let mut apply = PeerSignalApply {
+            peers: &peers,
+            heard: &heard,
+            catalogs: &catalogs,
+            slots: &slots,
+            active_network: Some("net".to_owned()),
+            ttl: std::time::Duration::from_secs(60),
+            catalog_versions: &mut versions,
+            catalog_admission_contracts: &mut contracts,
+            pending_catalogs: &mut pending,
+        };
+        assert_malformed_peer_frames_are_rejected(&mut apply);
+        apply.apply(
+            "peer",
+            Vec::new(),
+            false,
+            &operator::metrics_scraper::Stamp {
+                providers_version: Some("c".repeat(16)),
+                providers_admission_contract: Some("1".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            apply.pending_catalogs.contains_key("peer"),
+            "rejection keeps the pending catalog"
+        );
+        assert_eq!(apply.catalog_versions.get("peer"), Some(&"a".repeat(16)));
+        assert_eq!(
+            catalogs
+                .providers_for("peer")
+                .expect("held catalog")
+                .first()
+                .expect("one provider")
+                .provider_id,
+            "old"
+        );
+        apply.apply(
+            "peer",
+            Vec::new(),
+            false,
+            &operator::metrics_scraper::Stamp {
+                providers_version: Some("b".repeat(16)),
+                providers_admission_contract: Some("1".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !apply.pending_catalogs.contains_key("peer"),
+            "promotion consumes the pending catalog"
+        );
+        assert_eq!(apply.catalog_versions.get("peer"), Some(&"b".repeat(16)));
+        assert_eq!(
+            catalogs
+                .providers_for("peer")
+                .expect("promoted catalog")
+                .first()
+                .expect("one provider")
+                .provider_id,
+            "new"
+        );
+    }
+
+    /// Check that malformed or unversioned ranked frames keep both halves of the prior pair.
+    fn assert_malformed_peer_frames_are_rejected(apply: &mut PeerSignalApply<'_>) {
+        let revision = "grid_provider_config_generation{grid_site=\"peer\",grid_provider=\"new\",provider_uid=\"uid\",publisher_epoch=\"1\",batch_sequence=\"2\",batch_samples=\"0\"} 1 2000";
+        for text in [
+            format!("{revision}\n{revision}\n"),
+            format!(
+                "{}\n{revision}\n{revision}\n",
+                revision.replace("grid_provider=\"new\"", "grid_provider=\"old\"")
+            ),
+            revision.replace("batch_samples=\"0\"", "batch_samples=\"1\""),
+            "not exposition".to_owned(),
+        ] {
+            let (malformed_rows, malformed) = operator::signals::parse_peer_frame(&text);
+            assert!(malformed);
+            apply.apply(
+                "peer",
+                malformed_rows,
+                malformed,
+                &operator::metrics_scraper::Stamp {
+                    providers_version: Some("b".repeat(16)),
+                    providers_admission_contract: Some("1".to_owned()),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                apply.pending_catalogs.contains_key("peer"),
+                "malformed matched frames remain staged"
+            );
+            assert_eq!(apply.catalog_versions.get("peer"), Some(&"a".repeat(16)));
+            let (held_rows, _) = apply
+                .peers
+                .render(None, &[], None, operator::signals::ClockReading::now());
+            assert!(
+                held_rows.contains(" 42 "),
+                "malformed frames preserve the held signal snapshot"
+            );
+        }
+        let (unversioned, malformed) = operator::signals::parse_peer_frame(
+            "llm_d_epp_ready_endpoints{grid_site=\"peer\",grid_provider=\"new\"} 1 2000",
+        );
+        assert!(!malformed, "unversioned exposition remains valid for legacy readers");
+        apply.apply(
+            "peer",
+            unversioned,
+            malformed,
+            &operator::metrics_scraper::Stamp {
+                providers_version: Some("b".repeat(16)),
+                providers_admission_contract: Some("1".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            apply.pending_catalogs.contains_key("peer"),
+            "ranked payload requires a revision row"
+        );
+        assert_eq!(apply.catalog_versions.get("peer"), Some(&"a".repeat(16)));
+        let (held_rows, _) = apply
+            .peers
+            .render(None, &[], None, operator::signals::ClockReading::now());
+        assert!(
+            held_rows.contains(" 42 "),
+            "unversioned ranked payload retains prior signals"
+        );
+    }
+
+    #[test]
+    fn source_ranked_provider_generations_follow_the_access_filtered_active_network_catalog() {
+        let make_provider =
+            |network: &str, id: &str, cluster: &str, restricted: bool| operator::site_providers::WireProvider {
+                network_id: network.to_owned(),
+                provider_id: id.to_owned(),
+                routing_cluster: cluster.to_owned(),
+                models: vec!["model".to_owned()],
+                tools: Vec::new(),
+                backend_kind: "local".to_owned(),
+                capacity_weight: 1,
+                phase: crdt::ProviderPhase::Available,
+                match_labels: if restricted {
+                    BTreeMap::from([("tier".to_owned(), "gold".to_owned())])
+                } else {
+                    BTreeMap::new()
+                },
+                revision: 1,
+                spec_generation: Some(1),
+                admission_rank: Some(operator::site_providers::AdmissionRank {
+                    created_at_ns: 1,
+                    uid: format!("uid-{id}"),
+                }),
+            };
+        let local = operator::site_providers::LocalProviders::default();
+        local.replace(
+            "network-a",
+            vec![
+                make_provider("network-a", "a-first", "shared-cluster", false),
+                make_provider("network-a", "a-second", "shared-cluster", false),
+                make_provider("network-a", "a-hidden", "hidden-cluster", true),
+            ],
+        );
+        local.replace(
+            "network-b",
+            vec![make_provider("network-b", "b-only", "other-network-cluster", false)],
+        );
+        let reader = BTreeMap::new();
+        let rendered = local
+            .rendered(operator::site_providers::Reader::Peer(&reader))
+            .unwrap_or_else(|| std::process::abort());
+        let body = std::str::from_utf8(&rendered.body).unwrap_or_else(|_| std::process::abort());
+        let providers = operator::site_providers::parse(body).unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(
+            source_ranked_provider_generations(&providers, "network-a"),
+            BTreeMap::from([(
+                "shared-cluster".to_owned(),
+                BTreeMap::from([("uid-a-first".to_owned(), 1), ("uid-a-second".to_owned(), 1)]),
+            )]),
+            "duplicate provider records retain each authorized UID under their shared routing-cluster label"
+        );
+        assert!(
+            providers.iter().all(|provider| provider.provider_id != "a-hidden"),
+            "a provider hidden by source access labels is not admitted"
+        );
+        assert!(
+            !source_ranked_provider_generations(&providers, "network-a").contains_key("other-network-cluster"),
+            "a different GridNetwork cannot contribute signal labels"
+        );
+    }
+
+    #[tokio::test]
+    async fn ranked_publication_requires_a_reserved_publisher() {
+        for membership in [Membership::Local, Membership::Swim] {
+            let ctx = OperatorCtx::new(network_modes_client(None), None, SignalMode::Poll).with_membership(membership);
+            assert!(!ordered_publication_capable(&ctx));
+            assert!(ctx.set_publisher(grid_network::Publisher {
+                site: "source".to_owned(),
+                reservation: (1, 2),
+            }));
+            assert!(ordered_publication_capable(&ctx));
+        }
+    }
+
+    #[tokio::test]
+    async fn ranked_receiver_selects_its_network_without_a_local_publisher() {
+        let client = network_modes_client(Some(serde_json::json!({
+            "membership": {"mode": "Swim"}, "signalTransport": {"mode": "poll"}
+        })));
+        let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
+        assert!(ctx.publisher().is_none());
+        assert!(ctx.signal_network_name().is_none());
+        let mut selected = None;
+        assert_eq!(
+            selected_peer_network(&client, &mut selected).await.as_deref(),
+            Some("grid")
+        );
+        assert_eq!(selected.as_deref(), Some("grid"));
+        let missing = network_modes_client(None);
+        assert!(selected_peer_network(&missing, &mut selected).await.is_none());
+        assert!(selected.is_none(), "a successful deletion clears the previous network");
+        selected = Some("previous-grid".to_owned());
+        assert_eq!(
+            selected_peer_network(&client, &mut selected).await.as_deref(),
+            Some("grid")
+        );
+        assert_eq!(
+            selected.as_deref(),
+            Some("grid"),
+            "a successful lookup replaces the old network"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ranked_receiver_network_lookup_is_bounded_when_the_api_stalls() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                std::future::pending::<Result<http::Response<axum::body::Body>, std::convert::Infallible>>().await
+            }),
+            "default",
+        );
+        for previous in [None, Some("grid".to_owned())] {
+            let mut selected = previous.clone();
+            let started = tokio::time::Instant::now();
+            assert_eq!(selected_peer_network(&client, &mut selected).await, previous);
+            assert_eq!(selected, previous, "a timeout retains only previously known selection");
+            assert_eq!(started.elapsed(), PEER_AGES_WRITE_TIMEOUT);
+        }
+    }
+
+    #[tokio::test]
+    async fn ranked_receiver_network_lookup_retains_selection_on_api_error() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                Err::<http::Response<axum::body::Body>, _>(std::io::Error::other("injected API failure"))
+            }),
+            "default",
+        );
+        for previous in [None, Some("grid".to_owned())] {
+            let mut selected = previous.clone();
+            assert_eq!(selected_peer_network(&client, &mut selected).await, previous);
+            assert_eq!(
+                selected, previous,
+                "an API error retains only previously known selection"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn ranked_endpoint_headers_require_ordered_publication_on_both_paths() {
+        for ordered in [false, true] {
+            let mut published = serving_providers();
+            published.ordered_publication = ordered;
+            for caller in [Caller::Local, Caller::Peer(Some(BTreeMap::new()))] {
+                let catalog =
+                    providers_handler(axum::extract::State(published.clone()), axum::Extension(caller.clone())).await;
+                let signals = signals_handler(
+                    axum::extract::State(published.clone()),
+                    axum::Extension(caller),
+                    axum::extract::Query(Vec::new()),
+                )
+                .await;
+                let version = operator::site_providers::VERSION_HEADER;
+                assert!(catalog.headers().contains_key(version));
+                assert_eq!(catalog.headers().get(version), signals.headers().get(version));
+                for response in [catalog, signals] {
+                    let advertised = response
+                        .headers()
+                        .get(operator::site_providers::ADMISSION_CONTRACT_HEADER)
+                        .map(|value| value.to_str().expect("ASCII contract"));
+                    assert_eq!(advertised, ordered.then_some("1"));
+                }
+            }
+        }
+    }
+
     /// Every signals answer names the catalog version and the producer release.
     #[cfg(not(feature = "fips"))]
     #[tokio::test]
@@ -5500,11 +6689,18 @@ mod tests {
             alias: None,
         };
         let mut named = None;
+        let mut admission = None;
         poll.collect_each(std::slice::from_ref(&east), |_, _, _, stamp| {
             named = stamp.providers_version;
+            admission = stamp.providers_admission_contract;
         })
         .await;
         assert_eq!(named, expected);
+        assert_eq!(
+            admission.as_deref(),
+            Some("1"),
+            "signals and provider catalog share admission contract"
+        );
         drop(poll);
         server.await.expect("server task");
     }
@@ -5582,7 +6778,7 @@ mod tests {
             answering: true,
             alias: Some(("east-signals.grid.internal".to_owned(), addr.ip().to_string())),
         };
-        let (read, _) = poll
+        let (read, ..) = poll
             .fetch_providers(&east)
             .await
             .expect("east answered under its server name");
@@ -6632,6 +7828,9 @@ mod tests {
             catalogs: operator::peer_reach::PeerReach::none(&CATALOGS),
             sites_written: false,
             catalog_versions: std::collections::HashMap::default(),
+            catalog_admission_contracts: std::collections::HashMap::default(),
+            pending_catalogs: std::collections::HashMap::default(),
+            selected_network: None,
             remembered: BTreeMap::default(),
             unanswered: BTreeSet::default(),
             turn: 0,
@@ -7430,6 +8629,7 @@ mod tests {
             rounds: operator::signals::PeerRounds::default(),
             providers: operator::site_providers::LocalProviders::default(),
             membership: "Swim",
+            ordered_publication: false,
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         published.peers.refresh(
@@ -7784,6 +8984,7 @@ mod tests {
                 rounds: operator::signals::PeerRounds::default(),
                 providers: operator::site_providers::LocalProviders::default(),
                 membership: "Swim",
+                ordered_publication: false,
                 feedback,
             })
         }

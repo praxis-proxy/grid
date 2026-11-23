@@ -88,6 +88,10 @@ pub enum MetricsScrapeError {
     #[error("metrics response body is not valid UTF-8: {0}")]
     Encoding(std::string::FromUtf8Error),
 
+    /// A present provider-admission contract is undecodable or unsupported.
+    #[error("peer provider-admission contract is invalid or unsupported")]
+    InvalidAdmissionContract,
+
     /// TLS material could not be parsed or assembled into a valid configuration.
     #[error("metrics TLS material error: {0}")]
     TlsMaterial(String),
@@ -112,7 +116,7 @@ impl MetricsScrapeError {
             Self::NonOkStatus { status: 401 | 403, .. } => ScrapeClass::Unauthorized,
             Self::NonOkStatus { .. } => ScrapeClass::Http,
             Self::Transport(source) => transport_class(source.as_ref()),
-            Self::Encoding(_) => ScrapeClass::Parse,
+            Self::Encoding(_) | Self::InvalidAdmissionContract => ScrapeClass::Parse,
             Self::TlsMaterial(_) => ScrapeClass::Tls,
             Self::BodyTooLarge(_) => ScrapeClass::BodyCap,
             Self::InvalidUrl(_) | Self::HttpWithTls(_) | Self::Credential(_) | Self::PlaintextCredential(_) => {
@@ -247,6 +251,8 @@ pub struct Stamp {
     pub providers_version: Option<String>,
     /// Its providers contract version, on a providers answer.
     pub providers_contract: Option<String>,
+    /// Its source-ranked provider-admission extension, on a signals or providers answer.
+    pub providers_admission_contract: Option<String>,
 }
 
 /// GET `url` over `transport`, presenting `bearer` when given.
@@ -398,6 +404,23 @@ fn known_membership(header: Option<&str>) -> Option<String> {
         .map(|mode| mode.as_str().to_owned())
 }
 
+/// Distinguish an absent extension from a present value this reader must refuse.
+///
+/// RFC 9110 section 5.5 permits opaque header bytes; this version field requires
+/// a supported ASCII integer and cannot treat undecodable content as absence.
+fn admission_contract(headers: &http::HeaderMap) -> Result<Option<String>, MetricsScrapeError> {
+    let Some(value) = headers.get(crate::site_providers::ADMISSION_CONTRACT_HEADER) else {
+        return Ok(None);
+    };
+    let contract = value
+        .to_str()
+        .map_err(|_invalid_text| MetricsScrapeError::InvalidAdmissionContract)?;
+    if contract.parse::<u32>().ok() != Some(crate::site_providers::ADMISSION_CONTRACT_VERSION) {
+        return Err(MetricsScrapeError::InvalidAdmissionContract);
+    }
+    Ok(Some(contract.to_owned()))
+}
+
 /// Await `request`, then read a 2xx body from `url` and its `Date` header.
 async fn read_response(
     request: hyper_util::client::legacy::ResponseFuture,
@@ -420,6 +443,7 @@ async fn read_response(
         membership: known_membership(header(crate::signals::MEMBERSHIP_HEADER)),
         providers_version: header(crate::site_providers::VERSION_HEADER).map(|version| version.trim().to_owned()),
         providers_contract: header(crate::site_providers::CONTRACT_HEADER).map(str::to_owned),
+        providers_admission_contract: admission_contract(response.headers())?,
     };
 
     let body_bytes = Limited::new(response.into_body(), max_body)
@@ -571,6 +595,55 @@ mod tests {
         let text = result.unwrap_or_else(|_| std::process::abort());
         assert!(text.contains("test_metric"), "body must be in scrape result");
         let _ = body; // referenced for documentation
+    }
+
+    /// RFC 9110 section 5.5: opaque field content must not become an absent contract.
+    #[tokio::test]
+    async fn admission_contract_wire_values_do_not_downgrade_invalid_fields_to_legacy() {
+        /// A response and expected contract, or a refusal of the field value.
+        type WireCase = (&'static str, &'static [u8], Option<Option<&'static str>>);
+        let cases: [WireCase; 5] = [
+            ("absent", b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", Some(None)),
+            (
+                "supported",
+                b"HTTP/1.0 200 OK\r\nx-grid-provider-admission-contract: 1\r\nContent-Length: 0\r\n\r\n",
+                Some(Some("1")),
+            ),
+            (
+                "opaque",
+                b"HTTP/1.0 200 OK\r\nx-grid-provider-admission-contract: \x80\r\nContent-Length: 0\r\n\r\n",
+                None,
+            ),
+            (
+                "empty",
+                b"HTTP/1.0 200 OK\r\nx-grid-provider-admission-contract: \r\nContent-Length: 0\r\n\r\n",
+                None,
+            ),
+            (
+                "unsupported",
+                b"HTTP/1.0 200 OK\r\nx-grid-provider-admission-contract: 2\r\nContent-Length: 0\r\n\r\n",
+                None,
+            ),
+        ];
+        for (label, response, expected) in cases {
+            let url = start_test_server(response).await;
+            let transport = PeerTransport::new(None, None, None).unwrap_or_else(|_| std::process::abort());
+            let result = scrape_peer(&url, Duration::from_secs(5), &transport, 1024).await;
+            match expected {
+                Some(contract) => {
+                    let (_, stamp) = result.unwrap_or_else(|_| std::process::abort());
+                    assert_eq!(stamp.providers_admission_contract.as_deref(), contract, "{label}");
+                },
+                None => assert!(
+                    matches!(result, Err(MetricsScrapeError::InvalidAdmissionContract)),
+                    "{label} must fail instead of selecting legacy admission: {result:?}"
+                ),
+            }
+        }
+        assert_eq!(
+            MetricsScrapeError::InvalidAdmissionContract.class(),
+            crate::readiness::ScrapeClass::Parse
+        );
     }
 
     #[tokio::test]

@@ -121,8 +121,7 @@ static REGIONAL_POLICY_CANDIDATES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap_or_else(|_| std::process::abort())
 });
 
-/// Peer catalog reads by peer and outcome: `replaced` when a catalog landed, `failed` when
-/// the read did not.
+/// Peer catalog reads by peer and outcome: `staged`, `replaced`, `unchanged`, or `failed`.
 static PEER_CATALOG_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new("grid_peer_catalog_total", "Peer catalog reads by outcome"),

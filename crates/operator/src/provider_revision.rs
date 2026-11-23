@@ -38,8 +38,8 @@ pub(crate) async fn holds_fence(client: &Client, site: &str, high: u64) -> Resul
 
 /// Bind fresh samples, or an empty invalidation, to their collection snapshot.
 ///
-/// Aliased source objects cannot qualify the same routing provider. A metadata
-/// row never qualifies observations retained from an earlier collection pass.
+/// Ambiguous or unrepresentable source identities cannot publish unbound rows.
+/// A metadata row never qualifies observations retained from an earlier collection pass.
 pub(crate) fn qualify(
     collected: &mut HashMap<String, Vec<Observation>>,
     providers: &[InferenceProvider],
@@ -63,13 +63,15 @@ pub(crate) fn qualify(
         };
         let observations = collected.entry(identity.to_owned()).or_default();
         if identities.get(identity) != Some(&1) {
+            observations.clear();
             continue;
         }
         if observations.len() > revision::MAX_BATCH_SAMPLES {
             observations.clear();
         }
-        if let Some(metadata) = metadata(provider, epoch, sequence, observations.len()) {
-            observations.push(metadata);
+        match metadata(provider, epoch, sequence, observations.len()) {
+            Some(metadata) => observations.push(metadata),
+            None => observations.clear(),
         }
     }
 }
@@ -169,17 +171,45 @@ mod tests {
     }
 
     #[test]
-    fn aliased_providers_never_choose_an_arbitrary_source() -> Result<(), Box<dyn std::error::Error>> {
+    fn aliased_providers_clear_samples_without_choosing_an_arbitrary_source() -> Result<(), Box<dyn std::error::Error>>
+    {
         let first = provider()?;
         let mut second = first.clone();
         second.metadata.name = Some("other".to_owned());
         second.metadata.uid = Some("u2".to_owned());
         second.spec.cluster_name = Some("model".to_owned());
-        let mut collected = HashMap::new();
+        let sample = Observation {
+            metric: "llm_d_epp_average_queue_size".to_owned(),
+            labels: BTreeMap::new(),
+            value: 2.0,
+            timestamp_ms: None,
+            age: Duration::ZERO,
+        };
+        let mut collected = HashMap::from([("model".to_owned(), vec![sample])]);
         qualify(&mut collected, &[first, second], "net", 1, 1);
         assert!(
             collected.get("model").is_some_and(Vec::is_empty),
-            "clear old qualification on collision"
+            "ambiguous sources cannot leave unbound samples for the local Gateway"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_source_generation_clears_unqualified_samples() -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = provider()?;
+        source.metadata.generation = None;
+        let sample = Observation {
+            metric: "llm_d_epp_average_queue_size".to_owned(),
+            labels: BTreeMap::new(),
+            value: 2.0,
+            timestamp_ms: None,
+            age: Duration::ZERO,
+        };
+        let mut collected = HashMap::from([("model".to_owned(), vec![sample])]);
+        qualify(&mut collected, &[source], "net", 1, 1);
+        assert!(
+            collected.get("model").is_some_and(Vec::is_empty),
+            "samples without a source generation cannot be served as legacy data"
         );
         Ok(())
     }

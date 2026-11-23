@@ -7,7 +7,7 @@
 #   up     build and load the images, create the clusters, apply the topology stacks
 #   test   per mode in MODES: reset the grid namespace, install, assert
 #   down   delete the clusters
-#   selftest  check the HA verdicts against synthetic monitor logs, no cluster
+#   selftest  check qualification verdicts and local TLS probes, no cluster
 #
 # Env:
 #   MODES               legs to run (default "pin spiffe"): the peer trust modes, and
@@ -1101,14 +1101,42 @@ tls_refused() {
 }
 
 # refused_handshake <out prefix> <http code> [curl args...]: tls_refused, or a send failure
-# (exit 55) with no alert, where the same identity calling again with no body must be refused.
+# (exit 55) confirmed by a bodyless call or a read-only TLS probe of the same identity.
+# A reset alone is never evidence of authentication refusal.
 refused_handshake() {
   local out=$1 code=$2
   shift 2
+  rm -f -- "$out".nobody.* "$out".handshake.*
+  printf '%s\n' "$code" >"$out.http"
   tls_refused "$out" "$code" && return 0
   [[ $code == 000 && $(cat "$out.rc") == 55 ]] || return 1
   code=$(site_call "$out.nobody" /v1/models "$@")
-  tls_refused "$out.nobody" "$code"
+  printf '%s\n' "$code" >"$out.nobody.http"
+  tls_refused "$out.nobody" "$code" && return 0
+  [[ $code == 000 ]] || return 1
+  case $(cat "$out.nobody.rc") in 35 | 55 | 56) ;; *) return 1 ;; esac
+  confirm_tls_refusal "$out" "$@"
+}
+
+# Read a certificate-related peer alert without writing an HTTP request.
+confirm_tls_refusal() {
+  local out=$1 rc=0
+  shift
+  # shellcheck disable=SC2086
+  ${NET_PREFIX:-} python3 "$ROOT/scripts/tls_refusal_probe.py" \
+    --address "$SITE_GW_IP" --port 8080 --server-name "$SITE.grid.internal" \
+    --ca "$WORK/id/ca.crt" "$@" >"$out.handshake.out" 2>"$out.handshake.err" || rc=$?
+  printf '%s\n' "$rc" >"$out.handshake.rc"
+  [[ $rc == 0 ]]
+}
+
+# Preserve non-secret refusal receipts before WORK is removed by cleanup.
+keep_refusal_receipts() {
+  local out=$1 file dest="$ARTIFACTS/$MODE/tls-refusals"
+  mkdir -p "$dest"
+  for file in "$out".rc "$out".http "$out".err "$out".hdr "$out".nobody.* "$out".handshake.*; do
+    [[ ! -f $file ]] || cp "$file" "$dest/"
+  done
 }
 
 # refused_path <label> <want code> <path> [curl args...]: hub identity, no provider header.
@@ -1205,10 +1233,12 @@ assert_serving() {
   REFUSALS_FROM=$(date -u +%Y-%m-%dT%H:%M:%S)
   code=$(chat_body | site_call "$WORK/nocert" /v1/chat/completions -d @-)
   if refused_handshake "$WORK/nocert" "$code"; then
-    pass "anonymous caller: TLS alert, curl exit $(cat "$WORK/nocert.rc") ($(tr '\n' ' ' <"$WORK/nocert.err" | cut -c1-100))"
+    pass "anonymous caller: TLS refusal confirmed, initial curl exit $(cat "$WORK/nocert.rc") ($(tr '\n' ' ' <"$WORK/nocert.err" | cut -c1-100))"
   else
     fail "anonymous caller: HTTP $code, curl exit $(cat "$WORK/nocert.rc"), want a TLS alert ($(tr '\n' ' ' <"$WORK/nocert.err" | cut -c1-200))"
   fi
+
+  keep_refusal_receipts "$WORK/nocert"
 
   # The backend serves /health, so a 404 here is the gateway refusing it.
   refused_path "disallowed path /health" 404 /health
@@ -1231,6 +1261,7 @@ assert_serving() {
   else
     fail "enrolled identity the site does not trust: HTTP $code, curl exit $(cat "$WORK/rogue.rc") ($(tr '\n' ' ' <"$WORK/rogue.err" | cut -c1-200))"
   fi
+  keep_refusal_receipts "$WORK/rogue"
 }
 
 # ---------------------------------------------------------------------------
@@ -2480,6 +2511,48 @@ refutes() {
 
 ttr_of() { measure_ttr selftest t "$1" "$2" | tail -1 | cut -d= -f2; }
 
+# A reset must be confirmed independently; an HTTP answer must never become a TLS refusal.
+refusal_selftest() (
+  local out="$WORK/refusal-selftest" next_code=000 next_rc=55 probe_rc=0
+  local SITE_GW_IP=127.0.0.1
+  site_call() {
+    printf '%s\n' "$next_rc" >"$1.rc"
+    printf '%s\n' 'Send failure: Connection reset by peer' >"$1.err"
+    printf '%s' "$next_code"
+  }
+  confirm_tls_refusal() { printf '%s\n' 'fixture probe' >"$1.handshake.err"; return "$probe_rc"; }
+  printf '55\n' >"$out.rc"
+  printf '%s\n' 'Send failure: Connection reset by peer' >"$out.err"
+  if refused_handshake "$out" 000; then
+    pass "selftest reset followed by independently confirmed TLS refusal"
+  else
+    fail "selftest independently confirmed refusal was lost"
+  fi
+  probe_rc=1
+  if refused_handshake "$out" 000; then
+    fail "selftest reset alone was accepted as a TLS refusal"
+  else
+    pass "selftest reset alone is not authentication evidence"
+  fi
+  probe_rc=0
+  next_code=200
+  next_rc=0
+  if refused_handshake "$out" 000; then
+    fail "selftest HTTP success was hidden by a later refusal"
+  else
+    pass "selftest HTTP success cannot be hidden by a later refusal"
+  fi
+  printf 'stale\n' >"$out.handshake.err"
+  printf '35\n' >"$out.rc"
+  printf 'TLS alert certificate required\n' >"$out.err"
+  if refused_handshake "$out" 000 && [[ ! -e $out.handshake.err && ! -e $out.nobody.rc ]]; then
+    pass "selftest a direct alert cannot inherit the previous mode's probe receipts"
+  else
+    fail "selftest stale probe receipts crossed trust modes"
+  fi
+  ((FAILED == 0))
+)
+
 cmd_selftest() {
   MODE=selftest
   WORK=$(mktemp -d)
@@ -2531,6 +2604,8 @@ cmd_selftest() {
   refutes "a 200 carrying no providers" assert_catalog "selftest empty catalog" 100
 
   provider_scope_selftest
+  refusal_selftest
+  (cd "$ROOT" && python3 -B -m unittest scripts.test_tls_refusal_probe)
 
   rm -rf "$WORK"
   if ((FAILED)); then

@@ -82,9 +82,19 @@ is described in [Polling Cross-Site Load Signals](architecture/polling-metrics.m
 | `grid_collection_up` | gauge | `peer` | Whether the last poll of this peer succeeded. One missed poll reads 0 here while the condition still holds. |
 | `grid_peer_signals_reachable` | gauge | `peer` | 1 while the peer's `SignalsReachable` condition is True. It holds through three unanswered rounds, as the condition does, so alert on this one to agree with the status. |
 | `grid_peer_last_success_timestamp_seconds` | gauge | `peer` | Unix time of the last successful poll of this peer. |
-| `grid_peer_catalog_total` | counter | `peer`, `outcome` | Reads of the peer's providers catalog: `replaced` when a catalog landed, `failed` when the read did not. |
+| `grid_peer_catalog_total` | counter | `peer`, `outcome` | Peer provider-catalog reads by outcome; see below. |
 | `grid_peer_catalog_refused` | gauge | `peer` | 1 while the peer's last admission refused its catalog, which its `CatalogAccepted` condition reads False. |
 | `grid_peer_catalog_cut` | gauge | `peer` | 1 while part of the peer's catalog waits past this site's share of the overlay ceiling. |
+
+The `grid_peer_catalog_total` outcomes describe acceptance steps:
+
+- `replaced`: a staged catalog was promoted, or an unversioned legacy catalog
+  was accepted immediately. A scheduled legacy read can count here even when
+  its records have not changed.
+- `staged`: a catalog is waiting for a matching signals response. This can
+  include a versioned legacy catalog; it does not establish ranked admission.
+- `unchanged`: the contract, digest, and records match the accepted catalog.
+- `failed`: the read was refused or unavailable.
 
 Every series labelled `peer` is removed once the peer leaves the roster, so a renamed or
 deleted site does not keep stale series alive until restart.

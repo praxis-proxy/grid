@@ -45,6 +45,40 @@ Peers are dialled directly. The signals and providers path reads no
 TLS through untouched, and an egress proxy that terminates TLS breaks the
 mutual TLS the path depends on.
 
+## Provider admission with polled signals
+
+In poll mode, a peer also serves its bounded provider catalog at
+`/v1/site/providers`. New operators can use source-ranked admission when the
+catalog and signals response both advertise the supported
+`x-grid-provider-admission-contract` and name the same provider-body digest in
+`x-grid-providers-version`. The catalog records carry each visible Kubernetes
+provider's immutable creation time and UID. The serving site orders its bounded
+provider set by that rank, so new receivers derive the same set after restart
+instead of rebuilding independent slot histories.
+
+The extension applies only to the exact authenticated source, catalog digest,
+and access-filtered reader view. A reader keeps its last accepted catalog and
+signals together while a changed catalog awaits a signals response naming the
+same digest. Unsupported or incomplete ranked catalogs do not opt in. Older
+peers continue using receiver-local slot retention, including its 12-answer
+release rule. The source catalog and relay remain bounded; this contract does
+not guarantee that an arbitrary number of providers or signal rows fits in one
+response.
+
+Malformed revision frames do not refresh signals or promote a staged catalog.
+The receiver distinguishes these from a genuinely empty response and a valid
+zero-sample ordering fence. A malformed response retains the prior pair as a
+whole; independently valid fences in that response do not advance it.
+
+The receiver also keeps bounded authority for invalidation fences from recently
+accepted provider payloads after their UIDs leave the catalog. It permits only
+zero-sample fences, never their metric payloads. It holds at most 512
+provider/UID identities per peer, including identities still in the current catalog. Retired
+identities expire after 12 accepted ranked responses; if capacity is reached,
+the oldest retired identities are removed first. Fences do not renew this
+history. Failed responses do not age it, and removing a peer clears it. This
+cleanup history does not decide which providers receive payload admission.
+
 ## Gateway ingest feedback
 
 The local gateway reports completed ingests with an empty-body
