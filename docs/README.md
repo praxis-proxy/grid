@@ -1,9 +1,10 @@
-# Praxis Grid (AI Grid Network, AGN) Documentation
+# AI Grid Network (AGN) Documentation
 
-Praxis Grid, also called AI Grid Network (AGN), is a technical preview. The
-sections below are ordered for a first deployment: get a grid running, install
-it on your clusters, operate and route traffic, understand the design, then
-look up reference material. Contributor material is last.
+AI Grid Network (AGN), listed as Praxis Grid on the Praxis website, is a
+technical preview. The sections below are ordered for a first deployment: get a
+grid running, install it on your clusters, operate and route traffic,
+understand the design, then look up reference material. Contributor material is
+last.
 
 ## Getting Started
 
