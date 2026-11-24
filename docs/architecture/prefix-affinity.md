@@ -92,16 +92,30 @@ prefix_affinity:
   prefix_tokens_per_queued_request: 20000
 ```
 
+The new setting combines estimated prefill throughput
+(`prefill_tokens_per_second`) with estimated wait per queued request
+(`queued_request_seconds`):
+
+```text
+prefix_tokens_per_queued_request
+  = prefill_tokens_per_second * queued_request_seconds
+
+10,000 tokens/second * 2 seconds/queued request
+  = 20,000 tokens/queued request
+```
+
+Seconds cancel in the product. The value still reflects both timing estimates,
+but expresses how many matching prefix tokens justify one extra queued request.
+
 The two timing keys remain accepted for one release and log a deprecation
 warning when explicitly configured. Their defaults and original calculation
 remain unchanged, including `queued_request_seconds: 0`. A missing legacy key
 keeps its original default. Do not combine the new setting with either legacy
 key. Helm and the gateway reject mixed configurations.
 
-For ordinary timing values, the equivalent new value is
-`prefill_tokens_per_second * queued_request_seconds`. Legacy configurations
-retain the original division order during migration, preserving floating-point
-edge cases. Per-model costs and automatic calibration are separate work.
+Legacy configurations retain the original division order during migration,
+preserving floating-point edge cases. Per-model costs and automatic calibration
+are separate work.
 
 Each backend cluster has its own LRU, so traffic to one cluster cannot evict
 another cluster's entries. The replica's total entry capacity grows with the
