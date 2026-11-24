@@ -80,7 +80,8 @@ sequenceDiagram
 
 Enrollment grants identity, not liveness. The gossip mesh the GridNetwork
 configures carries which sites are live, and each member's GridSite converges
-to Active through it, as [Custom Resource Definitions](crds.md) describes.
+to Active through it, as [Custom Resource Definitions](../reference/crds.md)
+describes.
 
 ## Trust boundaries
 
@@ -190,4 +191,4 @@ token Secrets and revokes unused tokens when an admin deletes an invite.
 Standalone enrollment keeps its existing flow. The service enforces an optional
 key binding, but jurisdiction assignment and the approval gate remain pending.
 Redemption still issues immediately. See
-[SiteInvite usage](crds.md#siteinvite).
+[SiteInvite usage](../reference/crds.md#siteinvite).

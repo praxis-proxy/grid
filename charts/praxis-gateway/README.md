@@ -331,7 +331,7 @@ operator expects.
 | `praxisConfig.operator.configMapName` | string | `""` | Operator-created ConfigMap. Empty uses `praxis-consumer-config`. |
 | `praxisConfig.operator.allowUnauthenticatedExposure` | bool | `false` | Allow a LoadBalancer or NodePort Service for the operator's unauthenticated `praxis.yaml`. |
 | `praxisConfig.render.runtime.upstreamKeepalivePoolSize` | int | unset | Idle upstream connections each worker thread keeps, across every cluster, rendered as `runtime.upstream_keepalive_pool_size`. Praxis defaults to 64. Past the pool a finished connection closes instead of returning, so the next request to that backend pays a new connect and TLS handshake. Size it to the in-flight requests one replica sends a backend divided by its worker threads, at most 10000. Changing it rolls the pods. |
-| `praxisConfig.render.telemetry.enabled` | bool | `false` | Enable OTLP/gRPC export and W3C header propagation in generated `praxis.yaml`. Requires `praxisConfig.source: render` and `image.flavor: grid-gateway`. Configuration changes roll the pods. The tracked Grid build uses Praxis 0.7.3, which exports local HTTP and AI routing spans while forwarding W3C headers. Cross-gateway exported parentage requires the follow-up Praxis framework release described in [OpenTelemetry for Grid gateways](../../docs/architecture/opentelemetry.md). |
+| `praxisConfig.render.telemetry.enabled` | bool | `false` | Enable OTLP/gRPC export and W3C header propagation in generated `praxis.yaml`. Requires `praxisConfig.source: render` and `image.flavor: grid-gateway`. Configuration changes roll the pods. The tracked Grid build uses Praxis 0.7.3, which exports local HTTP and AI routing spans while forwarding W3C headers. Cross-gateway exported parentage requires the follow-up Praxis framework release described in [OpenTelemetry for Grid gateways](../../docs/operations/opentelemetry.md). |
 | `praxisConfig.render.telemetry.otlpEndpoint` | string | `""` | OTLP endpoint without URL userinfo, query, or fragment credentials. Omitted or empty uses `OTEL_EXPORTER_OTLP_ENDPOINT` from the container environment. If configured or generic/trace-specific exporter headers are present, the endpoint must explicitly use `https://`; scheme-less endpoints are rejected. |
 | `praxisConfig.render.telemetry.samplingRate` | number | unset | Root sampling probability, from `0.0` through `1.0`. |
 | `praxisConfig.render.telemetry.serviceName` / `serviceVersion` / `environment` | string | unset | OpenTelemetry resource attributes. |
@@ -619,7 +619,7 @@ as the Deployment itself, so
 to bring your own Role, for example from an installer that may not create
 RBAC; the Role to create, and what the grant still allows (`patch` is
 whole-object, not mounts-only), are in
-[Deployment access](../../docs/architecture/operations.md#deployment-access).
+[Deployment access](../../docs/operations/operations.md#deployment-access).
 The installer needs permission to create or update Roles and RoleBindings in
 this namespace and must pass Kubernetes' role-escalation and binding checks:
 it must already hold the granted `get` and `patch` permissions on the named

@@ -11,7 +11,7 @@ before planning cluster connectivity, provider deployment, and gateway roles.
 
 ## Guides
 
-- **[Adding an Inference Provider](../adding-provider.md)**:
+- **[Adding an Inference Provider](../operations/adding-provider.md)**:
   step-by-step workflow for adding in-cluster, existing-service, or
   external HTTPS providers to a running AGN installation.
 

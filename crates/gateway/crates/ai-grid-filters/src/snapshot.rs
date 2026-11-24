@@ -31,6 +31,10 @@ const UNHEALTHY: f64 = f64::NAN.abs();
 /// cluster, which may have come back while this one certainly fails. `total_cmp` orders
 /// positive NaNs by payload.
 const HELD: f64 = f64::from_bits(UNHEALTHY.to_bits() | 1);
+const _: () = assert!(
+    HELD.is_nan() && HELD.to_bits() > UNHEALTHY.to_bits(),
+    "a held candidate must sort after one on a down cluster"
+);
 
 /// A resolved, pre-ordered candidate list read atomically per request.
 #[derive(Debug)]
@@ -420,8 +424,7 @@ impl RouteSnapshot {
             return self;
         }
         self.demote_where(HELD, |candidate| {
-            held.iter()
-                .any(|(cluster, id)| *cluster == candidate.cluster && *id == candidate.stable_id)
+            held.contains(&(Arc::clone(&candidate.cluster), Arc::clone(&candidate.stable_id)))
         })
     }
 

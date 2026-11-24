@@ -40,7 +40,7 @@ Praxis AI handles:
 See `docs/architecture/overview.md` for the full
 design: CRDs, controllers, operational walkthrough,
 scoring model, and auth framework. See
-`docs/conventions.md` for coding style and policies.
+`docs/developing/conventions.md` for coding style and policies.
 
 ## Requirements
 
@@ -116,7 +116,7 @@ cargo xtask env status   # health of all components
 The separate `crates/gateway/` workspace contains `gateway`
 (the `grid-gateway` binary) and `ai-grid-filters`. Root
 Cargo workspace commands do not include it. See
-[the verification matrix](docs/development.md#verification)
+[the verification matrix](docs/developing/README.md#verification)
 for local and CI scopes; coverage currently gates root
 line coverage at 80% with documented exclusions.
 
@@ -157,7 +157,7 @@ Four provider modules each exposing `router()`:
 
 ## Conventions
 
-Full conventions in `docs/conventions.md`.
+Full conventions in `docs/developing/conventions.md`.
 
 ### Lint Discipline
 

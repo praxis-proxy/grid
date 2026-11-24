@@ -168,7 +168,7 @@ The operator uses a split RBAC model:
 
 These manifests grant no Deployment access; a gateway that delegates its
 Secret mounts grants `get` and `patch` on its own Deployment, as described under
-[Deployment access](../docs/architecture/operations.md#deployment-access).
+[Deployment access](../docs/operations/operations.md#deployment-access).
 To grant access to another namespace without regenerating:
 
 ```console
