@@ -549,8 +549,10 @@ impl ConfigWatch {
     #[must_use]
     pub fn spawn(client: Client, namespace: &str, name: &str, hosts: SignerHosts) -> Self {
         let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-        let events =
-            watcher(api, watcher::Config::default().fields(&format!("metadata.name={name}"))).default_backoff();
+        // Erase the watch state before moving it into the long-lived follow task.
+        let events = watcher(api, watcher::Config::default().fields(&format!("metadata.name={name}")))
+            .default_backoff()
+            .boxed();
         let (tx, rx) = tokio::sync::watch::channel(Arc::new(Snapshot::unread()));
         let what = format!("ConfigMap {namespace}/{name}");
         drop(tokio::spawn(follow(events, tx, Some(client), hosts, what)));
