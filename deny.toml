@@ -38,6 +38,19 @@ allow = ["MPL-2.0"]
 name = "foca"
 version = "*"
 
+# typify's code-generation backend uses MPL-2.0 version-ranges. Keep the
+# permission scoped to this dependency rather than allowing MPL globally.
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+name = "version-ranges"
+version = "=0.1.3"
+
+# typify's JSON Schema resolver uses this MIT No Attribution dependency.
+[[licenses.exceptions]]
+allow = ["MIT-0"]
+name = "borrow-or-share"
+version = "=0.2.4"
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
