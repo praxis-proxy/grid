@@ -1,4 +1,4 @@
-# Enforces the markdown rules documented in docs/conventions.md:
+# Enforces the markdown rules documented in docs/developing/conventions.md:
 # 80-column prose, fenced code blocks must declare a language.
 
 # MD013: 80-column prose; code blocks follow the 120-char code limit

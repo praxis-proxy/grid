@@ -34,7 +34,7 @@ and upgrade requirements.
 
 The operator exports each provider's resolved readings, not the raw engine
 series behind them. The series a gateway routes on travel over
-`/v1/site/signals`, described in [Signals](architecture/signals.md). A series
+`/v1/site/signals`, described in [Signals](../architecture/signals.md). A series
 the operator holds but does not name below never reaches `/metrics`.
 
 A metric with labels does not appear in a scrape until its first observation, so
@@ -69,7 +69,7 @@ from, and `grid_provider` the provider within it.
 ## Operator: polling peer sites
 
 One poll per peer per interval, so every series here is per peer. The poll path
-is described in [Polling Cross-Site Load Signals](architecture/polling-metrics.md).
+is described in [Polling Cross-Site Load Signals](../architecture/polling-metrics.md).
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -155,7 +155,7 @@ already did. Both fire above four fifths of a cap for five minutes:
 
 Certificate expiry is the one to alert on. Renewal starts when a third of the
 lifetime remains, so this falling toward now means renewal has been failing for
-a while. See [Site Identity](installation/enrollment.md).
+a while. See [Site Identity](../installation/enrollment.md).
 
 ## Gateway
 
@@ -221,7 +221,7 @@ topology. All three series read `NaN` after the pair leaves that topology.
 ## Gateway: polling the local operator
 
 Every site's load reaches the gateway through one poll of its local operator,
-described in [Site Selection](site-selection.md).
+described in [Site Selection](../site-selection.md).
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -234,7 +234,7 @@ described in [Site Selection](site-selection.md).
 ## Overlay-sync
 
 The sidecar that delivers the serving overlay to the gateway, described in
-[Routing](architecture/routing.md). One scrape per gateway pod.
+[Routing](../architecture/routing.md). One scrape per gateway pod.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|

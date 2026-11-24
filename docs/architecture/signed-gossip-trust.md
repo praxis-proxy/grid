@@ -136,7 +136,7 @@ it does not add network identities to the capability or tenant-spend formats.
 Signed gossip establishes which site sent a state update. It does not make the
 site routable. The operator still applies `GridSite` lifecycle, TLS trust,
 freshness, placement, and access-policy checks before provider state enters a
-gateway overlay. See [GridSite lifecycle and routing eligibility](crds.md#gridsite)
+gateway overlay. See [GridSite lifecycle and routing eligibility](../reference/crds.md#gridsite)
 for those checks.
 
 ## Implementation references

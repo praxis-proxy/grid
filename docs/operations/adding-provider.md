@@ -7,7 +7,7 @@ external HTTPS APIs.
 ## Prerequisites
 
 - A running AGN installation with `install.sh` (see the
-  [Existing-Cluster Helm Installation](installation/existing-clusters.md))
+  [Existing-Cluster Helm Installation](../installation/existing-clusters.md))
 - `kubectl`, `helm`, `jq`, `python3`, `yq` (v4.18.0+)
 - Cluster access via `KUBECONFIG` and `--context`
 - TLS Secrets (`consumer-tls`, `provider-tls`) already created
@@ -141,7 +141,7 @@ Required fields: `name`, `gridNetworkRef`, `providerKind`,
 Set `spec.tls` to share the provider CA bundle and optional client certificate
 across health checks, metrics scraping, and model discovery. Feature-specific
 TLS settings override it when an endpoint needs different trust material or a
-different client identity; see [TLS and mTLS](architecture/crds.md#tls-and-mtls).
+different client identity; see [TLS and mTLS](../reference/crds.md#tls-and-mtls).
 
 ### 4. Update provider Praxis config template
 
@@ -497,7 +497,7 @@ stays `Unavailable` and the overlay excludes it.
 
 For backends not managed by the `grid-mock-providers` chart, create a
 NetworkPolicy that permits these two sources. See
-[NetworkPolicy for Multiple Backends](installation/existing-clusters.md#networkpolicy-for-multiple-backends).
+[NetworkPolicy for Multiple Backends](../installation/existing-clusters.md#networkpolicy-for-multiple-backends).
 
 ## Troubleshooting
 

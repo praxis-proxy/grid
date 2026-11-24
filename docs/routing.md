@@ -63,7 +63,7 @@ Configuration snippets show the routing settings to add to an existing
 deployment. Provider snippets are partial resources: retain the required
 `backendKind`, `providerKind`, and `endpoint`, along with the capability,
 site, trust, and authentication settings for your deployment. See the
-[CRD Reference](architecture/crds.md) for complete resource examples.
+[CRD Reference](reference/crds.md) for complete resource examples.
 
 If `selectionPolicy` is omitted, Praxis uses deterministic selection. Set it
 explicitly when you want traffic sharing; `noMetrics` alone does not enable
@@ -520,7 +520,7 @@ The demo explicitly distinguishes two statuses:
 - **Metric-driven dynamic weighting:** experimental.
 
 For the field definition and overlay contract, see the
-[CRD Reference](architecture/crds.md) and
+[CRD Reference](reference/crds.md) and
 [Routing Architecture and Overlay Contract](architecture/routing.md).
 
 ---
@@ -829,7 +829,7 @@ appropriate ingress affinity when cross-request provider stickiness is required.
 
 **Praxis AI reference:**
 
-- [intelligent_route filter](https://github.com/praxis-proxy/ai/blob/main/docs/filters/intelligent_route.md)
+- [intelligent_route filter](https://github.com/praxis-proxy/ai/blob/main/docs/filters/routing/intelligent_route.md)
 
 ---
 
@@ -1374,11 +1374,11 @@ AGN:
 - [AGN documentation index](README.md)
 - [Routing Architecture and Overlay Contract](architecture/routing.md)
 - [Provider Scoring](architecture/scoring.md)
-- [CRD Reference](architecture/crds.md)
+- [CRD Reference](reference/crds.md)
 
 Praxis AI:
 
-- [`intelligent_route` filter](https://github.com/praxis-proxy/ai/blob/main/docs/filters/intelligent_route.md)
+- [`intelligent_route` filter](https://github.com/praxis-proxy/ai/blob/main/docs/filters/routing/intelligent_route.md)
 
 Runnable demos:
 

@@ -39,11 +39,11 @@ The remaining non-ASCII characters occur in 73 files and are intentional:
 The missing-data value is `DOWN_VALUE` in the dashboard's `SitePanel.tsx`.
 Changing it would change the UI contract. `crates/xtask/src/env.rs` uses a Unicode
 ellipsis to mark truncated evidence. The diagram characters are confined to
-`docs/adding-provider.md`, `docs/installation/existing-clusters.md`, and
-`crates/swim/src/crypto.rs`; `.github/workflows/tests.yaml` also matches the actual
-box-drawing output of `cargo tree`. The accented character in the dashboard
-metrics client's test and the euro sign in the MCP probe test exercise UTF-8
-byte boundaries. These are functional fixtures, not prose punctuation.
+`docs/operations/adding-provider.md`, `docs/installation/existing-clusters.md`,
+and `crates/swim/src/crypto.rs`; `.github/workflows/tests.yaml` also matches the
+actual box-drawing output of `cargo tree`. The accented character in the
+dashboard metrics client's test and the euro sign in the MCP probe test exercise
+UTF-8 byte boundaries. These are functional fixtures, not prose punctuation.
 
 ## Reproduce the inventory
 

@@ -2247,7 +2247,7 @@ async fn reconcile_deleting_grid_network(
 /// Pure and I/O-free (network fields only), so the reconcile-time wiring this
 /// guards is exercised directly by unit tests without a live or mocked
 /// Kubernetes client, per this repo's convention of preferring pure decision
-/// functions for reconciliation logic (`docs/conventions.md`). The CRD
+/// functions for reconciliation logic (`docs/developing/conventions.md`). The CRD
 /// schema's numeric minimum on `capUsd` already rejects negative values at
 /// admission time; this is the defensive second layer for `NaN`/infinite
 /// caps and blank/duplicate `tenantId`s that the schema cannot express.

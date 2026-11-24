@@ -3,7 +3,7 @@
 Start with the [development conventions]. They are the canonical policy for
 code, tests, documentation, and human responsibility for submitted changes.
 
-[development conventions]: docs/conventions.md
+[development conventions]: docs/developing/conventions.md
 
 ## Getting started
 
@@ -24,8 +24,8 @@ also check spelling, Markdown style, local links and anchors, and whitespace
 appropriate to the affected behavior. Record checks that could not be run and
 their prerequisites in the PR.
 
-[development guide]: docs/development.md
-[verification matrix]: docs/development.md#verification
+[development guide]: docs/developing/README.md
+[verification matrix]: docs/developing/README.md#verification
 
 ## Picking up an issue
 
@@ -61,4 +61,4 @@ and reviewer obligations; see the canonical policy for the enforcement boundary.
 Draft status does not remove the requirement to review and understand the
 submitted code.
 
-[PR conventions]: docs/conventions.md#pull-request-conventions
+[PR conventions]: docs/developing/conventions.md#pull-request-conventions

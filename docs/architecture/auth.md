@@ -197,8 +197,8 @@ ownership for credential Secret placement and rotation:
   GitOps, External Secrets, Vault, or another platform mechanism must place the
   Secret in the cluster where the final-hop component runs.
 
-See [Consumer Config](consumer-config.md) for the current operator-generated
-config shape.
+See [Consumer Config](../reference/consumer-config.md) for the current
+operator-generated config shape.
 
 **Additional credential backends** can implement `CredentialResolver` without
 changing callers:
