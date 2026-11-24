@@ -1,9 +1,10 @@
-# AI Grid Network (AGN)
+# Praxis Grid (AI Grid Network, AGN)
 
-AI Grid Network (AGN) connects inference providers across Kubernetes clusters,
-cloud services, and external APIs. Its operator discovers participating sites,
-tracks provider availability, and publishes routing state for [Praxis AI]
-gateways. Gateways select a provider for each request from that local state.
+Praxis Grid, also called AI Grid Network (AGN), connects inference providers
+across Kubernetes clusters, cloud services, and external APIs. Its operator
+discovers participating sites, tracks provider availability, and publishes
+routing state for [Praxis AI] gateways. Gateways select a provider for each
+request from that local state.
 
 AGN is a technical preview. Start with the [scope and limitations] before
 choosing a topology or planning an upgrade. You supply the clusters, inference
