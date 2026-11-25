@@ -1105,7 +1105,7 @@ which can leave the gateway serving an older route after the operator has
 published a new preference. It also adds validation, atomic writes,
 last-known-good retention, delivery health, and revision metrics at the handoff
 boundary. See [Architecture Overview](overview.md#configmap-handoff) and the
-[Praxis gateway chart](../../charts/praxis-gateway/README.md#routing-overlay-delivery).
+[Praxis gateway chart](https://github.com/praxis-proxy/grid/blob/main/charts/praxis-gateway/README.md#routing-overlay-delivery).
 
 Direct ConfigMap projection remains available when
 `overlay.sidecar.enabled=false`, but its delivery latency is controlled by the

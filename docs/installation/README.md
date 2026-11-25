@@ -9,5 +9,5 @@
 - [Installing on AWS](aws.md): three single-node clusters, why gossip needs a network
   load balancer, the private connectivity internal load balancers need, and why
   a peer arrives from its egress address.
-- [Single Gateway Examples](../../examples/helm/praxis-gateway/README.md):
+- [Single Gateway Examples](https://github.com/praxis-proxy/grid/blob/main/examples/helm/praxis-gateway/README.md):
   values for one `praxis-gateway` release, one file per `praxisConfig.source`.

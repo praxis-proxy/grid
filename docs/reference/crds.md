@@ -629,7 +629,7 @@ unresolved required site metadata, or with no
 permitted candidate, publishes an authoritative empty revision and fails
 closed. An invalid policy update is rejected before it can
 replace the last-known-good revision. See the
-[regional-policy example](../../examples/gateway/regional-policy.yaml) and
+[regional-policy example](https://github.com/praxis-proxy/grid/blob/main/examples/gateway/regional-policy.yaml) and
 [routing guide](../routing.md#regional-policy-affinity-locking-and-sovereignty)
 for complete behavior, updates, sessions, and observability.
 

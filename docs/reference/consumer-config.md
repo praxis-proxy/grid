@@ -628,7 +628,7 @@ five seconds when `GRID_SERVING_CONFIG` is set. Invalid serving-data updates
 keep the last accepted settings and topology. Changes to mounted identity files
 can still restart signals pollers using those accepted settings. The watcher
 does not update listener settings or add load-balancer clusters to `praxis.yaml`.
-See the [gateway chart serving guide](../../charts/praxis-gateway/README.md#cross-site-routing-in-agn).
+See the [gateway chart serving guide](https://github.com/praxis-proxy/grid/blob/main/charts/praxis-gateway/README.md#cross-site-routing-in-agn).
 
 The same `ConfigMap` carries `dial.json` beside the serving config: one entry
 per cluster that derivation admits for this gateway, with its address, transport

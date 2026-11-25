@@ -169,7 +169,7 @@ Its labels are fixed policy categories only; it never includes region names,
 provider names, request IDs, or arbitrary policy values. Structured logs carry
 candidate/site details for diagnosis without adding Prometheus cardinality.
 
-The [regional policy example](../examples/gateway/regional-policy.yaml) shows
+The [regional policy example](https://github.com/praxis-proxy/grid/blob/main/examples/gateway/regional-policy.yaml) shows
 the `GridNetwork` fragment together with the `GridSite` metadata it relies on.
 
 ---
@@ -1135,7 +1135,7 @@ spec:
 
 Best demonstration:
 
-- [Grid static weighted provider qualification](../tests/e2e/topologies/grid-static-weighted/README.md)
+- [Grid static weighted provider qualification](https://github.com/praxis-proxy/grid/blob/main/tests/e2e/topologies/grid-static-weighted/README.md)
   (stable, in-repository)
 - [Grid dynamic weighted routing](https://github.com/praxis-proxy/experimental/tree/main/demos/grid-weighted-dynamic-routing)
   (experimental pressure-derived weights)

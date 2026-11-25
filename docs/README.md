@@ -6,6 +6,15 @@ grid running, install it on your clusters, operate and route traffic,
 understand the design, then look up reference material. Contributor material is
 last.
 
+## Understand the Network
+
+A <code>GridNetwork</code> describes participating <code>GridSite</code>
+resources and provider state they exchange. Operators publish local routing
+configuration; gateways select destinations and carry inference traffic. Grid
+does not create site-to-site network connectivity. Grid Gateway's
+<code>grid_site_route</code> and Praxis AI's <code>intelligent_route</code>
+are separate routing integrations; follow the guide for the path you deploy.
+
 ## Getting Started
 
 - [Getting Started](getting-started/README.md): where to begin.
@@ -43,7 +52,7 @@ last.
   limit.
 - [FIPS Support](fips.md): FIPS builds, runtime images, and startup
   verification.
-- [Fleet Dashboard](../crates/fleet-dashboard/README.md): optional hub web UI
+- [Fleet Dashboard](https://github.com/praxis-proxy/grid/blob/main/crates/fleet-dashboard/README.md): optional hub web UI
   drawing every site on a map with health from its own Prometheus; deployed
   only when you install its chart.
 
@@ -89,45 +98,24 @@ last.
 
 ## Examples
 
-- [Hub and Site Install](../examples/helm/hub-site/README.md): the Helm
-  commands for a hub and one site.
-- [Single Gateway Examples](../examples/helm/praxis-gateway/README.md):
-  values for one `praxis-gateway` release, one file per `praxisConfig.source`.
-- [Provider Traffic Selection](../tests/e2e/topologies/grid-provider-traffic/README.md):
-  runnable three-cluster topology for AGN selection groups and request-time
-  round-robin provider choice.
-- [Praxis demos](https://github.com/praxis-proxy/demos): deployable
-  examples with automated runtime proofs of routing, failover, security
-  boundaries, and provider lifecycle.
+- [Hub and Site Install](https://github.com/praxis-proxy/grid/blob/main/examples/helm/hub-site/README.md):
+  the Helm commands for a hub and one site.
+- [Single Gateway Examples](https://github.com/praxis-proxy/grid/blob/main/examples/helm/praxis-gateway/README.md):
+  values for one <code>praxis-gateway</code> release, one file per
+  <code>praxisConfig.source</code>.
+- [Praxis demos](https://github.com/praxis-proxy/demos): self-contained
+  examples, including the Grid QuickStarts. Follow each demo's own prerequisites
+  and status notes.
+- [Experimental demos](https://github.com/praxis-proxy/experimental/tree/main/demos):
+  development examples whose status and prerequisites are documented by each
+  demo.
 
-## Integration Qualifications
+## Evaluation and Qualifications
 
-- [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md):
-  proves multi-cluster discovery, accepted-overlay delivery, request-time
-  round-robin selection, provider attribution, and stable routing.
-- [Operator-derived Local Routing Qualification](../tests/e2e/topologies/grid-operator-routing/README.md):
-  proves operator-derived local dials reach the embedded Gateway, attributed
-  requests follow those dials, passive health demotes and recovers a failed
-  backend, and endpoint replacement eventually routes to the replacement backend.
-- [Static Weighted Provider Qualification](../tests/e2e/topologies/grid-static-weighted/README.md):
-  proves configured capacity propagation, weighted overlay convergence,
-  proportional request selection, hot reload, and equal-weight recovery. This
-  is the release qualification for `weightedRandom`, static placement, provider
-  capacity, weighted-overlay, or cross-site capacity propagation changes.
-- [Combined-site Lifecycle Qualification](../tests/e2e/topologies/grid-combined-site/README.md):
-  is the release qualification for combined-site routing, provider
-  add/remove/re-add, session fallback, rollout, trust, or lifecycle changes.
-- [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md):
-  proves shared identity-scoped quota enforcement across gateway replicas,
-  regional provider selection, expiry, restart persistence, fail-closed state
-  storage, and storage-network isolation.
-- [Single-cluster Multi-gateway Qualification](../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md):
-  proves shared overlay delivery and independent consumer/provider gateway
-  behavior within one Kind cluster and one GridSite.
-
-These integration tests create their environments through Forge and execute
-through first-class Rust `xtask` commands. Their topology READMEs document
-image preparation, execution, evidence, and cleanup.
+- [Grid evaluation and E2E scenarios](developing/ci-kind-e2e.md): choose a
+  runnable scenario by behavior, routing path, and Kind cluster count. The
+  guide links to each topology's source-owned prerequisites, command, evidence,
+  and cleanup instructions, and summarizes the workflows that currently run.
 
 ## Developing
 

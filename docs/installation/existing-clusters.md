@@ -9,6 +9,9 @@ Kubernetes clusters.
 Review the [technical preview scope and limitations](../technical-preview-scope.md)
 before planning cluster connectivity, provider deployment, and gateway roles.
 
+Want to explore Grid in a disposable environment first? Choose a scenario from
+the [evaluation and E2E guide](../developing/ci-kind-e2e.md).
+
 ## Guides
 
 - **[Adding an Inference Provider](../operations/adding-provider.md)**:
