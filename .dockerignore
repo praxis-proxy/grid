@@ -17,3 +17,6 @@ evidence
 **/node_modules
 crates/fleet-dashboard/web/dist
 crates/fleet-dashboard/webui
+
+# Python harness bytecode is generated locally and is not a build input.
+**/__pycache__

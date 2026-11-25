@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1
+
+# Metadata-only qualification wrapper around the unchanged production musl image.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# The source/revision labels are inherited from the binary-producing build.
+# Never let this metadata-only wrapper relabel an unrelated base as current.
+LABEL org.grid.qualification.memory.variant="musl-malloc" \
+    org.grid.qualification.memory.allocator="system"
