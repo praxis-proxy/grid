@@ -1,12 +1,5 @@
 [advisories]
-# RUSTSEC-2023-0071 (Marvin Attack, rsa 0.9.x timing sidechannel) reaches the
-# lockfile only through sqlx-mysql, an optional sqlx driver we never enable:
-# the workspace pins sqlx with default-features = false and the postgres driver
-# only, so rsa is never compiled into any grid binary. cargo audit scans
-# Cargo.lock and flags the unactivated optional dep, while the graph-aware
-# dependency-check (cargo deny) correctly does not. No fixed rsa release exists.
 ignore = [
-  "RUSTSEC-2023-0071",
   # zstd 0.13.3 / zstd-safe 7.3.0 are pinned through the gateway's
   # upstream Pingora header-serde dependency, which has no release with
   # compatible requirements for the fixed zstd 0.14 / zstd-safe 8 APIs.
