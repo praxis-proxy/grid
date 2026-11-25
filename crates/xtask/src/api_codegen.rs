@@ -14,7 +14,7 @@
 
 use schemars::Schema;
 use schemars08::schema::Schema as TypifySchema;
-use typify::{TypeSpace, TypeSpaceSettings};
+use typify::{TypeSpace, TypeSpaceSettings, typespace::TypespaceTrait};
 
 /// Spec read, relative to the workspace root.
 const SPEC: &str = "api/enrollment-v1alpha1.yaml";
@@ -42,21 +42,23 @@ pub(crate) fn generate() -> Result<(), Box<dyn std::error::Error>> {
         let mut value = raw.clone();
         normalize(&mut value);
         let schema: Schema = serde_json::from_value(value)?;
-        // Typify 0.8 still consumes schemars 0.8 schemas; keep that boundary explicit while parsing with schemars 1.x.
+        // Typify still consumes schemars 0.8 schemas; keep that boundary explicit while parsing with schemars 1.x.
         let typify_schema = serde_json::from_value(serde_json::to_value(schema)?)?;
         defs.push((name.clone(), typify_schema));
     }
     defs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut settings = TypeSpaceSettings::default();
-    settings
-        .with_struct_builder(false)
-        .with_derive("PartialEq".to_owned())
-        .with_derive("Eq".to_owned());
+    settings.map_typespace_settings(|settings| {
+        settings
+            .with_struct_builder(false)
+            .with_required_trait(TypespaceTrait::PartialEq)
+            .with_required_trait(TypespaceTrait::Eq)
+    });
     let mut space = TypeSpace::new(&settings);
     space.add_ref_types(defs)?;
 
-    let ast = syn::parse2(space.to_stream())?;
+    let ast = syn::parse2(space.to_stream()?)?;
     let body = prettyplease::unparse(&ast);
     std::fs::write(OUT, format!("{HEADER}{body}"))?;
     println!("generated {OUT}");
