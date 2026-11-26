@@ -2533,6 +2533,7 @@ dependencies = [
  "tokio-rustls",
  "tower",
  "tracing-subscriber",
+ "uuid",
  "version",
 ]
 

@@ -1224,10 +1224,15 @@ qwen3-site-b   self_hosted   False       False         False      2m      3d
 ```
 
 `spec.capacityWeight` is an optional positive relative provider capacity from
-`1` through `1000`, used only with `GridNetwork.spec.selectionPolicy.mode:
-weightedRandom` and `placementPolicy.strategy: static`. If omitted, the
-effective weight is `1`. AGN copies this value to the overlay's
-`traffic_weight`; it does not represent a percentage.
+`1` through `1000`. When `intelligent_route` is selected,
+`GridNetwork.spec.selectionPolicy.mode: weightedRandom` with
+`placementPolicy.strategy: static` makes AGN copy it to the overlay's
+`traffic_weight`. It also reaches the embedded `grid_site_route` candidate's
+`weight`, independently of that selection policy; when the filter has no
+pressure reading, it scales the filter's capacity-weighted fallback. If
+omitted, both effective weights default to `1`. The value is relative and does
+not represent a percentage. See [Cross-site site selection](../site-selection.md)
+for the filter's selection algorithm.
 
 ### Backend kind
 

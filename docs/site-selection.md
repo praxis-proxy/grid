@@ -28,6 +28,20 @@ Queue-only and saturated selection retain sites tied on the least queue depth.
 Selection excludes unready sites. A site demoted by gateway health checks is a last
 resort if it remains admitted.
 
+When every eligible site lacks a fresh saturation (`rho`) reading, the filter
+draws by capacity. A known capacity is the learned capacity from queue-free
+samples; an unknown capacity uses the mean of the known capacities, or `1` if
+all are unknown. Each capacity is multiplied by the provider's candidate
+`weight`. The operator carries `InferenceProvider.spec.capacityWeight` into
+that field for `grid_site_route`, even when the network's `selectionPolicy` is
+not set to `weightedRandom`. That GridNetwork selection mode configures the
+separate `intelligent_route` path. Thus, with absent telemetry and the default
+equal candidate weights, multiple candidates receive equal expected shares;
+with relative weights such as `1:2:3`, the expected draws follow those weights.
+This is probabilistic selection, not round robin, and a bounded request sample
+does not promise an exact ratio. Missing telemetry is not treated as a measured
+zero.
+
 A site that has published and then sends nothing for the freshness window is silent.
 A peer is judged at the end of the operator's last poll round that tried it, and this
 site at the last read of its operator, so a stalled poller or relay pauses the judgement

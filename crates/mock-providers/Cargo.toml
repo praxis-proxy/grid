@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 version.workspace = true
+uuid = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 http = { workspace = true }

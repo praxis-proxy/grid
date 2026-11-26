@@ -172,10 +172,9 @@ fn app_state() -> AppState {
     let provider_site = std::env::var("MOCK_PROVIDER_SITE").unwrap_or_else(|_| "unknown".to_owned());
     let queue_depth_env = std::env::var("MOCK_QUEUE_DEPTH").ok();
     let queue_depth = parse_queue_depth(queue_depth_env.as_deref());
-    AppState {
-        provider_site: Arc::<str>::from(provider_site),
-        queue_depth,
-    }
+    let qualification_enabled =
+        std::env::var("MOCK_ENABLE_QUALIFICATION_ENDPOINTS").is_ok_and(|value| value.eq_ignore_ascii_case("true"));
+    AppState::new(Arc::<str>::from(provider_site), queue_depth).with_qualification_receipts(qualification_enabled)
 }
 
 /// Parse a normalized queue-depth metric, falling back to a ready provider.

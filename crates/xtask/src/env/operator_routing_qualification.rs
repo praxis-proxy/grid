@@ -6,11 +6,15 @@ use std::{
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Default Forge topology used by this qualification.
@@ -29,8 +33,12 @@ const STACK_APPLICATION_ORDER: [&str; 4] = ["operator", "mock-providers", "grid-
 const PROVIDER_A: &str = "provider-a";
 /// Grid backend ID for Provider B.
 const PROVIDER_B: &str = "provider-b";
+/// Grid backend ID for Provider C.
+const PROVIDER_C: &str = "provider-c";
 /// Inference model used by probe requests.
 const MODEL: &str = "operator-routing-test-model";
+/// A second model served only by Provider C.
+const OTHER_MODEL: &str = "operator-routing-other-model";
 /// Curl client image tag loaded into the run-owned cluster.
 const CLIENT_IMAGE: &str = "curlimages/curl:8.10.1";
 /// Immutable source for the pinned curl client image.
@@ -38,8 +46,6 @@ const CLIENT_IMAGE_REF: &str =
     "curlimages/curl@sha256:fcff5cf7a4b895da7bd2933c914938db2b05d2113fa0d6c55b6d29930408f661";
 /// Expected digest for the pinned curl client image.
 const CLIENT_IMAGE_DIGEST: &str = "sha256:fcff5cf7a4b895da7bd2933c914938db2b05d2113fa0d6c55b6d29930408f661";
-/// In-cluster Gateway endpoint used for inference probes.
-const GATEWAY_SERVICE: &str = "http://operator-routing-gateway.grid-system.svc:8080/v1/chat/completions";
 /// Maximum time to wait for qualification convergence.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(150);
 /// Maximum duration for a single Gateway request.
@@ -47,7 +53,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Poll interval for Kubernetes state and Gateway requests.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Marker emitted by the curl probe to report its HTTP status.
-const REQUEST_MARKER: &str = "OPERATOR_ROUTING_HTTP_STATUS:";
+const REQUEST_MARKER: &str = "SITE_ROUTE_HTTP_STATUS:";
+/// Number of bytes one prefix-affinity key covers in canonical prompt text.
+#[cfg(test)]
+const PREFIX_AFFINITY_BLOCK_BYTES: usize = 256;
+/// The filter needs four complete prefix keys before a confirmed prompt can be sticky.
+#[cfg(test)]
+const PREFIX_AFFINITY_MINIMUM_BYTES: usize = 4 * PREFIX_AFFINITY_BLOCK_BYTES;
+/// Repeated prompt fragment used by the live prefix-affinity warm-up and follow-up.
+const PREFIX_AFFINITY_PROMPT_FRAGMENT: &str = "stable-prefix-affinity-prompt-";
+/// Give the canonical prompt room for several complete keys, not just one partial prefix.
+const PREFIX_AFFINITY_PROMPT_REPETITIONS: usize = 64;
 /// Maximum captured bytes retained from either subprocess output stream.
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 /// Grace period between terminating and killing a subprocess group.
@@ -55,7 +71,11 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(500);
 /// Maximum time allowed for subprocess output readers to finish after cleanup.
 const OUTPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Options for the operator-routing Kind qualification command.
+/// Options for the Grid site-route balancing Kind qualification command.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these independent bools are CLI switches for sample size and run-owned environment retention"
+)]
 #[derive(Debug, clap::Args)]
 pub(crate) struct Options {
     /// Forge topology to deploy.
@@ -67,6 +87,8 @@ pub(crate) struct Options {
     pub(crate) keep_on_failure: bool,
     /// Evidence output directory, or a generated timestamped directory.
     pub(crate) evidence_dir: Option<PathBuf>,
+    /// Use smaller bounded samples while preserving all qualification gates.
+    pub(crate) quick: bool,
 }
 
 /// One named qualification phase and its observed outcome.
@@ -92,6 +114,8 @@ enum Outcome {
     Running,
     /// Qualification phase completed successfully.
     Pass,
+    /// The serving revision changed during sampling.
+    Inconclusive,
     /// Qualification phase failed.
     Fail,
 }
@@ -156,6 +180,8 @@ struct RunContext {
 /// One response probe and the backend attribution returned by Grid.
 #[derive(Debug, Clone, Serialize)]
 struct Probe {
+    /// Unique ID carried to the backend receipt endpoint.
+    request_id: String,
     /// HTTP status returned by the in-cluster Gateway.
     status: Option<u16>,
     /// Grid backend attribution returned by the Gateway.
@@ -164,14 +190,53 @@ struct Probe {
     grid_site: Option<String>,
     /// Independent mock-provider identity returned by the recorder.
     mock_provider: Option<String>,
+    /// Content type returned by the mock backend.
+    content_type: Option<String>,
+    /// Whether the body is a valid JSON object.
+    json_body_valid: bool,
+    /// Whether the body has the mock `OpenAI` SSE framing and terminal marker.
+    sse_body_valid: bool,
+    /// Response body retained in memory for state-ID assertions, not serialized in sample files.
+    #[serde(skip_serializing)]
+    response_body: String,
     /// Request transport or decoding error, if any.
     error: Option<String>,
 }
 
+/// One immutable serving snapshot shared by both the operator and embedded Gateway.
+#[derive(Clone, Debug, Serialize)]
+struct ServingSnapshot {
+    /// `ConfigMap` UID containing the operator's candidate inventory.
+    config_map_uid: String,
+    /// Kubernetes `ConfigMap` resource version bracketing a sample window.
+    resource_version: String,
+    /// Operator-published digest of the serving document.
+    digest: String,
+    /// Parsed candidate inventory mounted by the Gateway.
+    config: serde_json::Value,
+}
+
+/// Qualification-only backend counter and bounded request receipt list.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ProviderReceipts {
+    /// Provider identity reported by the fixture backend, distinct from its Grid provider name.
+    provider: String,
+    /// Unique recorder instance, replaced on backend restart.
+    instance: String,
+    /// Total inference requests received since this mock started.
+    total: u64,
+    /// Bounded request IDs observed by this backend; null means a missing ID.
+    request_ids: Vec<Option<String>>,
+}
+
+/// Per-provider receipts bracketing one qualification phase.
+type ReceiptSnapshot = BTreeMap<String, ProviderReceipts>;
+
 impl Probe {
     /// Whether the response is successful and has complete local attribution.
     fn is_success(&self) -> bool {
-        self.status == Some(200)
+        self.error.is_none()
+            && self.status == Some(200)
             && self.grid_backend.is_some()
             && self.grid_site.as_deref() == Some("local")
             && self
@@ -194,8 +259,8 @@ fn run_id() -> String {
 }
 
 /// Derive this run's Kind cluster name from its unique suffix.
-fn cluster_name(suffix: &str) -> String {
-    format!("grid-operator-routing-{suffix}-local")
+fn cluster_name(prefix: &str, suffix: &str) -> String {
+    format!("{prefix}-{suffix}-local")
 }
 
 /// Select the requested evidence path or create a topology-local default.
@@ -256,6 +321,11 @@ fn has_repo_digest(references: &[String], expected_digest: &str) -> bool {
     references.iter().any(|reference| reference.ends_with(&expected))
 }
 
+/// Remove image references and subprocess diagnostics before recording a preflight error.
+fn preflight_image_id(role: &str, result: Result<String, String>) -> Result<String, String> {
+    result.map_err(|_diagnostic| format!("could not inspect the {role} image"))
+}
+
 /// Resolve and inspect the locally built images selected for this run.
 fn resolve_images() -> Result<Images, String> {
     let pull_policy = source_value("GRID_XTASK_IMAGE_PULL_POLICY", "Never");
@@ -271,9 +341,18 @@ fn resolve_images() -> Result<Images, String> {
     }
     verify_image_digest(CLIENT_IMAGE, CLIENT_IMAGE_DIGEST)?;
     let local_ids = BTreeMap::from([
-        ("operator".to_owned(), image_id(&operator)?),
-        ("grid_gateway".to_owned(), image_id(&grid_gateway)?),
-        ("mock_provider".to_owned(), image_id(&mock_provider)?),
+        (
+            "operator".to_owned(),
+            preflight_image_id("operator", image_id(&operator))?,
+        ),
+        (
+            "grid_gateway".to_owned(),
+            preflight_image_id("grid_gateway", image_id(&grid_gateway))?,
+        ),
+        (
+            "mock_provider".to_owned(),
+            preflight_image_id("mock_provider", image_id(&mock_provider))?,
+        ),
         ("client".to_owned(), image_id(CLIENT_IMAGE)?),
     ]);
     Ok(Images {
@@ -299,7 +378,7 @@ fn split_image(image: &str) -> (String, String) {
 }
 
 /// Create a run-scoped Forge config with unique image references and cluster names.
-fn materialize_config(source: &Path, images: &Images, suffix: &str) -> Result<PathBuf, String> {
+fn materialize_config(source: &Path, images: &Images, cluster_prefix: &str, suffix: &str) -> Result<PathBuf, String> {
     let source_text = fs::read_to_string(source).map_err(|error| format!("read Forge topology: {error}"))?;
     let mut config: serde_yaml::Value = serde_yaml::from_str(&source_text).map_err(|error| error.to_string())?;
     scope_environment_name(&mut config, suffix)?;
@@ -310,7 +389,7 @@ fn materialize_config(source: &Path, images: &Images, suffix: &str) -> Result<Pa
         .ok_or("Forge topology has no spec.runtime mapping")?;
     runtime.insert(
         serde_yaml::Value::String("clusterPrefix".to_owned()),
-        serde_yaml::Value::String(format!("grid-operator-routing-{suffix}")),
+        serde_yaml::Value::String(format!("{cluster_prefix}-{suffix}")),
     );
     let clusters = config
         .get_mut("spec")
@@ -372,6 +451,33 @@ fn create_evidence_dir(directory: &Path) -> Result<(), String> {
             directory.display()
         )
     })
+}
+
+/// Record a failed source-image preflight without persisting environment values.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the failure record needs the evidence path, run ID, topology, source revision and fingerprint, and redacted error"
+)]
+fn write_preflight_failure(
+    directory: &Path,
+    run_id: &str,
+    topology: &Path,
+    source_revision: &str,
+    source_fingerprint_sha256: &str,
+    error: &str,
+) -> Result<(), String> {
+    let report = format!(
+        "# Image preflight failed before cluster creation\n\n\
+         - Run ID: `{run_id}`.\n\
+         - Topology: `{}`.\n\
+         - Source revision: `{source_revision}`.\n\
+         - Source fingerprint: `{source_fingerprint_sha256}`.\n\
+         - Cluster creation and application mutations: not started.\n\
+         - Error: {error}\n",
+        topology.display()
+    );
+    fs::write(directory.join("PRE-FLIGHT-FAILURE.md"), report)
+        .map_err(|write_error| format!("write image preflight failure report: {write_error}"))
 }
 
 /// Add the unique run suffix to the Forge environment name.
@@ -904,68 +1010,610 @@ fn wait_for_dial(ctx: &RunContext, provider: &str, expected: &str) -> Result<ser
 
 /// Send one uniquely identified inference probe through the Gateway.
 fn request(ctx: &RunContext, request_id: u64) -> Probe {
-    let body =
-        format!("{{\"model\":\"{MODEL}\",\"messages\":[{{\"role\":\"user\",\"content\":\"probe-{request_id}\"}}]}}");
-    let output = kubectl(
+    let id = format!("route-{request_id}");
+    request_json(
         ctx,
-        &[
-            "exec",
-            "-n",
-            NAMESPACE,
-            "qualification-client",
-            "--",
-            "curl",
-            "--silent",
-            "--show-error",
-            "--connect-timeout",
-            "2",
-            "--max-time",
-            "6",
-            "-D",
-            "-",
-            "-o",
-            "/dev/null",
-            "-w",
-            &format!("\\n{REQUEST_MARKER}%{{http_code}}\\n"),
-            "-H",
-            "Authorization: Bearer qualification-only",
-            "-H",
-            "Content-Type: application/json",
-            "--data",
-            &body,
-            GATEWAY_SERVICE,
-        ],
-        REQUEST_TIMEOUT,
-    );
+        &id,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": format!("independent-{request_id}-unique-prompt")}
+        ]}),
+    )
+}
+
+/// Send one OpenAI-compatible request with a unique backend receipt ID.
+fn request_json(ctx: &RunContext, request_id: &str, path: &str, body: serde_json::Value) -> Probe {
+    request_http(ctx, request_id, "POST", path, Some(body))
+}
+
+/// Build a prompt long enough for the four-key minimum used by `grid_site_route` affinity.
+fn prefix_affinity_prompt() -> String {
+    PREFIX_AFFINITY_PROMPT_FRAGMENT.repeat(PREFIX_AFFINITY_PROMPT_REPETITIONS)
+}
+
+/// Send an OpenAI-compatible request and retain its bounded response body for assertions.
+fn request_http(
+    ctx: &RunContext,
+    request_id: &str,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Probe {
+    let body_text = body
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_default();
+    let url = format!("http://operator-routing-gateway.grid-system.svc:8080{path}");
+    let receipt_header = format!("x-qualification-request-id: {request_id}");
+    let mut args = vec![
+        "exec".to_owned(),
+        "-n".to_owned(),
+        NAMESPACE.to_owned(),
+        "qualification-client".to_owned(),
+        "--".to_owned(),
+        "curl".to_owned(),
+        "--silent".to_owned(),
+        "--show-error".to_owned(),
+        "--connect-timeout".to_owned(),
+        "2".to_owned(),
+        "--max-time".to_owned(),
+        "6".to_owned(),
+        "-D".to_owned(),
+        "-".to_owned(),
+        "-w".to_owned(),
+        format!("\\n{REQUEST_MARKER}%{{http_code}}\\n"),
+        "-H".to_owned(),
+        "Authorization: Bearer qualification-only".to_owned(),
+        "-H".to_owned(),
+        "Content-Type: application/json".to_owned(),
+        "-H".to_owned(),
+        receipt_header,
+        "-X".to_owned(),
+        method.to_owned(),
+    ];
+    if let Some(body) = body {
+        args.extend(["--data-binary".to_owned(), body_text]);
+        drop(body);
+    }
+    args.push(url);
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = kubectl(ctx, &arg_refs, REQUEST_TIMEOUT);
     let Ok(output) = output else {
         return Probe {
+            request_id: request_id.to_owned(),
             status: None,
             grid_backend: None,
             grid_site: None,
             mock_provider: None,
+            content_type: None,
+            json_body_valid: false,
+            sse_body_valid: false,
+            response_body: String::new(),
             error: Some("kubectl exec/curl failed before returning a response".to_owned()),
         };
     };
     let text = String::from_utf8_lossy(&output.stdout);
+    let (response_text, status) = text.rsplit_once(&format!("\n{REQUEST_MARKER}")).map_or_else(
+        || (text.as_ref(), None),
+        |(response, status)| {
+            (
+                response,
+                status
+                    .lines()
+                    .next()
+                    .and_then(|status| status.trim().parse::<u16>().ok()),
+            )
+        },
+    );
+    let (headers, response_body) = response_text
+        .split_once("\r\n\r\n")
+        .or_else(|| response_text.split_once("\n\n"))
+        .unwrap_or((response_text, ""));
     let header = |name: &str| {
-        text.lines().find_map(|line| {
+        headers.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
             key.eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
         })
     };
-    let status = text.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(REQUEST_MARKER)
-            .and_then(|status| status.parse::<u16>().ok())
-    });
     let error = (!output.status.success()).then(|| stderr(&output));
     Probe {
+        request_id: request_id.to_owned(),
         status,
         grid_backend: header("x-grid-backend"),
         grid_site: header("x-grid-site"),
         mock_provider: header("x-grid-test-provider"),
+        content_type: header("content-type"),
+        json_body_valid: serde_json::from_str::<serde_json::Value>(response_body)
+            .is_ok_and(|parsed| parsed.is_object()),
+        sse_body_valid: header("content-type")
+            .is_some_and(|content_type| content_type.to_ascii_lowercase().contains("text/event-stream"))
+            && valid_chat_sse(response_body),
+        response_body: response_body.to_owned(),
         error,
     }
+}
+
+/// Validate dispatchable mock chat SSE records and require a final terminal event.
+fn valid_chat_sse(body: &str) -> bool {
+    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+    let mut records = normalized.split_inclusive("\n\n").filter_map(|record| {
+        let frame = record.strip_suffix("\n\n")?;
+        let data = frame
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("data:")
+                    .map(|value| value.strip_prefix(' ').unwrap_or(value))
+            })
+            .collect::<Vec<_>>();
+        (!data.is_empty()).then(|| data.join("\n"))
+    });
+    let mut saw_chunk = false;
+    while let Some(data) = records.next() {
+        if data == "[DONE]" {
+            return saw_chunk && records.next().is_none();
+        }
+        if !serde_json::from_str::<serde_json::Value>(&data).is_ok_and(|chunk| {
+            chunk.get("object").and_then(serde_json::Value::as_str) == Some("chat.completion.chunk")
+                && chunk.get("choices").is_some_and(serde_json::Value::is_array)
+        }) {
+            return false;
+        }
+        saw_chunk = true;
+    }
+    false
+}
+
+/// Read the sticky decision counter from the gateway's loopback metrics listener.
+fn sticky_decisions(ctx: &RunContext) -> Result<u64, String> {
+    let metrics = kubectl_ok(
+        ctx,
+        &[
+            "-n",
+            NAMESPACE,
+            "exec",
+            "deployment/operator-routing-gateway",
+            "-c",
+            "praxis",
+            "--",
+            "wget",
+            "-qO-",
+            "http://127.0.0.1:9901/metrics",
+        ],
+        REQUEST_TIMEOUT,
+    )?;
+    let Some(sample) = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("grid_route_prefix_affinity_total{outcome=\"sticky\"} "))
+    else {
+        return Ok(0);
+    };
+    sample
+        .trim()
+        .parse()
+        .map_err(|error| format!("invalid sticky decision counter: {error}"))
+}
+
+/// Read the serving `ConfigMap` and prove the embedded Gateway has the same mounted document.
+fn serving_snapshot(ctx: &RunContext) -> Result<ServingSnapshot, String> {
+    let config_map = json_kubectl(ctx, &["-n", NAMESPACE, "get", "configmap", GRID_SERVING_CONFIGMAP])?;
+    let published_text = config_map
+        .pointer("/data/serving-config.json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("operator serving ConfigMap has no serving-config.json")?;
+    let published: serde_json::Value = serde_json::from_str(published_text)
+        .map_err(|error| format!("operator serving-config.json is invalid: {error}"))?;
+    let command = [
+        "exec",
+        "-n",
+        NAMESPACE,
+        "deployment/operator-routing-gateway",
+        "-c",
+        "praxis",
+        "--",
+        "cat",
+        "/etc/praxis/grid-serving/serving-config.json",
+    ];
+    let mounted_output = kubectl(ctx, &command, Duration::from_secs(15))?;
+    if !mounted_output.status.success() {
+        return Err(format!("read mounted serving-config.json: {}", stderr(&mounted_output)));
+    }
+    let mounted_text = String::from_utf8_lossy(&mounted_output.stdout);
+    let mounted: serde_json::Value = serde_json::from_str(&mounted_text)
+        .map_err(|error| format!("Gateway mounted serving-config.json is invalid: {error}"))?;
+    if published != mounted {
+        return Err("Gateway-mounted serving candidates differ from the operator ConfigMap".to_owned());
+    }
+    Ok(ServingSnapshot {
+        config_map_uid: config_map
+            .pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        resource_version: config_map
+            .pointer("/metadata/resourceVersion")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        digest: config_map
+            .pointer("/metadata/annotations/grid.praxis.fast~1serving-digest")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        config: mounted,
+    })
+}
+
+/// Map serving candidates for one model by their selected Grid backend cluster.
+fn serving_candidates<'config>(
+    snapshot: &'config ServingSnapshot,
+    model: &str,
+) -> Result<BTreeMap<String, &'config serde_json::Value>, String> {
+    let candidates = snapshot
+        .config
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("serving config has no candidate array")?;
+    Ok(candidates
+        .iter()
+        .filter(|candidate| candidate.get("name").and_then(serde_json::Value::as_str) == Some(model))
+        .filter_map(|candidate| {
+            candidate
+                .get("cluster")
+                .and_then(serde_json::Value::as_str)
+                .map(|cluster| (cluster.to_owned(), candidate))
+        })
+        .collect())
+}
+
+/// Check a serving model's candidate set, candidate weights, and admission state.
+fn assert_serving_model(
+    snapshot: &ServingSnapshot,
+    model: &str,
+    expected: &BTreeMap<String, (u32, bool)>,
+) -> Result<(), String> {
+    let candidates = serving_candidates(snapshot, model)?;
+    let actual: BTreeSet<_> = candidates.keys().cloned().collect();
+    let expected_names: BTreeSet<_> = expected.keys().cloned().collect();
+    if actual != expected_names {
+        return Err(format!(
+            "serving candidate set for {model:?} was {actual:?}, expected {expected_names:?}"
+        ));
+    }
+    for (cluster, (weight, admits_new)) in expected {
+        let candidate = candidates
+            .get(cluster)
+            .ok_or_else(|| format!("serving candidate {cluster:?} is missing for {model:?}"))?;
+        let actual_weight = candidate.get("weight").and_then(serde_json::Value::as_u64);
+        if actual_weight != Some(u64::from(*weight)) {
+            return Err(format!(
+                "serving candidate {cluster:?} weight was {actual_weight:?}, expected {weight}"
+            ));
+        }
+        let admission = candidate.get("admission").and_then(serde_json::Value::as_str);
+        let actual_admits = admission.is_none_or(|state| {
+            state.eq_ignore_ascii_case("new_and_existing") || state.eq_ignore_ascii_case("newandexisting")
+        });
+        if actual_admits != *admits_new {
+            return Err(format!(
+                "serving candidate {cluster:?} admission was {admission:?}, expected admits_new={admits_new}"
+            ));
+        }
+        for signal in ["capacity", "rho", "queue_depth", "backlog"] {
+            if candidate.get(signal).is_some() {
+                return Err(format!(
+                    "no-pressure qualification unexpectedly received candidate signal {signal:?} for {cluster}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Wait for a mounted serving revision to publish the requested candidate/admission state.
+fn wait_for_serving_model(
+    ctx: &RunContext,
+    model: &str,
+    expected: &BTreeMap<String, (u32, bool)>,
+) -> Result<ServingSnapshot, String> {
+    wait_until(
+        &format!("Gateway serving snapshot for model {model}"),
+        WAIT_TIMEOUT,
+        || {
+            let snapshot = serving_snapshot(ctx)?;
+            match assert_serving_model(&snapshot, model, expected) {
+                Ok(()) if !snapshot.digest.is_empty() && !snapshot.resource_version.is_empty() => Ok(Some(snapshot)),
+                _ => Ok(None),
+            }
+        },
+    )
+}
+
+/// Read the mounted Praxis config and verify this Gateway runs only `grid_site_route`.
+fn verify_grid_site_route_filter(ctx: &RunContext) -> Result<String, String> {
+    let command = [
+        "exec",
+        "-n",
+        NAMESPACE,
+        "deployment/operator-routing-gateway",
+        "-c",
+        "praxis",
+        "--",
+        "cat",
+        "/etc/praxis/praxis.yaml",
+    ];
+    let output = kubectl(ctx, &command, Duration::from_secs(15))?;
+    if !output.status.success() {
+        return Err(format!("read mounted Praxis config: {}", stderr(&output)));
+    }
+    let config = String::from_utf8_lossy(&output.stdout).into_owned();
+    if config.matches("filter: grid_site_route").count() != 1 || config.contains("filter: intelligent_route") {
+        return Err(
+            "mounted Praxis config must contain exactly one grid_site_route filter and no intelligent_route filter"
+                .to_owned(),
+        );
+    }
+    Ok(config)
+}
+
+/// Read the opt-in request receipts from every fixture backend.
+fn receipt_snapshot(ctx: &RunContext) -> Result<ReceiptSnapshot, String> {
+    let mut result = BTreeMap::new();
+    for service in ["provider-a", "provider-b-old", "provider-c"] {
+        let url = format!("http://{service}.grid-system.svc:8080/__qualification/receipts");
+        let output = kubectl(
+            ctx,
+            &[
+                "exec",
+                "-n",
+                NAMESPACE,
+                "qualification-client",
+                "--",
+                "curl",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "5",
+                &url,
+            ],
+            Duration::from_secs(8),
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "read qualification receipts from {service}: {}",
+                stderr(&output)
+            ));
+        }
+        let receipt: ProviderReceipts = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("parse qualification receipts from {service}: {error}"))?;
+        validate_receipt_identity(service, &receipt)?;
+        result.insert(service.to_owned(), receipt);
+    }
+    Ok(result)
+}
+
+/// Require the receipt endpoint's provider identity to match the service being scraped.
+fn validate_receipt_identity(service: &str, receipt: &ProviderReceipts) -> Result<(), String> {
+    if receipt.provider == service {
+        Ok(())
+    } else {
+        Err(format!(
+            "qualification receipt endpoint for {service} identifies as {}",
+            receipt.provider
+        ))
+    }
+}
+
+/// Verify that each request in `probes` reached exactly one backend, matching response attribution.
+fn assert_receipts_for_probes(
+    before: &ReceiptSnapshot,
+    after: &ReceiptSnapshot,
+    probes: &[Probe],
+) -> Result<BTreeMap<String, usize>, String> {
+    let mut expected = BTreeMap::<String, String>::new();
+    for probe in probes {
+        let provider = probe
+            .mock_provider
+            .as_deref()
+            .ok_or_else(|| format!("request {} has no backend provider header", probe.request_id))?;
+        if expected.insert(probe.request_id.clone(), provider.to_owned()).is_some() {
+            return Err(format!("qualification request ID {} was reused", probe.request_id));
+        }
+    }
+
+    let mut actual = BTreeMap::<String, Vec<String>>::new();
+    let mut total_delta = 0_u64;
+    for (provider, current) in after {
+        let previous = before
+            .get(provider)
+            .ok_or_else(|| format!("no receipt baseline for provider {provider}"))?;
+        if current.instance != previous.instance {
+            return Err(format!("receipt recorder restarted for provider {provider}"));
+        }
+        total_delta = total_delta.saturating_add(
+            current
+                .total
+                .checked_sub(previous.total)
+                .ok_or_else(|| format!("receipt total decreased for provider {provider}"))?,
+        );
+        let mut prior_counts = BTreeMap::<String, usize>::new();
+        for id in previous.request_ids.iter().flatten() {
+            *prior_counts.entry(id.clone()).or_default() += 1;
+        }
+        let mut seen_counts = BTreeMap::<String, usize>::new();
+        for id in current.request_ids.iter().flatten() {
+            *seen_counts.entry(id.clone()).or_default() += 1;
+        }
+        let previous_missing = previous.request_ids.iter().filter(|id| id.is_none()).count();
+        let current_missing = current.request_ids.iter().filter(|id| id.is_none()).count();
+        let missing_delta = current_missing.saturating_sub(previous_missing);
+        if missing_delta != 0 {
+            return Err(format!(
+                "provider {provider} recorded {missing_delta} inference requests without request IDs"
+            ));
+        }
+        for (id, count) in seen_counts {
+            let old = prior_counts.get(&id).copied().unwrap_or_default();
+            for _ in old..count {
+                actual.entry(id.clone()).or_default().push(provider.clone());
+            }
+        }
+    }
+
+    let actual_ids: BTreeSet<_> = actual.keys().cloned().collect();
+    let expected_ids: BTreeSet<_> = expected.keys().cloned().collect();
+    if actual_ids != expected_ids {
+        return Err(format!(
+            "backend receipt IDs differ from sent request IDs: actual={actual_ids:?}, expected={expected_ids:?}"
+        ));
+    }
+    for (id, providers) in &actual {
+        if providers.len() != 1 {
+            return Err(format!(
+                "request {id} reached {} backends: {providers:?}",
+                providers.len()
+            ));
+        }
+        let expected_provider = expected.get(id).map(String::as_str).unwrap_or_default();
+        if providers.first().map(String::as_str) != Some(expected_provider) {
+            return Err(format!(
+                "request {id} response named provider {expected_provider:?}, backend receipt came from {providers:?}"
+            ));
+        }
+    }
+    if total_delta != u64::try_from(probes.len()).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "backend inference receipt delta was {total_delta}, expected exactly {} (detects retries or lost requests)",
+            probes.len()
+        ));
+    }
+    let counts = actual.values().fold(BTreeMap::new(), |mut counts, providers| {
+        if let Some(provider) = providers.first() {
+            *counts.entry(provider.clone()).or_insert(0_usize) += 1;
+        }
+        counts
+    });
+    Ok(counts)
+}
+
+/// Verify that an unsuccessful request made no backend inference attempt.
+fn assert_no_new_receipts(before: &ReceiptSnapshot, after: &ReceiptSnapshot) -> Result<(), String> {
+    for (provider, previous) in before {
+        let current = after
+            .get(provider)
+            .ok_or_else(|| format!("no receipt state after request for provider {provider}"))?;
+        if current.instance != previous.instance
+            || current.total != previous.total
+            || current.request_ids != previous.request_ids
+        {
+            return Err(format!(
+                "provider {provider} received a backend request despite the no-route gate"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Send a bounded independent-request sample with fixed concurrency and unique prompts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the bounded sample needs its run context, identity, phase, request model, size, and concurrency"
+)]
+fn request_samples(
+    ctx: &RunContext,
+    run_id: &str,
+    phase: &str,
+    model: &str,
+    count: usize,
+    concurrency: usize,
+) -> Result<Vec<Probe>, String> {
+    let next = AtomicUsize::new(0);
+    let probes = Mutex::new(Vec::with_capacity(count));
+    let workers = concurrency.min(count).max(1);
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= count {
+                        break;
+                    }
+                    let id = sample_request_id(run_id, phase, index);
+                    let body = serde_json::json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": format!("{id} independent prompt content")}
+                    ]});
+                    let probe = request_json(ctx, &id, "/v1/chat/completions", body);
+                    if let Ok(mut collected) = probes.lock() {
+                        collected.push(probe);
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            if handle.join().is_err() {
+                return Err("a bounded Gateway request worker panicked".to_owned());
+            }
+        }
+        Ok(())
+    })?;
+    let mut probes = probes
+        .into_inner()
+        .map_err(|_poison| "bounded Gateway request sample collection was poisoned".to_owned())?;
+    probes.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+    if probes.len() != count {
+        return Err(format!(
+            "collected {} probes from a requested sample of {count}",
+            probes.len()
+        ));
+    }
+    Ok(probes)
+}
+
+/// Check an observed multinomial sample against configured relative weights with a 3.3-sigma bound.
+fn assert_distribution(
+    counts: &BTreeMap<String, usize>,
+    weights: &BTreeMap<String, u32>,
+    sample_count: usize,
+) -> Result<(), String> {
+    let actual_names: BTreeSet<_> = counts.keys().cloned().collect();
+    let expected_names: BTreeSet<_> = weights.keys().cloned().collect();
+    if !actual_names.is_subset(&expected_names) {
+        return Err(format!(
+            "observed provider set {actual_names:?} contains a candidate outside eligible set {expected_names:?}"
+        ));
+    }
+    let actual_total: usize = counts.values().sum();
+    if actual_total != sample_count || sample_count == 0 {
+        return Err(format!(
+            "distribution count was {actual_total}, expected {sample_count}"
+        ));
+    }
+    let total_weight: f64 = weights.values().map(|weight| f64::from(*weight)).sum();
+    if total_weight == 0.0 || weights.values().any(|weight| *weight == 0) {
+        return Err("configured candidate weights must all be positive".to_owned());
+    }
+    let sample_count = u32::try_from(sample_count)
+        .map_err(|_error| "sample count exceeds the supported exact integer range".to_owned())?;
+    for (provider, weight) in weights {
+        let p = f64::from(*weight) / total_weight;
+        let n = f64::from(sample_count);
+        let observed = counts.get(provider).copied().unwrap_or_default();
+        let observed = f64::from(
+            u32::try_from(observed)
+                .map_err(|_error| "observed count exceeds the supported exact integer range".to_owned())?,
+        );
+        let expected = n * p;
+        let bound = 3.3 * (n * p * (1.0 - p)).sqrt() + 1.0;
+        if (observed - expected).abs() > bound {
+            return Err(format!(
+                "provider {provider} received {observed:.0}/{sample_count}; expected {expected:.1} ± {bound:.1} for configured weight {weight}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Probe until the expected provider serves successfully or the deadline expires.
@@ -1003,6 +1651,7 @@ fn expected_backend(provider: &str) -> Option<&'static str> {
     match provider {
         "provider-a" => Some(PROVIDER_A),
         "provider-b-old" | "provider-b-replacement" => Some(PROVIDER_B),
+        "provider-c" => Some(PROVIDER_C),
         _ => None,
     }
 }
@@ -1399,7 +2048,11 @@ fn phase<T>(evidence: &mut Evidence, name: &str, run: impl FnOnce() -> Result<T,
         Err(error) => {
             evidence.scenarios.push(Scenario {
                 name: name.to_owned(),
-                result: Outcome::Fail,
+                result: if error.starts_with("INCONCLUSIVE: ") {
+                    Outcome::Inconclusive
+                } else {
+                    Outcome::Fail
+                },
                 detail: error.clone(),
                 started_at_unix_ms,
                 completed_at_unix_ms: unix_millis(),
@@ -1415,6 +2068,1194 @@ fn record_probe_set(evidence: &mut Evidence, name: &str, probes: &[Probe]) {
         name.to_owned(),
         serde_json::to_value(probes).unwrap_or(serde_json::Value::Null),
     );
+}
+
+/// Patch only named fields under a task-owned `InferenceProvider` spec.
+fn patch_provider_spec(ctx: &RunContext, provider: &str, patch: &serde_json::Value) -> Result<(), String> {
+    let patch = serde_json::to_string(patch)
+        .map_err(|error| format!("serialize InferenceProvider/{provider} patch: {error}"))?;
+    let output = kubectl(
+        ctx,
+        &[
+            "patch",
+            "inferenceprovider",
+            provider,
+            "--type=merge",
+            "--patch",
+            &patch,
+        ],
+        Duration::from_secs(20),
+    )?;
+    if !output.status.success() {
+        return Err(format!("patch InferenceProvider/{provider}: {}", stderr(&output)));
+    }
+    Ok(())
+}
+
+/// Restore a possibly committed write and advance its resource version to fence late arrivals.
+fn restore_provider_spec(ctx: &RunContext, provider: &str, spec: &serde_json::Value) -> Result<(), String> {
+    for _ in 0..3 {
+        let current = json_kubectl(ctx, &["get", "inferenceprovider", provider])?;
+        let revision = current
+            .pointer("/metadata/resourceVersion")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("InferenceProvider/{provider} has no resourceVersion"))?;
+        let patch = serde_json::json!({
+            "metadata": {
+                "resourceVersion": revision,
+                "annotations": {"grid.praxis.fast/qualification-restore": revision},
+            },
+            "spec": spec,
+        });
+        if patch_provider_spec(ctx, provider, &patch).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(format!("could not restore and fence InferenceProvider/{provider}"))
+}
+
+/// Apply temporary provider spec changes and restore every changed field on all return paths.
+fn with_provider_patches<T>(
+    ctx: &RunContext,
+    patches: &[(String, serde_json::Value)],
+    qualification: impl FnOnce() -> Result<T, String>,
+    verify_restored: impl FnOnce() -> Result<(), String>,
+) -> Result<T, String> {
+    let mut restore_fields_by_provider = Vec::with_capacity(patches.len());
+    for (provider, patch) in patches {
+        let current = json_kubectl(ctx, &["get", "inferenceprovider", provider])?;
+        let current_spec = current
+            .get("spec")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("InferenceProvider/{provider} has no spec object"))?;
+        let patch_fields = patch
+            .as_object()
+            .ok_or_else(|| format!("temporary patch for InferenceProvider/{provider} is not an object"))?;
+        let mut restore_fields = serde_json::Map::new();
+        for key in patch_fields.keys() {
+            restore_fields.insert(
+                key.clone(),
+                current_spec.get(key).cloned().unwrap_or(serde_json::Value::Null),
+            );
+        }
+        restore_fields_by_provider.push((provider.clone(), serde_json::Value::Object(restore_fields)));
+    }
+
+    let mut applied = Vec::new();
+    let mut apply_error = None;
+    for (provider, patch) in patches {
+        let mutation = json_kubectl(ctx, &["get", "inferenceprovider", provider]).and_then(|current| {
+            let revision = current
+                .pointer("/metadata/resourceVersion")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("InferenceProvider/{provider} has no resourceVersion"))?;
+            applied.push(provider.clone());
+            let mutation = serde_json::json!({"metadata": {"resourceVersion": revision}, "spec": patch});
+            patch_provider_spec(ctx, provider, &mutation)
+        });
+        match mutation {
+            Ok(()) => {},
+            Err(error) => {
+                apply_error = Some(error);
+                break;
+            },
+        }
+    }
+    let result = if let Some(error) = apply_error {
+        Err(error)
+    } else {
+        qualification()
+    };
+
+    let mut restoration_error = None;
+    for (provider, patch) in &restore_fields_by_provider {
+        if applied.contains(provider)
+            && let Err(error) = restore_provider_spec(ctx, provider, patch)
+        {
+            restoration_error.get_or_insert(error);
+        }
+    }
+    if let Err(error) = verify_restored() {
+        restoration_error.get_or_insert(error);
+    }
+
+    match (result, restoration_error) {
+        (Ok(value), None) => Ok(value),
+        (Err(error), None) => Err(error),
+        (Ok(_), Some(restore_detail)) => Err(format!(
+            "temporary provider changes failed to restore: {restore_detail}"
+        )),
+        (Err(test_detail), Some(restore_detail)) => Err(format!(
+            "qualification failed: {test_detail}; restoration failed: {restore_detail}"
+        )),
+    }
+}
+
+/// Expected serving candidates for all three providers with the supplied weights and admission.
+fn expected_main_model(weights: [u32; 3], admits_new: bool) -> BTreeMap<String, (u32, bool)> {
+    BTreeMap::from([
+        (PROVIDER_A.to_owned(), (weights[0], admits_new)),
+        (PROVIDER_B.to_owned(), (weights[1], admits_new)),
+        (PROVIDER_C.to_owned(), (weights[2], admits_new)),
+    ])
+}
+
+/// Expected candidates with new-request admission limited to the selected providers.
+fn expected_main_model_with_new_admissions(
+    weights: [u32; 3],
+    admitted: &BTreeSet<String>,
+) -> BTreeMap<String, (u32, bool)> {
+    BTreeMap::from([
+        (PROVIDER_A.to_owned(), (weights[0], admitted.contains(PROVIDER_A))),
+        (PROVIDER_B.to_owned(), (weights[1], admitted.contains(PROVIDER_B))),
+        (PROVIDER_C.to_owned(), (weights[2], admitted.contains(PROVIDER_C))),
+    ])
+}
+
+/// Verify that the live fixtures contain no configured metrics source for the native lane.
+fn verify_absent_pressure_telemetry(ctx: &RunContext) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let mut providers = BTreeMap::new();
+    for name in [PROVIDER_A, PROVIDER_B, PROVIDER_C] {
+        let provider = json_kubectl(ctx, &["get", "inferenceprovider", name])?;
+        if provider.pointer("/spec/metricsConfig").is_some() {
+            return Err(format!("InferenceProvider/{name} unexpectedly has metricsConfig"));
+        }
+        providers.insert(name.to_owned(), provider);
+    }
+    Ok(providers)
+}
+
+/// A measured sample, its raw probes, and the serving revision held through the window.
+struct DistributionResult {
+    /// Weights passed to the distribution check.
+    eligible_weights: BTreeMap<String, u32>,
+    /// Receipts observed per backend provider.
+    counts: BTreeMap<String, usize>,
+    /// Successful request/response probes collected for this window.
+    probes: Vec<Probe>,
+    /// Path to the append-only JSONL sample file.
+    samples_file: String,
+    /// Candidate snapshot immediately before sampling.
+    start: ServingSnapshot,
+    /// Candidate snapshot immediately after sampling.
+    end: ServingSnapshot,
+}
+
+/// Exercise no-pressure candidate selection with bounded concurrent independent prompts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a distribution window needs the topology context, run identity, candidate phase, sample size, weights, and admission set"
+)]
+fn sample_distribution(
+    ctx: &RunContext,
+    run_id: &str,
+    name: &str,
+    count: usize,
+    weights: [u32; 3],
+    admitted: &BTreeSet<String>,
+) -> Result<DistributionResult, String> {
+    let expected = expected_main_model_with_new_admissions(weights, admitted);
+    let start = serving_snapshot(ctx)?;
+    assert_serving_model(&start, MODEL, &expected)?;
+    let before = receipt_snapshot(ctx)?;
+    let probes = request_samples(ctx, run_id, name, MODEL, count, 8)?;
+    let samples_file = write_probe_samples(ctx, name, &probes)?;
+    let end = serving_snapshot(ctx)?;
+    if start.config_map_uid != end.config_map_uid
+        || start.resource_version != end.resource_version
+        || start.digest != end.digest
+    {
+        return Err(format!(
+            "INCONCLUSIVE: serving revision changed during {name}: {} / {} / {} -> {} / {} / {}; samples: {samples_file}",
+            start.config_map_uid,
+            start.resource_version,
+            start.digest,
+            end.config_map_uid,
+            end.resource_version,
+            end.digest
+        ));
+    }
+    for probe in &probes {
+        if !probe.is_success() || !probe.json_body_valid {
+            return Err(format!("independent JSON inference request failed: {probe:?}"));
+        }
+        let provider = probe.mock_provider.as_deref().unwrap_or_default();
+        validate_attribution(probe, provider)?;
+    }
+    let after = receipt_snapshot(ctx)?;
+    let counts = assert_receipts_for_probes(&before, &after, &probes)?;
+    let expected_weights = BTreeMap::from([
+        ("provider-a".to_owned(), weights[0]),
+        ("provider-b-old".to_owned(), weights[1]),
+        ("provider-c".to_owned(), weights[2]),
+    ]);
+    let eligible_weights: BTreeMap<_, _> = expected_weights
+        .into_iter()
+        .filter(|(provider, _)| {
+            let backend = match provider.as_str() {
+                "provider-a" => PROVIDER_A,
+                "provider-b-old" => PROVIDER_B,
+                _ => PROVIDER_C,
+            };
+            expected.get(backend).is_some_and(|(_, admits)| *admits)
+        })
+        .collect();
+    assert_distribution(&counts, &eligible_weights, count)?;
+    Ok(DistributionResult {
+        eligible_weights,
+        counts,
+        probes,
+        samples_file,
+        start,
+        end,
+    })
+}
+
+/// Persist raw request/response attribution records as one JSON object per line.
+fn write_probe_samples(ctx: &RunContext, name: &str, probes: &[Probe]) -> Result<String, String> {
+    let path = ctx.evidence_dir.join(format!("samples-{name}.jsonl"));
+    let mut content = String::new();
+    for probe in probes {
+        let line = serde_json::to_string(probe).map_err(|error| format!("serialize sample probe: {error}"))?;
+        content.push_str(&line);
+        content.push('\n');
+    }
+    fs::write(&path, content).map_err(|error| format!("write sample file {}: {error}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
+/// Serialize the result and revision bounds from one independent-request sample.
+fn distribution_evidence(result: &DistributionResult, weights: [u32; 3], sample_count: usize) -> serde_json::Value {
+    let total: f64 = result.eligible_weights.values().map(|weight| f64::from(*weight)).sum();
+    let probabilities: BTreeMap<_, _> = ["provider-a", "provider-b-old", "provider-c"]
+        .into_iter()
+        .map(|provider| {
+            let weight = result.eligible_weights.get(provider).copied().unwrap_or_default();
+            (provider, f64::from(weight) / total)
+        })
+        .collect();
+    serde_json::json!({
+        "eligibleWeightsByProvider": result.eligible_weights,
+        "expectedProbabilitiesByProvider": probabilities,
+        "sampleCount": sample_count,
+        "weightsByProvider": {
+            "provider-a": weights[0],
+            "provider-b-old": weights[1],
+            "provider-c": weights[2],
+        },
+        "counts": result.counts,
+        "tolerance": "per-candidate absolute deviation <= 3.3 binomial standard deviations + 1 request",
+        "candidateRevision": {
+            "configMapUid": result.start.config_map_uid,
+            "resourceVersion": result.start.resource_version,
+            "digest": result.start.digest,
+        },
+        "endRevision": {
+            "configMapUid": result.end.config_map_uid,
+            "resourceVersion": result.end.resource_version,
+            "digest": result.end.digest,
+        },
+        "samplesFile": result.samples_file,
+        "probeCount": result.probes.len(),
+    })
+}
+
+/// Read a Responses API ID from a successful mock response without retaining it in evidence.
+fn response_state_id(probe: &Probe, prefix: &str) -> Result<String, String> {
+    if !probe.is_success() || !probe.json_body_valid {
+        return Err(format!(
+            "state creation did not return a successful JSON response: {probe:?}"
+        ));
+    }
+    let body: serde_json::Value = serde_json::from_str(&probe.response_body)
+        .map_err(|error| format!("state creation response is invalid JSON: {error}"))?;
+    let id = body
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("state creation response has no string id")?;
+    if !id.starts_with(prefix) {
+        return Err(format!("state creation id does not start with {prefix:?}: {id:?}"));
+    }
+    Ok(id.to_owned())
+}
+
+/// Verify the Conversation GET returned the upstream identity from the requested Grid tag.
+fn validate_conversation_read(probe: &Probe, requested: &str) -> Result<(), String> {
+    let upstream = requested
+        .splitn(4, '.')
+        .nth(3)
+        .ok_or("conversation ID has no upstream portion")?;
+    let expected = format!("conv_{upstream}");
+    let body: serde_json::Value = serde_json::from_str(&probe.response_body)
+        .map_err(|error| format!("invalid Conversation response: {error}"))?;
+    if body.get("object").and_then(serde_json::Value::as_str) != Some("conversation")
+        || body.get("id").and_then(serde_json::Value::as_str) != Some(expected.as_str())
+    {
+        return Err("Conversation GET did not return the requested conversation".to_owned());
+    }
+    Ok(())
+}
+
+/// Whether a stored-state ID has the Grid site tag inserted after its API prefix.
+fn state_id_has_site_tag(id: &str, prefix: &str, expected_site: &str) -> bool {
+    let Some(after_prefix) = id.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((site, remaining)) = after_prefix.split_once('.') else {
+        return false;
+    };
+    let Some((mark, remaining)) = remaining.split_once('.') else {
+        return false;
+    };
+    let Some((mac, upstream)) = remaining.split_once('.') else {
+        return false;
+    };
+    let is_hex =
+        |value: &str, length: usize| value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    site == expected_site && is_hex(mark, 8) && (mac.is_empty() || is_hex(mac, 16)) && !upstream.is_empty()
+}
+
+/// Map the mock's independently reported provider identity to its task `InferenceProvider`.
+fn provider_resource(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "provider-a" => Ok(PROVIDER_A),
+        "provider-b-old" => Ok(PROVIDER_B),
+        "provider-c" => Ok(PROVIDER_C),
+        other => Err(format!("unknown task provider identity {other:?}")),
+    }
+}
+
+/// Restart the run-owned Gateway against a stable mounted serving revision and probe its route.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restart gate keeps rollout, process identity, mounted revision, request attribution, and startup logs in one ordered phase"
+)]
+fn restart_gateway_for_revision(
+    ctx: &RunContext,
+    run_id: &str,
+    label: &str,
+    expected_providers: &BTreeSet<String>,
+    request_id: &mut u64,
+) -> Result<serde_json::Value, String> {
+    let expected_snapshot = serving_snapshot(ctx)?;
+    if expected_snapshot.digest.is_empty() || expected_snapshot.resource_version.is_empty() {
+        return Err("serving revision has no digest or ConfigMap resourceVersion".to_owned());
+    }
+    let before_pods = gateway_pods(ctx)?;
+    let restart = kubectl(
+        ctx,
+        &["-n", NAMESPACE, "rollout", "restart", &format!("deployment/{GATEWAY}")],
+        Duration::from_secs(20),
+    )?;
+    write_command_output(&ctx.evidence_dir, &format!("gateway-restart-{label}.log"), &restart)?;
+    if !restart.status.success() {
+        return Err(format!(
+            "restart Gateway for serving revision failed: {}",
+            stderr(&restart)
+        ));
+    }
+    let rollout = kubectl(
+        ctx,
+        &[
+            "-n",
+            NAMESPACE,
+            "rollout",
+            "status",
+            &format!("deployment/{GATEWAY}"),
+            "--timeout=120s",
+        ],
+        Duration::from_secs(130),
+    )?;
+    write_command_output(&ctx.evidence_dir, &format!("gateway-rollout-{label}.log"), &rollout)?;
+    if !rollout.status.success() {
+        return Err(format!(
+            "Gateway did not become Ready after restart: {}",
+            stderr(&rollout)
+        ));
+    }
+    let deployment = json_kubectl(ctx, &["-n", NAMESPACE, "get", "deployment", GATEWAY])?;
+    let generation = deployment
+        .pointer("/metadata/generation")
+        .and_then(serde_json::Value::as_u64);
+    let observed = deployment
+        .pointer("/status/observedGeneration")
+        .and_then(serde_json::Value::as_u64);
+    let replicas = deployment.pointer("/spec/replicas").and_then(serde_json::Value::as_u64);
+    let ready = deployment
+        .pointer("/status/readyReplicas")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    if generation != observed || replicas != Some(1) || ready != 1 {
+        return Err(format!(
+            "Gateway Deployment is not current and singly Ready after restart: generation={generation:?}, observed={observed:?}, desired={replicas:?}, ready={ready}"
+        ));
+    }
+    let after_pods = gateway_pods(ctx)?;
+    let changed = after_pods
+        .values()
+        .any(|current| !before_pods.values().any(|old| old.uid == current.uid));
+    if !changed {
+        return Err("Gateway rollout completed without replacing its serving process".to_owned());
+    }
+    let after_snapshot = serving_snapshot(ctx)?;
+    if expected_snapshot.config_map_uid != after_snapshot.config_map_uid
+        || expected_snapshot.resource_version != after_snapshot.resource_version
+        || expected_snapshot.digest != after_snapshot.digest
+        || expected_snapshot.config != after_snapshot.config
+    {
+        return Err(format!(
+            "serving config changed during Gateway startup: {} / {} -> {} / {}",
+            expected_snapshot.resource_version,
+            expected_snapshot.digest,
+            after_snapshot.resource_version,
+            after_snapshot.digest
+        ));
+    }
+
+    let gateway_id = next_manual_request_id(run_id, label, request_id);
+    let before_receipts = receipt_snapshot(ctx)?;
+    let probe = request_json(
+        ctx,
+        &gateway_id,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": format!("{run_id}-{label}-fresh-gateway-probe")}]
+        }),
+    );
+    let after_receipts = receipt_snapshot(ctx)?;
+    if expected_providers.is_empty() {
+        if probe.error.is_some() || probe.status != Some(503) {
+            return Err(format!(
+                "fresh Gateway expected no eligible candidate but returned {:?}",
+                probe.status
+            ));
+        }
+        assert_no_new_receipts(&before_receipts, &after_receipts)?;
+    } else {
+        if !probe.is_success() || !probe.json_body_valid {
+            return Err(format!(
+                "fresh Gateway did not route a successful JSON probe: {probe:?}"
+            ));
+        }
+        let selected = probe
+            .mock_provider
+            .as_deref()
+            .ok_or("fresh Gateway probe lacks provider attribution")?;
+        if !expected_providers.contains(selected) {
+            return Err(format!(
+                "fresh Gateway selected ineligible provider {selected:?}; expected one of {expected_providers:?}"
+            ));
+        }
+        validate_attribution(&probe, selected)?;
+        assert_receipts_for_probes(&before_receipts, &after_receipts, std::slice::from_ref(&probe))?;
+    }
+    let log = kubectl(
+        ctx,
+        &[
+            "-n",
+            NAMESPACE,
+            "logs",
+            &format!("deployment/{GATEWAY}"),
+            "-c",
+            "praxis",
+            "--tail=250",
+        ],
+        Duration::from_secs(20),
+    )?;
+    write_command_output(&ctx.evidence_dir, &format!("gateway-startup-{label}.log"), &log)?;
+    if !log.status.success() {
+        return Err(format!("read post-start Gateway logs: {}", stderr(&log)));
+    }
+    Ok(serde_json::json!({
+        "acceptedByFreshGatewayProcess": true,
+        "configMapUid": after_snapshot.config_map_uid,
+        "resourceVersion": after_snapshot.resource_version,
+        "servingDigest": after_snapshot.digest,
+        "configUnchangedAcrossRestart": true,
+        "oldGatewayPods": before_pods.values().collect::<Vec<_>>(),
+        "newGatewayPods": after_pods.values().collect::<Vec<_>>(),
+        "startupLog": ctx.evidence_dir.join(format!("gateway-startup-{label}.log")).display().to_string(),
+        "revisionProbe": probe,
+    }))
+}
+
+/// Return the monotonically unique request ID for a manual probe.
+fn next_manual_request_id(run_id: &str, label: &str, sequence: &mut u64) -> String {
+    let id = format!("{run_id}-{label}-{}", *sequence);
+    *sequence = sequence.saturating_add(1);
+    id
+}
+
+/// Build a sample request ID in its own namespace, separate from manual probes.
+fn sample_request_id(run_id: &str, phase: &str, index: usize) -> String {
+    format!("{run_id}-sample-{phase}-{index}")
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ordered live qualification phases share revisions, request IDs, and safe restoration"
+)]
+/// Exercise no-pressure balancing, eligibility, state ownership, request forms, and recovery.
+fn run_site_route_balancing_phases(
+    ctx: &RunContext,
+    evidence: &mut Evidence,
+    request_id: &mut u64,
+    images: &Images,
+    quick: bool,
+) -> Result<(), String> {
+    let distribution_count = if quick { 120 } else { 600 };
+    let weighted_count = if quick { 240 } else { 900 };
+    let single_count = if quick { 24 } else { 60 };
+    let run_identity = evidence_run_id(evidence);
+
+    let runtime_images = phase(evidence, "deployments-and-runtime-images", || {
+        image_references_and_runtime_ids(
+            ctx,
+            images,
+            &[
+                "grid-operator",
+                GATEWAY,
+                "provider-a",
+                "provider-b-old",
+                "provider-b-replacement",
+                "provider-c",
+            ],
+        )
+    })?;
+    evidence.observations.insert(
+        "runtime_images".to_owned(),
+        serde_json::to_value(runtime_images).unwrap_or_default(),
+    );
+
+    let filter_config = phase(evidence, "embedded-gateway-runs-grid-site-route", || {
+        verify_grid_site_route_filter(ctx)
+    })?;
+    evidence.observations.insert(
+        "mounted_praxis_filter_chain".to_owned(),
+        serde_json::json!(filter_config),
+    );
+
+    let baseline_candidates = expected_main_model([1, 1, 1], true);
+    let platform = phase(evidence, "provider-readiness-and-absent-pressure-telemetry", || {
+        let mut statuses = BTreeMap::new();
+        for (provider, endpoint) in [
+            (PROVIDER_A, "http://provider-a.grid-system.svc:8080"),
+            (PROVIDER_B, "http://provider-b-old.grid-system.svc:8080"),
+            (PROVIDER_C, "http://provider-c.grid-system.svc:8080"),
+        ] {
+            statuses.insert(provider.to_owned(), wait_provider_available(ctx, provider, endpoint)?);
+        }
+        let provider_specs = verify_absent_pressure_telemetry(ctx)?;
+        let serving = wait_for_serving_model(ctx, MODEL, &baseline_candidates)?;
+        let second_model = BTreeMap::from([(PROVIDER_C.to_owned(), (1, true))]);
+        assert_serving_model(&serving, OTHER_MODEL, &second_model)?;
+        Ok(serde_json::json!({
+            "currentGenerationAvailableProviders": statuses,
+            "providerSpecsWithoutMetricsConfig": provider_specs,
+            "mainModelServingRevision": {
+                "uid": serving.config_map_uid,
+                "resourceVersion": serving.resource_version,
+                "digest": serving.digest,
+            },
+            "mainModelCandidates": serving_candidates(&serving, MODEL)?.keys().collect::<Vec<_>>(),
+            "otherModelCandidates": serving_candidates(&serving, OTHER_MODEL)?.keys().collect::<Vec<_>>(),
+            "pressureInputsAbsent": true,
+        }))
+    })?;
+    evidence
+        .observations
+        .insert("provider_and_metric_baseline".to_owned(), platform);
+
+    let baseline = phase(evidence, "three-equal-candidates-no-pressure", || {
+        let gateway = restart_gateway_for_revision(
+            ctx,
+            &run_identity,
+            "three-equal-candidates",
+            &BTreeSet::from([
+                "provider-a".to_owned(),
+                "provider-b-old".to_owned(),
+                "provider-c".to_owned(),
+            ]),
+            request_id,
+        )?;
+        let result = sample_distribution(
+            ctx,
+            &run_identity,
+            "three-equal-candidates",
+            distribution_count,
+            [1, 1, 1],
+            &BTreeSet::from([PROVIDER_A.to_owned(), PROVIDER_B.to_owned(), PROVIDER_C.to_owned()]),
+        )?;
+        Ok(serde_json::json!({
+            "gatewayRevisionAcceptance": gateway,
+            "distribution": distribution_evidence(&result, [1, 1, 1], distribution_count),
+        }))
+    })?;
+    evidence
+        .observations
+        .insert("three_equal_candidates".to_owned(), baseline);
+
+    let two_candidate_phase = phase(evidence, "two-candidate-distribution-after-withdrawal", || {
+        with_provider_patches(
+            ctx,
+            &[(
+                PROVIDER_C.to_owned(),
+                serde_json::json!({"trafficPolicy": {"drain": true}}),
+            )],
+            || {
+                let expected = expected_main_model_with_new_admissions(
+                    [1, 1, 1],
+                    &BTreeSet::from([PROVIDER_A.to_owned(), PROVIDER_B.to_owned()]),
+                );
+                let serving = wait_for_serving_model(ctx, MODEL, &expected)?;
+                let gateway = restart_gateway_for_revision(
+                    ctx,
+                    &run_identity,
+                    "two-candidates-drained-c",
+                    &BTreeSet::from(["provider-a".to_owned(), "provider-b-old".to_owned()]),
+                    request_id,
+                )?;
+                let result = sample_distribution(
+                    ctx,
+                    &run_identity,
+                    "two-candidates-drained-c",
+                    distribution_count,
+                    [1, 1, 1],
+                    &BTreeSet::from([PROVIDER_A.to_owned(), PROVIDER_B.to_owned()]),
+                )?;
+                Ok(serde_json::json!({
+                    "drainedCandidate": PROVIDER_C,
+                    "withdrawalRevision": serving.resource_version,
+                    "gatewayRevisionAcceptance": gateway,
+                    "distribution": distribution_evidence(&result, [1, 1, 1], distribution_count),
+                }))
+            },
+            || wait_for_default_provider_state(ctx),
+        )
+    })?;
+    evidence
+        .observations
+        .insert("two_candidate_withdrawal".to_owned(), two_candidate_phase);
+
+    let single_candidate_phase = phase(evidence, "single-candidate-distribution-after-withdrawal", || {
+        with_provider_patches(
+            ctx,
+            &[
+                (
+                    PROVIDER_B.to_owned(),
+                    serde_json::json!({"trafficPolicy": {"drain": true}}),
+                ),
+                (
+                    PROVIDER_C.to_owned(),
+                    serde_json::json!({"trafficPolicy": {"drain": true}}),
+                ),
+            ],
+            || {
+                let expected =
+                    expected_main_model_with_new_admissions([1, 1, 1], &BTreeSet::from([PROVIDER_A.to_owned()]));
+                let serving = wait_for_serving_model(ctx, MODEL, &expected)?;
+                let gateway = restart_gateway_for_revision(
+                    ctx,
+                    &run_identity,
+                    "one-candidate-drained-b-c",
+                    &BTreeSet::from(["provider-a".to_owned()]),
+                    request_id,
+                )?;
+                let result = sample_distribution(
+                    ctx,
+                    &run_identity,
+                    "one-candidate-drained-b-c",
+                    single_count,
+                    [1, 1, 1],
+                    &BTreeSet::from([PROVIDER_A.to_owned()]),
+                )?;
+                Ok(serde_json::json!({
+                    "drainedCandidates": [PROVIDER_B, PROVIDER_C],
+                    "withdrawalRevision": serving.resource_version,
+                    "gatewayRevisionAcceptance": gateway,
+                    "distribution": distribution_evidence(&result, [1, 1, 1], single_count),
+                }))
+            },
+            || wait_for_default_provider_state(ctx),
+        )
+    })?;
+    evidence
+        .observations
+        .insert("single_candidate_withdrawal".to_owned(), single_candidate_phase);
+
+    let weighted = phase(evidence, "capacity-weighted-draw-with-absent-pressure", || {
+        let patches = [
+            (PROVIDER_A.to_owned(), serde_json::json!({"capacityWeight": 1})),
+            (PROVIDER_B.to_owned(), serde_json::json!({"capacityWeight": 2})),
+            (PROVIDER_C.to_owned(), serde_json::json!({"capacityWeight": 3})),
+        ];
+        let zero_eligible = with_provider_patches(
+            ctx,
+            &patches,
+            || {
+                let expected = expected_main_model([1, 2, 3], true);
+                let serving = wait_for_serving_model(ctx, MODEL, &expected)?;
+                let gateway = restart_gateway_for_revision(
+                    ctx,
+                    &run_identity,
+                    "capacity-weighted-1-2-3",
+                    &BTreeSet::from([
+                        "provider-a".to_owned(),
+                        "provider-b-old".to_owned(),
+                        "provider-c".to_owned(),
+                    ]),
+                    request_id,
+                )?;
+                let result = sample_distribution(
+                    ctx,
+                    &run_identity,
+                    "capacity-weighted-1-2-3",
+                    weighted_count,
+                    [1, 2, 3],
+                    &BTreeSet::from([PROVIDER_A.to_owned(), PROVIDER_B.to_owned(), PROVIDER_C.to_owned()]),
+                )?;
+                Ok(serde_json::json!({
+                    "configuredRevision": serving.resource_version,
+                    "gatewayRevisionAcceptance": gateway,
+                    "distribution": distribution_evidence(&result, [1, 2, 3], weighted_count),
+                }))
+            },
+            || wait_for_default_provider_state(ctx),
+        )?;
+        let restored_gateway = restart_gateway_for_revision(
+            ctx,
+            &run_identity,
+            "weighted-restored",
+            &BTreeSet::from([
+                "provider-a".to_owned(),
+                "provider-b-old".to_owned(),
+                "provider-c".to_owned(),
+            ]),
+            request_id,
+        )?;
+        Ok(serde_json::json!({
+            "zeroEligible": zero_eligible,
+            "restoredGatewayRevisionAcceptance": restored_gateway,
+        }))
+    })?;
+    evidence
+        .observations
+        .insert("capacity_weighted_distribution".to_owned(), weighted);
+
+    let model_isolation = phase(evidence, "model-isolation-and-no-route-contract", || {
+        let gateway = restart_gateway_for_revision(
+            ctx,
+            &run_identity,
+            "model-isolation-baseline",
+            &BTreeSet::from([
+                "provider-a".to_owned(),
+                "provider-b-old".to_owned(),
+                "provider-c".to_owned(),
+            ]),
+            request_id,
+        )?;
+        let before_other = receipt_snapshot(ctx)?;
+        let other_id = next_manual_request_id(&run_identity, "other-model", request_id);
+        let other = request_json(
+            ctx,
+            &other_id,
+            "/v1/chat/completions",
+            serde_json::json!({"model": OTHER_MODEL, "messages": [{"role":"user","content":"model-isolation"}]}),
+        );
+        validate_attribution(&other, "provider-c")?;
+        if !other.json_body_valid {
+            return Err(format!("model-isolation response is not valid JSON: {other:?}"));
+        }
+        let after_other = receipt_snapshot(ctx)?;
+        assert_receipts_for_probes(&before_other, &after_other, std::slice::from_ref(&other))?;
+
+        let before_unknown = receipt_snapshot(ctx)?;
+        let unknown_id = next_manual_request_id(&run_identity, "unknown-model", request_id);
+        let unknown = request_json(
+            ctx,
+            &unknown_id,
+            "/v1/chat/completions",
+            serde_json::json!({"model": "not-a-served-model", "messages": [{"role":"user","content":"unknown-model"}]}),
+        );
+        if unknown.error.is_some() || unknown.status != Some(404) {
+            return Err(format!(
+                "unknown model returned {:?}, expected existing 404 contract",
+                unknown.status
+            ));
+        }
+        let after_unknown = receipt_snapshot(ctx)?;
+        assert_no_new_receipts(&before_unknown, &after_unknown)?;
+        Ok(serde_json::json!({
+            "knownOtherModel": {"status": other.status, "provider": other.mock_provider},
+            "unknownModel": {"status": unknown.status, "body": unknown.response_body},
+            "gatewayRevisionAcceptance": gateway,
+        }))
+    })?;
+    evidence
+        .observations
+        .insert("model_isolation".to_owned(), model_isolation);
+
+    let zero_eligible = phase(evidence, "known-model-zero-new-candidates-and-restoration", || {
+        let patches = [
+            (
+                PROVIDER_A.to_owned(),
+                serde_json::json!({"trafficPolicy": {"drain": true}}),
+            ),
+            (
+                PROVIDER_B.to_owned(),
+                serde_json::json!({"trafficPolicy": {"drain": true}}),
+            ),
+            (
+                PROVIDER_C.to_owned(),
+                serde_json::json!({"trafficPolicy": {"drain": true}}),
+            ),
+        ];
+        let drained = with_provider_patches(
+            ctx,
+            &patches,
+            || {
+                let expected = expected_main_model([1, 1, 1], false);
+                let serving = wait_for_serving_model(ctx, MODEL, &expected)?;
+                let gateway =
+                    restart_gateway_for_revision(ctx, &run_identity, "zero-eligible", &BTreeSet::new(), request_id)?;
+                let before = receipt_snapshot(ctx)?;
+                let id = next_manual_request_id(&run_identity, "zero-eligible", request_id);
+                let probe = request_json(
+                    ctx,
+                    &id,
+                    "/v1/chat/completions",
+                    serde_json::json!({"model": MODEL, "messages": [{"role":"user","content":"zero-eligible"}]}),
+                );
+                if probe.error.is_some() || probe.status != Some(503) {
+                    return Err(format!(
+                        "known model with no admitted candidate returned {:?}, expected 503",
+                        probe.status
+                    ));
+                }
+                let after = receipt_snapshot(ctx)?;
+                assert_no_new_receipts(&before, &after)?;
+                Ok(serde_json::json!({
+                    "status": probe.status,
+                    "servingRevision": serving.resource_version,
+                    "gatewayRevisionAcceptance": gateway,
+                    "backendReceipts": "zero",
+                }))
+            },
+            || wait_for_default_provider_state(ctx),
+        )?;
+        let restored_gateway = restart_gateway_for_revision(
+            ctx,
+            &run_identity,
+            "zero-eligible-restored",
+            &BTreeSet::from([
+                "provider-a".to_owned(),
+                "provider-b-old".to_owned(),
+                "provider-c".to_owned(),
+            ]),
+            request_id,
+        )?;
+        Ok(serde_json::json!({
+            "drainedState": drained,
+            "restoredGatewayRevisionAcceptance": restored_gateway,
+        }))
+    })?;
+    evidence
+        .observations
+        .insert("zero_eligible_and_restoration".to_owned(), zero_eligible);
+
+    let request_forms = phase(evidence, "json-sse-and-prefix-affinity", || {
+        let before = receipt_snapshot(ctx)?;
+        let first_id = next_manual_request_id(&run_identity, "prefix-first", request_id);
+        let second_id = next_manual_request_id(&run_identity, "prefix-second", request_id);
+        let prompt = prefix_affinity_prompt();
+        let first = request_json(
+            ctx,
+            &first_id,
+            "/v1/chat/completions",
+            serde_json::json!({"model": MODEL, "messages": [{"role":"user","content":prompt}]}),
+        );
+        let sticky_before = sticky_decisions(ctx)?;
+        let second = request_json(
+            ctx,
+            &second_id,
+            "/v1/chat/completions",
+            serde_json::json!({"model": MODEL, "messages": [{"role":"user","content":prompt}]}),
+        );
+        let sticky_after = sticky_decisions(ctx)?;
+        if !first.is_success()
+            || !second.is_success()
+            || first.mock_provider != second.mock_provider
+            || sticky_after.checked_sub(sticky_before) != Some(1)
+        {
+            return Err(format!(
+                "repeated prompt did not remain on its confirmed prefix holder: {first:?} / {second:?}"
+            ));
+        }
+        let stream_id = next_manual_request_id(&run_identity, "sse", request_id);
+        let stream = request_json(
+            ctx,
+            &stream_id,
+            "/v1/chat/completions",
+            serde_json::json!({"model": MODEL, "messages": [{"role":"user","content":"bounded SSE request"}], "stream":true}),
+        );
+        if !stream.is_success() || !stream.sse_body_valid {
+            return Err(format!(
+                "streaming response is not a successful OpenAI-compatible SSE stream: {stream:?}"
+            ));
+        }
+        validate_attribution(&first, first.mock_provider.as_deref().unwrap_or_default())?;
+        validate_attribution(&second, second.mock_provider.as_deref().unwrap_or_default())?;
+        validate_attribution(&stream, stream.mock_provider.as_deref().unwrap_or_default())?;
+        let after = receipt_snapshot(ctx)?;
+        assert_receipts_for_probes(&before, &after, &[first.clone(), second.clone(), stream.clone()])?;
+        Ok(serde_json::json!({
+            "stickyDecisions": {"before": sticky_before, "after": sticky_after},
+            "repeatedPromptProviders": [first.mock_provider, second.mock_provider],
+            "sse": {"status": stream.status, "contentType": stream.content_type, "valid": stream.sse_body_valid, "provider": stream.mock_provider},
+            "backendReceipts": "three unique requests, exactly once each",
+        }))
+    })?;
+    evidence
+        .observations
+        .insert("request_forms_and_affinity".to_owned(), request_forms);
+
+    let responses_state = phase(evidence, "responses-owner-routing-and-existing-only", || {
+        let before = receipt_snapshot(ctx)?;
+        let create_id = next_manual_request_id(&run_identity, "responses-create", request_id);
+        let created = request_json(
+            ctx,
+            &create_id,
+            "/v1/responses",
+            serde_json::json!({"model": MODEL, "input": "create stored response state"}),
+        );
+        let state_id = response_state_id(&created, "resp_")?;
+        let owner_id_tagged = state_id_has_site_tag(&state_id, "resp_", "local");
+        if !owner_id_tagged {
+            return Err("Responses state ID is missing the expected local Grid owner tag".to_owned());
+        }
+        let owner = created
+            .mock_provider
+            .as_deref()
+            .ok_or("Responses creation had no provider attribution")?;
+        let continuation_id = next_manual_request_id(&run_identity, "responses-continue", request_id);
+        let continuation = request_json(
+            ctx,
+            &continuation_id,
+            "/v1/responses",
+            serde_json::json!({"model": MODEL, "input": "continue stored response state", "previous_response_id": state_id}),
+        );
+        validate_attribution(&continuation, owner)?;
+        if !continuation.json_body_valid {
+            return Err(format!(
+                "Responses continuation returned invalid JSON: {continuation:?}"
+            ));
+        }
+        let after = receipt_snapshot(ctx)?;
+        assert_receipts_for_probes(&before, &after, &[created.clone(), continuation.clone()])?;
+
+        let owner_resource = provider_resource(owner)?;
+        let expected = [PROVIDER_A, PROVIDER_B, PROVIDER_C]
+            .into_iter()
+            .map(|provider| (provider.to_owned(), (1, provider != owner_resource)))
+            .collect::<BTreeMap<_, _>>();
+        let new_request_providers = ["provider-a", "provider-b-old", "provider-c"]
+            .into_iter()
+            .filter(|provider| *provider != owner)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let drain_result = with_provider_patches(
+            ctx,
+            &[(
+                owner_resource.to_owned(),
+                serde_json::json!({"trafficPolicy": {"drain": true}}),
+            )],
+            || {
+                let serving = wait_for_serving_model(ctx, MODEL, &expected)?;
+                let gateway = restart_gateway_for_revision(
+                    ctx,
+                    &run_identity,
+                    "responses-owner-existing-only",
+                    &new_request_providers,
+                    request_id,
+                )?;
+                let before_drain_continuation = receipt_snapshot(ctx)?;
+                let id = next_manual_request_id(&run_identity, "responses-existing-only", request_id);
+                let probe = request_json(
+                    ctx,
+                    &id,
+                    "/v1/responses",
+                    serde_json::json!({"model": MODEL, "input": "continue while owner admits existing state", "previous_response_id": state_id}),
+                );
+                validate_attribution(&probe, owner)?;
+                let continued = response_state_id(&probe, "resp_")?;
+                if !state_id_has_site_tag(&continued, "resp_", "local")
+                    || !serde_json::from_str::<serde_json::Value>(&probe.response_body)
+                        .is_ok_and(|body| body.get("object").and_then(serde_json::Value::as_str) == Some("response"))
+                {
+                    return Err("drained Responses continuation did not return a tagged response object".to_owned());
+                }
+                let after_drain_continuation = receipt_snapshot(ctx)?;
+                assert_receipts_for_probes(
+                    &before_drain_continuation,
+                    &after_drain_continuation,
+                    std::slice::from_ref(&probe),
+                )?;
+                Ok(serde_json::json!({
+                    "owner": owner,
+                    "ownerAdmission": "existing_only",
+                    "servingRevision": serving.resource_version,
+                    "gatewayRevisionAcceptance": gateway,
+                    "continuedAtOwner": true,
+                    "newResponseIdRedacted": true,
+                }))
+            },
+            || wait_for_default_provider_state(ctx),
+        )?;
+        let restored_gateway = restart_gateway_for_revision(
+            ctx,
+            &run_identity,
+            "responses-owner-restored",
+            &BTreeSet::from([
+                "provider-a".to_owned(),
+                "provider-b-old".to_owned(),
+                "provider-c".to_owned(),
+            ]),
+            request_id,
+        )?;
+        Ok(serde_json::json!({
+            "createStatus": created.status,
+            "continuationStatus": continuation.status,
+            "owner": owner,
+            "ownerIdTagged": owner_id_tagged,
+            "existingOnlyContinuation": drain_result,
+            "restoredGatewayRevisionAcceptance": restored_gateway,
+        }))
+    })?;
+    evidence
+        .observations
+        .insert("responses_state_routing".to_owned(), responses_state);
+
+    let conversations_state = phase(evidence, "conversations-owner-routing", || {
+        let before = receipt_snapshot(ctx)?;
+        let create_id = next_manual_request_id(&run_identity, "conversation-create", request_id);
+        let created = request_json(
+            ctx,
+            &create_id,
+            "/v1/conversations",
+            serde_json::json!({"metadata": {}}),
+        );
+        let state_id = response_state_id(&created, "conv_")?;
+        let owner_id_tagged = state_id_has_site_tag(&state_id, "conv_", "local");
+        if !owner_id_tagged {
+            return Err("Conversation state ID is missing the expected local Grid owner tag".to_owned());
+        }
+        let owner = created
+            .mock_provider
+            .as_deref()
+            .ok_or("Conversation creation had no provider attribution")?;
+        let get_id = next_manual_request_id(&run_identity, "conversation-get", request_id);
+        let read = request_http(ctx, &get_id, "GET", &format!("/v1/conversations/{state_id}"), None);
+        validate_attribution(&read, owner)?;
+        validate_conversation_read(&read, &state_id)?;
+        let after = receipt_snapshot(ctx)?;
+        assert_receipts_for_probes(&before, &after, &[created.clone(), read.clone()])?;
+        let owner_resource = provider_resource(owner)?;
+        let expected = [PROVIDER_A, PROVIDER_B, PROVIDER_C]
+            .into_iter()
+            .map(|provider| (provider.to_owned(), (1, provider != owner_resource)))
+            .collect::<BTreeMap<_, _>>();
+        let new_request_providers = ["provider-a", "provider-b-old", "provider-c"]
+            .into_iter()
+            .filter(|provider| *provider != owner)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let drain = with_provider_patches(
+            ctx,
+            &[(
+                owner_resource.to_owned(),
+                serde_json::json!({"trafficPolicy": {"drain": true}}),
+            )],
+            || {
+                let serving = wait_for_serving_model(ctx, MODEL, &expected)?;
+                let gateway = restart_gateway_for_revision(
+                    ctx,
+                    &run_identity,
+                    "conversation-owner-existing-only",
+                    &new_request_providers,
+                    request_id,
+                )?;
+                let before_drain_read = receipt_snapshot(ctx)?;
+                let id = next_manual_request_id(&run_identity, "conversation-existing-only", request_id);
+                let probe = request_http(ctx, &id, "GET", &format!("/v1/conversations/{state_id}"), None);
+                validate_attribution(&probe, owner)?;
+                validate_conversation_read(&probe, &state_id)?;
+                let after_drain_read = receipt_snapshot(ctx)?;
+                assert_receipts_for_probes(&before_drain_read, &after_drain_read, std::slice::from_ref(&probe))?;
+                Ok(
+                    serde_json::json!({"ownerAdmission":"existing_only", "servingRevision":serving.resource_version, "gatewayRevisionAcceptance":gateway, "continuedAtOwner":true}),
+                )
+            },
+            || wait_for_default_provider_state(ctx),
+        )?;
+        let restored_gateway = restart_gateway_for_revision(
+            ctx,
+            &run_identity,
+            "conversation-owner-restored",
+            &BTreeSet::from([
+                "provider-a".to_owned(),
+                "provider-b-old".to_owned(),
+                "provider-c".to_owned(),
+            ]),
+            request_id,
+        )?;
+        Ok(serde_json::json!({
+            "createStatus": created.status,
+            "readStatus": read.status,
+            "owner": owner,
+            "ownerIdTagged": owner_id_tagged,
+            "existingOnlyRead": drain,
+            "restoredGatewayRevisionAcceptance": restored_gateway,
+        }))
+    })?;
+    evidence
+        .observations
+        .insert("conversations_state_routing".to_owned(), conversations_state);
+    Ok(())
+}
+
+/// Unique run identifier embedded in evidence and every backend request ID.
+fn evidence_run_id(evidence: &Evidence) -> String {
+    evidence
+        .observations
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("site-route")
+        .to_owned()
+}
+
+/// Wait for all task providers, weights, metrics configuration, and serving candidates to restore.
+fn wait_for_default_provider_state(ctx: &RunContext) -> Result<(), String> {
+    wait_until(
+        "baseline provider specs and serving snapshot restoration",
+        WAIT_TIMEOUT,
+        || {
+            let mut restored = true;
+            for provider in [PROVIDER_A, PROVIDER_B, PROVIDER_C] {
+                let value = json_kubectl(ctx, &["get", "inferenceprovider", provider])?;
+                let spec = value.get("spec").ok_or("InferenceProvider has no spec")?;
+                restored &= spec.get("capacityWeight").and_then(serde_json::Value::as_u64) == Some(1);
+                restored &= spec
+                    .get("trafficPolicy")
+                    .is_none_or(|policy| policy.get("drain").and_then(serde_json::Value::as_bool) != Some(true));
+                restored &= spec.get("metricsConfig").is_none();
+            }
+            let candidates = expected_main_model([1, 1, 1], true);
+            let serving = serving_snapshot(ctx)?;
+            let matches = assert_serving_model(&serving, MODEL, &candidates).is_ok();
+            if restored && matches { Ok(Some(())) } else { Ok(None) }
+        },
+    )
 }
 
 #[expect(
@@ -1747,29 +3588,68 @@ fn write_evidence(evidence: &Evidence, directory: &Path) -> Result<(), String> {
     fs::write(directory.join("evidence.json"), json).map_err(|error| format!("write evidence: {error}"))
 }
 
-/// Run a single-cluster derived-dial, passive-health, and endpoint replacement qualification.
+/// Run the existing single-cluster derived-dial and passive-health qualification.
+pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_mode(options, false)
+}
+
+/// Run the dedicated `grid_site_route` balancing qualification.
+pub(crate) fn run_site_route_balancing(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_mode(options, true)
+}
+
+/// Run the shared task-owned Kind lifecycle with the selected qualification phases.
 #[expect(
     clippy::too_many_lines,
     reason = "the run lifecycle is deliberately kept adjacent to preserve failure and teardown ordering"
 )]
-pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
+fn run_with_mode(options: &Options, site_route_balancing: bool) -> Result<(), Box<dyn std::error::Error>> {
     let topology = &options.forge_config;
     let run = run_id();
     let source_fingerprint_sha256 = source_fingerprint()?;
-    let evidence_dir = evidence_dir(topology, options.evidence_dir.as_deref(), &run);
+    let source_revision = git_command(&["rev-parse", "HEAD"])?;
+    let cluster_prefix = if site_route_balancing {
+        // Kind appends "-control-plane" to this name for the node's Docker
+        // hostname, so keep the prefix short enough for the full run suffix.
+        "grid-site-route"
+    } else {
+        "grid-operator-routing"
+    };
+    let evidence_run = format!(
+        "{}-{run}",
+        if site_route_balancing {
+            "site-route-balancing"
+        } else {
+            "operator-routing"
+        }
+    );
+    let evidence_dir = evidence_dir(topology, options.evidence_dir.as_deref(), &evidence_run);
     create_evidence_dir(&evidence_dir)?;
-    let images = resolve_images().map_err(|error| format!("resolve source-built images: {error}"))?;
+    let images = match resolve_images() {
+        Ok(images) => images,
+        Err(error) => {
+            write_preflight_failure(
+                &evidence_dir,
+                &run,
+                topology,
+                &source_revision,
+                &source_fingerprint_sha256,
+                &error,
+            )?;
+            return Err(format!("resolve source-built images: {error}").into());
+        },
+    };
     let forge = super::glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?;
-    let cluster = cluster_name(&run);
+    let cluster = cluster_name(cluster_prefix, &run);
     let context = context_for(&cluster);
-    let network = format!("grid-operator-routing-{run}-net");
+    let network = format!("{cluster_prefix}-{run}-net");
     if kind_cluster_exists(&cluster)? {
         return Err(format!("run-owned Kind cluster {cluster} already exists; refusing to touch it").into());
     }
     if docker_network_exists(&network)? {
         return Err(format!("run-owned Docker network {network} already exists; refusing to touch it").into());
     }
-    let resolved_working_config = materialize_config(topology, &images, &run)?;
+    let resolved_working_config = materialize_config(topology, &images, cluster_prefix, &run)?;
     let state_dir = super::forge_config::state_dir_for_config(&resolved_working_config)?;
     if state_dir.exists() {
         fs::remove_file(&resolved_working_config)?;
@@ -1796,7 +3676,6 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         ("client_pinned_source".to_owned(), CLIENT_IMAGE_REF.to_owned()),
     ]);
     let image_ids = images.local_ids.clone();
-    let source_revision = git_command(&["rev-parse", "HEAD"])?;
     let mut evidence = Evidence {
         schema_version: 1,
         result: Outcome::Running,
@@ -1867,10 +3746,18 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
             Ok((value.pointer("/status/phase").and_then(serde_json::Value::as_str) == Some("Running")).then_some(()))
         })?;
         let mut request_id = 0;
-        run_phases(&ctx, &mut evidence, &mut request_id, &images)
+        if site_route_balancing {
+            run_site_route_balancing_phases(&ctx, &mut evidence, &mut request_id, &images, options.quick)
+        } else {
+            run_phases(&ctx, &mut evidence, &mut request_id, &images)
+        }
     })();
     if let Err(error) = &run_result {
-        evidence.result = Outcome::Fail;
+        evidence.result = if error.starts_with("INCONCLUSIVE: ") {
+            Outcome::Inconclusive
+        } else {
+            Outcome::Fail
+        };
         evidence
             .observations
             .insert("first_failure".to_owned(), serde_json::json!(error));
@@ -1917,7 +3804,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
             },
         }
     } else if options.keep_on_failure && run_result.is_err() {
-        "PRESERVED: --keep-on-failure retained run-owned cluster after diagnostics".clone_into(&mut evidence.cleanup);
+        evidence.cleanup = failed_run_cleanup_status(kind_cluster_exists(&cluster), docker_network_exists(&network));
     } else if !options.teardown {
         "NOT_REQUESTED: run-owned cluster retained".clone_into(&mut evidence.cleanup);
     }
@@ -1960,6 +3847,28 @@ fn docker_network_exists(network: &str) -> Result<bool, String> {
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .any(|line| line.trim() == network))
+}
+
+/// Describe which exact run-owned resources remain after a failed run.
+fn failed_run_cleanup_status(cluster: Result<bool, String>, network: Result<bool, String>) -> String {
+    match (cluster, network) {
+        (Ok(true), Ok(true)) => {
+            "PRESERVED: --keep-on-failure retained the run-owned Kind cluster and Docker network after diagnostics"
+                .to_owned()
+        },
+        (Ok(true), Ok(false)) => "PARTIAL: run-owned Kind cluster remains but its Docker network is absent".to_owned(),
+        (Ok(false), Ok(true)) => "PARTIAL: run-owned Docker network remains but the Kind cluster is absent".to_owned(),
+        (Ok(false), Ok(false)) => "NOT_PRESENT: failed run left no run-owned Kind cluster or Docker network".to_owned(),
+        (Err(error), Ok(present)) => {
+            format!("UNKNOWN: could not verify the run-owned Kind cluster ({error}); Docker network present={present}")
+        },
+        (Ok(present), Err(error)) => {
+            format!("UNKNOWN: run-owned Kind cluster present={present}; could not verify its Docker network ({error})")
+        },
+        (Err(cluster_error), Err(network_error)) => format!(
+            "UNKNOWN: could not verify run-owned Kind cluster ({cluster_error}) or Docker network ({network_error})"
+        ),
+    }
 }
 
 /// Confirm teardown removed the run-owned Kind cluster.
@@ -2037,6 +3946,7 @@ fn source_fingerprint_from_parts(tracked_diff: &[u8], untracked_files: &[(String
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{BTreeMap, BTreeSet},
         error::Error,
         fs,
         process::Command,
@@ -2046,12 +3956,69 @@ mod tests {
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
     use super::{
-        CLIENT_IMAGE, CLIENT_IMAGE_DIGEST, CLIENT_IMAGE_REF, GatewayPodIdentity, GatewayPodSnapshot, Outcome, Probe,
-        STACK_APPLICATION_ORDER, bounded_command, correlated_failure_and_demotion, create_evidence_dir,
-        ensure_gateway_pods_retained, has_repo_digest, is_provider_demotion_log, is_provider_failure_log,
-        parse_phase_log, require_dial, source_fingerprint_from_parts, split_image, strip_ansi_codes,
-        validate_attribution,
+        CLIENT_IMAGE, CLIENT_IMAGE_DIGEST, CLIENT_IMAGE_REF, GatewayPodIdentity, GatewayPodSnapshot, Outcome,
+        PREFIX_AFFINITY_MINIMUM_BYTES, PROVIDER_C, Probe, ProviderReceipts, STACK_APPLICATION_ORDER,
+        assert_distribution, bounded_command, cluster_name, correlated_failure_and_demotion, create_evidence_dir,
+        ensure_gateway_pods_retained, expected_main_model_with_new_admissions, failed_run_cleanup_status,
+        has_repo_digest, is_provider_demotion_log, is_provider_failure_log, next_manual_request_id, parse_phase_log,
+        prefix_affinity_prompt, require_dial, sample_request_id, source_fingerprint_from_parts, split_image,
+        state_id_has_site_tag, strip_ansi_codes, validate_attribution, validate_receipt_identity,
+        write_preflight_failure,
     };
+
+    #[test]
+    fn stored_state_tag_check_matches_grid_prefix_insertion_format() {
+        assert!(state_id_has_site_tag(
+            "resp_local.0123abcd..resp_provider-a-1",
+            "resp_",
+            "local"
+        ));
+        assert!(state_id_has_site_tag(
+            "conv_local.0123abcd.0123456789abcdef.conv_provider-c-2",
+            "conv_",
+            "local"
+        ));
+        assert!(
+            !"resp_local.0123abcd..resp_provider-a-1".contains(".local."),
+            "the site name follows the API prefix underscore"
+        );
+        assert!(
+            !state_id_has_site_tag("resp_local.0123abcd..resp_provider-a-1", "resp_", "remote"),
+            "an ID tagged for another site must not pass"
+        );
+        assert!(
+            !state_id_has_site_tag("resp_provider-a-1", "resp_", "local"),
+            "an untagged upstream ID must not pass"
+        );
+        assert!(
+            !state_id_has_site_tag("resp_local.not-hex..resp_provider-a-1", "resp_", "local"),
+            "an invalid cluster mark must not pass"
+        );
+    }
+
+    #[test]
+    fn failed_run_cleanup_status_reports_actual_cluster_and_network_presence() {
+        assert_eq!(
+            failed_run_cleanup_status(Ok(true), Ok(true)),
+            "PRESERVED: --keep-on-failure retained the run-owned Kind cluster and Docker network after diagnostics"
+        );
+        assert_eq!(
+            failed_run_cleanup_status(Ok(false), Ok(false)),
+            "NOT_PRESENT: failed run left no run-owned Kind cluster or Docker network"
+        );
+        assert_eq!(
+            failed_run_cleanup_status(Ok(true), Ok(false)),
+            "PARTIAL: run-owned Kind cluster remains but its Docker network is absent"
+        );
+        assert_eq!(
+            failed_run_cleanup_status(Ok(false), Ok(true)),
+            "PARTIAL: run-owned Docker network remains but the Kind cluster is absent"
+        );
+        assert!(
+            failed_run_cleanup_status(Err("kind unavailable".to_owned()), Ok(false)).contains("kind unavailable"),
+            "resource inspection errors must not be reported as successful retention"
+        );
+    }
 
     #[test]
     fn image_reference_split_handles_registry_ports() {
@@ -2089,6 +4056,15 @@ mod tests {
     }
 
     #[test]
+    fn live_prefix_affinity_prompt_exceeds_the_four_key_minimum() {
+        let prompt = prefix_affinity_prompt();
+        assert!(
+            prompt.len() >= PREFIX_AFFINITY_MINIMUM_BYTES,
+            "live warm-up prompt must exceed four 256-byte canonical prefix blocks"
+        );
+    }
+
+    #[test]
     fn dial_assertion_checks_the_published_address_not_just_candidate_presence() -> Result<(), Box<dyn Error>> {
         let dial = serde_json::json!({"dial":{"provider-b":{"address":"provider-b.grid-system.svc:8080"}}});
         require_dial(&dial, "provider-b", "provider-b.grid-system.svc:8080")?;
@@ -2102,10 +4078,15 @@ mod tests {
     #[test]
     fn successful_probe_requires_gateway_and_backend_attribution() -> Result<(), Box<dyn Error>> {
         let valid = Probe {
+            request_id: "probe-1".to_owned(),
             status: Some(200),
             grid_backend: Some("provider-b".to_owned()),
             grid_site: Some("local".to_owned()),
             mock_provider: Some("provider-b-old".to_owned()),
+            content_type: Some("application/json".to_owned()),
+            json_body_valid: true,
+            sse_body_valid: false,
+            response_body: String::new(),
             error: None,
         };
         assert!(valid.is_success(), "HTTP 200 with both attributions is a valid probe");
@@ -2118,6 +4099,12 @@ mod tests {
             "missing Grid backend attribution must fail"
         );
         validate_attribution(&valid, "provider-b-old")?;
+        let provider_c = Probe {
+            grid_backend: Some(PROVIDER_C.to_owned()),
+            mock_provider: Some("provider-c".to_owned()),
+            ..valid.clone()
+        };
+        validate_attribution(&provider_c, "provider-c")?;
         assert!(
             validate_attribution(&valid, "provider-a").is_err(),
             "a mismatched provider attribution must fail"
@@ -2128,6 +4115,157 @@ mod tests {
         };
         assert!(!missing_site.is_success(), "missing site attribution must fail");
         Ok(())
+    }
+
+    #[test]
+    fn distribution_assertion_accepts_sampling_variation_and_zero_draws_but_rejects_skew() {
+        let equal_weights = BTreeMap::from([
+            ("provider-a".to_owned(), 1),
+            ("provider-b".to_owned(), 1),
+            ("provider-c".to_owned(), 1),
+        ]);
+        assert!(
+            assert_distribution(
+                &BTreeMap::from([
+                    ("provider-a".to_owned(), 38),
+                    ("provider-b".to_owned(), 31),
+                    ("provider-c".to_owned(), 31),
+                ]),
+                &equal_weights,
+                100,
+            )
+            .is_ok(),
+            "an approximate equal draw must not require round-robin counts"
+        );
+        assert!(
+            assert_distribution(
+                &BTreeMap::from([("provider-a".to_owned(), 1), ("provider-b".to_owned(), 0),]),
+                &BTreeMap::from([("provider-a".to_owned(), 1), ("provider-b".to_owned(), 1)]),
+                1,
+            )
+            .is_ok(),
+            "an eligible candidate may receive no request in a small sample"
+        );
+        assert!(
+            assert_distribution(
+                &BTreeMap::from([
+                    ("provider-a".to_owned(), 60),
+                    ("provider-b".to_owned(), 20),
+                    ("provider-c".to_owned(), 20),
+                ]),
+                &equal_weights,
+                100,
+            )
+            .is_err(),
+            "a materially skewed sample must fail"
+        );
+        let weighted = BTreeMap::from([
+            ("provider-a".to_owned(), 1),
+            ("provider-b".to_owned(), 2),
+            ("provider-c".to_owned(), 3),
+        ]);
+        assert!(
+            assert_distribution(
+                &BTreeMap::from([
+                    ("provider-a".to_owned(), 17),
+                    ("provider-b".to_owned(), 33),
+                    ("provider-c".to_owned(), 50),
+                ]),
+                &weighted,
+                100,
+            )
+            .is_ok(),
+            "the expected 1:2:3 share must pass"
+        );
+        assert!(
+            assert_distribution(
+                &BTreeMap::from([
+                    ("provider-a".to_owned(), 45),
+                    ("provider-b".to_owned(), 30),
+                    ("provider-c".to_owned(), 25),
+                ]),
+                &weighted,
+                100,
+            )
+            .is_err(),
+            "a materially wrong static-weight ratio must fail"
+        );
+    }
+
+    #[test]
+    fn sample_request_ids_do_not_collide_with_gateway_revision_probes() {
+        let mut sequence = 0;
+        let gateway_probe = next_manual_request_id("run-1", "three-equal-candidates", &mut sequence);
+        let first_sample = sample_request_id("run-1", "three-equal-candidates", 0);
+        assert_ne!(
+            gateway_probe, first_sample,
+            "the Gateway handoff probe and first distribution request need distinct receipt IDs"
+        );
+    }
+
+    #[test]
+    fn withdrawal_expectations_keep_undrained_candidates_admitting_new_requests() {
+        let two_candidates = expected_main_model_with_new_admissions(
+            [1, 1, 1],
+            &BTreeSet::from(["provider-a".to_owned(), "provider-b".to_owned()]),
+        );
+        assert_eq!(
+            two_candidates,
+            BTreeMap::from([
+                ("provider-a".to_owned(), (1, true)),
+                ("provider-b".to_owned(), (1, true)),
+                ("provider-c".to_owned(), (1, false)),
+            ]),
+            "draining only Provider C must leave Providers A and B eligible for new requests"
+        );
+        let single_candidate =
+            expected_main_model_with_new_admissions([1, 1, 1], &BTreeSet::from(["provider-a".to_owned()]));
+        assert_eq!(
+            single_candidate,
+            BTreeMap::from([
+                ("provider-a".to_owned(), (1, true)),
+                ("provider-b".to_owned(), (1, false)),
+                ("provider-c".to_owned(), (1, false)),
+            ]),
+            "draining Providers B and C must leave Provider A eligible for new requests"
+        );
+    }
+
+    #[test]
+    fn chat_sse_requires_a_chunk_and_a_separate_terminal_event() {
+        let chunk = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[]}\r\n\r\n";
+        assert!(super::valid_chat_sse(&format!("{chunk}data: [DONE]\r\n\r\n")));
+        assert!(!super::valid_chat_sse(": data: [DONE]\n\n"));
+        assert!(!super::valid_chat_sse(&format!("{chunk}data: [DONE]")));
+        assert!(!super::valid_chat_sse(&format!("data: [DONE]\n\n{chunk}")));
+    }
+
+    #[test]
+    fn receipt_identity_uses_the_backend_service_name_not_the_grid_provider_name() {
+        let receipt = ProviderReceipts {
+            provider: "provider-b-old".to_owned(),
+            instance: "recorder-1".to_owned(),
+            total: 1,
+            request_ids: vec![Some("request-1".to_owned())],
+        };
+        assert!(
+            validate_receipt_identity("provider-b-old", &receipt).is_ok(),
+            "receipt identity must match the backend service being scraped"
+        );
+        assert!(
+            validate_receipt_identity("provider-b", &receipt).is_err(),
+            "the Grid InferenceProvider name can differ from the fixture backend identity"
+        );
+    }
+
+    #[test]
+    fn site_route_cluster_name_keeps_kind_node_hostname_within_docker_limit() {
+        let cluster = cluster_name("grid-site-route", "1794806609138-4294967295");
+        let hostname = format!("{cluster}-control-plane");
+        assert!(
+            hostname.len() <= 63,
+            "Kind control-plane hostname must fit Docker's 63-character hostname limit: {hostname}"
+        );
     }
 
     #[test]
@@ -2404,6 +4542,36 @@ mod tests {
             fs::read(prior_result)?,
             b"prior run",
             "refusing reuse must preserve existing evidence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_preflight_failure_is_recorded_without_environment_values() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let error = super::preflight_image_id("operator", Err("private-registry.example/sentinel-image".to_owned()))
+            .err()
+            .ok_or("expected image inspection to fail")?;
+        write_preflight_failure(
+            directory.path(),
+            "run-1",
+            std::path::Path::new("tests/e2e/topologies/grid-site-route-balancing/forge.yaml"),
+            "revision-1",
+            "fingerprint-1",
+            &error,
+        )?;
+
+        let report = fs::read_to_string(directory.path().join("PRE-FLIGHT-FAILURE.md"))?;
+        assert!(report.contains("run-1"), "preflight evidence records the run ID");
+        assert!(
+            report.contains("revision-1"),
+            "preflight evidence records the source revision"
+        );
+        assert!(report.contains("Cluster creation and application mutations: not started"));
+        assert!(report.contains("could not inspect the operator image"));
+        assert!(
+            !report.contains("sentinel-image"),
+            "preflight evidence does not persist credentials"
         );
         Ok(())
     }
