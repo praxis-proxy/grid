@@ -16,7 +16,13 @@ proves that each site's EPP signals cross the operator mTLS poll relay, reach
 the Gateway through its local operator, and change live site selection without
 a Gateway restart. It also checks that a stale local signal is excluded while
 SWIM remains connected and that a peer with the wrong pinned identity cannot
-replace an accepted signal.
+replace an accepted signal. The full cross-site proof requires the site with
+the polling Grid Gateway to report a current-generation
+`SignalRelayCapacity=False/WithinBudget` condition. It checks that provider-batch
+omission counters are present and zero at both operators, for their local and
+peer stores. It does not require a completed local relay at the site without a
+polling Gateway. This checks the ordinary two-pool relay path; the 256-provider
+capacity envelope is covered by operator tests, not this small Kind topology.
 
 Build the Grid operator and Gateway from this checkout before a full local run:
 

@@ -81,6 +81,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SIGNALS_RELAY_TRUNCATED.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_RELAY_PROVIDER_BATCHES_OMITTED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MODEL_DISCOVERY_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_CATALOG_TOTAL.clone()))
@@ -521,11 +523,29 @@ static SIGNALS_RELAY_TRUNCATED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
             "grid_signals_relay_truncated_total",
-            "Targets dropped and lines cut from the relay served to the local gateway",
+            "Targets dropped and lines cut from the local-gateway signals relay",
         ),
         &["store", "cut"],
     )
     .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Provider batches omitted by bounded local-gateway rendering, split by fixed cause.
+static SIGNALS_RELAY_PROVIDER_BATCHES_OMITTED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let metric = IntCounterVec::new(
+        Opts::new(
+            "grid_signals_relay_provider_batches_omitted_total",
+            "Provider batches omitted by the local-gateway signals relay",
+        ),
+        &["store", "reason"],
+    )
+    .unwrap_or_else(|_| std::process::abort());
+    for store in ["site", "peers"] {
+        for reason in ["rows", "bytes", "invalid"] {
+            let _counter = metric.with_label_values(&[store, reason]);
+        }
+    }
+    metric
 });
 
 /// Count what `rendered` left out of the relay for `store` (`site` or `peers`).
@@ -539,6 +559,26 @@ pub fn record_relay_truncated(store: &str, rendered: &crate::signals::Rendered) 
         SIGNALS_RELAY_TRUNCATED
             .with_label_values(&[store, "line"])
             .inc_by(u64::try_from(rendered.lines_cut).unwrap_or(u64::MAX));
+    }
+    for (reason, count) in [
+        ("rows", rendered.providers_omitted_by_rows),
+        ("bytes", rendered.providers_omitted_by_bytes),
+        ("invalid", rendered.invalid_batches),
+    ] {
+        if count > 0 {
+            SIGNALS_RELAY_PROVIDER_BATCHES_OMITTED
+                .with_label_values(&[store, reason])
+                .inc_by(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+    }
+}
+
+/// Count poll-round metadata rows omitted from the bounded local-gateway relay.
+pub fn record_relay_poll_rounds_omitted(rows: usize) {
+    if rows > 0 {
+        SIGNALS_RELAY_TRUNCATED
+            .with_label_values(&["rounds", "line"])
+            .inc_by(u64::try_from(rows).unwrap_or(u64::MAX));
     }
 }
 
@@ -1465,6 +1505,37 @@ mod tests {
             text.contains("grid_gateway_feedback_events_total"),
             "the operator exports the feedback events"
         );
+    }
+
+    #[test]
+    fn relay_omissions_use_only_fixed_labels() {
+        drop(scrape());
+        let rounds = SIGNALS_RELAY_TRUNCATED.with_label_values(&["rounds", "line"]);
+        let rows = SIGNALS_RELAY_PROVIDER_BATCHES_OMITTED.with_label_values(&["peers", "rows"]);
+        let bytes = SIGNALS_RELAY_PROVIDER_BATCHES_OMITTED.with_label_values(&["peers", "bytes"]);
+        let invalid = SIGNALS_RELAY_PROVIDER_BATCHES_OMITTED.with_label_values(&["peers", "invalid"]);
+        let rounds_before = rounds.get();
+        let rows_before = rows.get();
+        let bytes_before = bytes.get();
+        let invalid_before = invalid.get();
+        record_relay_truncated(
+            "peers",
+            &crate::signals::Rendered {
+                providers_omitted_by_rows: 2,
+                providers_omitted_by_bytes: 3,
+                invalid_batches: 4,
+                ..crate::signals::Rendered::default()
+            },
+        );
+        record_relay_poll_rounds_omitted(5);
+        assert_eq!(rounds.get(), rounds_before + 5);
+        assert_eq!(rows.get(), rows_before + 2);
+        assert_eq!(bytes.get(), bytes_before + 3);
+        assert_eq!(invalid.get(), invalid_before + 4);
+        let text = scrape();
+        assert!(text.contains("grid_signals_relay_provider_batches_omitted_total"));
+        assert!(text.contains("reason=\"bytes\",store=\"peers\""));
+        assert!(text.contains("grid_signals_relay_truncated_total{cut=\"line\",store=\"rounds\"}"));
     }
 
     #[test]

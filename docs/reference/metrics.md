@@ -107,7 +107,18 @@ relays every site's readings to its own gateway.
 | `grid_signals_ca_loaded_timestamp_seconds` | gauge | | Unix time the listener last loaded its CA bundle. It moves when the listener restarts on rotated material. |
 | `grid_signals_ca_expiry_timestamp_seconds` | gauge | | Unix time the earliest loaded CA anchor expires, 0 while none is loaded. |
 | `grid_signals_ca_anchors` | gauge | | Certificates in the loaded CA bundle. A rotation that adds the new anchor before dropping the old one reads 2 for its overlap. |
-| `grid_signals_relay_truncated_total` | counter | `store`, `cut` | Targets dropped and lines cut from the relay served to the local gateway. |
+| `grid_signals_relay_truncated_total` | counter | `store`, `cut` | Targets dropped and lines cut from the local-gateway relay. `store="rounds",cut="line"` counts omitted poll-round metadata rows. |
+| `grid_signals_relay_provider_batches_omitted_total` | counter | `store`, `reason` | Complete provider batches omitted from the local-gateway relay: `rows` and `bytes` are capacity bounds; `invalid` is an incomplete or invalid revision batch. |
+
+In poll mode, the active publisher's `GridNetwork` reports the latest local relay
+outcome in `SignalRelayCapacity`: `False/WithinBudget` means the latest response
+fit, `True/RelayCapacityExceeded` means poll-round rows or provider batches were
+omitted for capacity, and `Unknown/AwaitingFirstRelay` means no response has
+completed yet. The condition is written only when its state changes. Provider
+batch omission counters carry the reason and store (`site` or `peers`); poll-round
+row omissions use `grid_signals_relay_truncated_total{store="rounds",cut="line"}`.
+Invalid revision batches are counted separately and do not turn the capacity
+condition True.
 
 Alert before the listener sheds, not after; `grid_signals_connections_shed_total` says it
 already did. Both fire above four fifths of a cap for five minutes:

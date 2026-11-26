@@ -9,8 +9,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    io::Write as _,
+    process::{Command, Stdio},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -22,6 +26,9 @@ use super::{
     run_cluster_prefix, set_simulator_fake_metrics_with_endpoint_kv, set_simulator_waiting_requests,
     split_image_reference,
 };
+
+/// Short-lived token used only to scrape this run's release-scoped Gateway metrics.
+static GATEWAY_METRICS_BEARER_TOKEN: OnceLock<String> = OnceLock::new();
 
 /// One live peer is sufficient for the two-site topology used by this proof.
 const MIN_CONNECTED_SWIM_MEMBERS: u64 = 1;
@@ -507,6 +514,7 @@ fn run(
     prepare_poll_gateway(image)?;
 
     let local_context = kind_context(GRID_SERVING_SITE);
+    initialize_gateway_metrics_token(&local_context)?;
     let (gateway_http_port, _gateway_forward) =
         start_ready_port_forward(&local_context, GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT)?;
     let (gateway_metrics_port, _gateway_metrics_forward) = start_ready_port_forward(
@@ -531,7 +539,7 @@ fn run(
         "Grid Gateway watcher observed its mounted serving configuration".to_owned(),
     );
 
-    wait_for_relay_samples(operator_metrics_port, Duration::from_secs(120))?;
+    wait_for_relay_samples_and_verify_capacity(operator_metrics_port, peer_operator_metrics_port, observations)?;
     let metrics = read_operator_metrics(operator_metrics_port)?;
     let local_a = sample_value(
         &metrics,
@@ -754,20 +762,188 @@ fn run(
     let remote_site = format!("{GRID_NETWORK_NAME}-pool-b");
     let original_pins = read_site_pins(&local_context, &remote_site)?;
     let poll_failures_before_bad_pin = peer_poll_failure_counts(&trusted_metrics_before_bad_pin, "pool-b");
-    let wrong_pin = "0000000000000000000000000000000000000000000000000000000000000000";
     record(
         observations,
         format!(
             "wrong-peer-pin phase starting: trusted pool-a sample={local_a_before_bad_pin}, trusted pool-b sample={pool_b_before_bad_pin}, pool-b origin sample={pool_b_origin_before}"
         ),
     );
-    let invalid_identity_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+    let invalid_identity_result = WrongPeerPinProof {
+        context,
+        observations,
+        attribution,
+        local_context: &local_context,
+        remote_site: &remote_site,
+        gateway_http_port,
+        operator_metrics_port,
+        peer_operator_metrics_port,
+        pool_b_before_bad_pin,
+        pool_b_origin_before,
+        poll_failures_before_bad_pin,
+    }
+    .run();
+    record(
+        observations,
+        "restoring the original pool-b fingerprint on pool-a".to_owned(),
+    );
+    let pin_restore = patch_site_pins(&local_context, &remote_site, &original_pins);
+    match &pin_restore {
+        Ok(()) => record(observations, "original pool-b fingerprint restored".to_owned()),
+        Err(error) => record(
+            observations,
+            format!("failed to restore the original pool-b fingerprint: {error}"),
+        ),
+    }
+    match (invalid_identity_result, pin_restore) {
+        (Ok(()), Ok(())) => {},
+        (Err(proof_error), Ok(())) => return Err(proof_error),
+        (Ok(()), Err(restore_error)) => {
+            return Err(format!("peer-pin proof passed but pin restoration failed: {restore_error}").into());
+        },
+        (Err(proof_error), Err(restore_error)) => {
+            return Err(format!(
+                "peer-pin proof failed: {proof_error}; peer-pin restoration also failed: {restore_error}"
+            )
+            .into());
+        },
+    }
+
+    let (phase_after_restore, reason_after_restore, restored_site_resource_version) =
+        wait_for_gridsite_phase_and_reason(
+            &local_context,
+            &remote_site,
+            "Active",
+            "TlsVerified",
+            Duration::from_secs(90),
+        )?;
+    record(
+        observations,
+        format!(
+            "pool-b GridSite returned to an eligible state after restoring its trusted identity: phase={phase_after_restore}, reason={reason_after_restore}, resourceVersion={restored_site_resource_version}"
+        ),
+    );
+    wait_for_relay_samples(operator_metrics_port, Duration::from_secs(90))?;
+    let pool_b_restored = wait_for_signal_decrease(
+        operator_metrics_port,
+        "pool-b",
+        pool_b_before_bad_pin,
+        Duration::from_secs(90),
+    )?;
+    wait_for_pressure_order_recorded(
+        operator_metrics_port,
+        "pool-b",
+        Duration::from_secs(90),
+        observations,
+        "pool-a operator observed the recovered pressure order",
+    )?;
+    verify_weighted_site_distribution(
+        gateway_http_port,
+        gateway_metrics_port,
+        "pool-b",
+        true,
+        "restored-peer-identity-routing",
+        attribution,
+        Duration::from_secs(120),
+    )
+    .map(|distribution| {
+        record(
+            observations,
+            format!("restored peer identity and lower-pressure pool-b routing: {distribution}"),
+        );
+    })?;
+    record(
+        observations,
+        format!("pool-a accepted the restored peer's lower-pressure signal: {pool_b_restored}"),
+    );
+    prove_network_partition(
+        context,
+        gateway_http_port,
+        gateway_metrics_port,
+        operator_metrics_port,
+        mtls,
+        &gateway_uid,
+        attribution,
+        observations,
+    )?;
+    if gateway_pod_uid(&local_context)? != gateway_uid {
+        return Err("Grid Gateway pod changed during the cross-site signal proof".into());
+    }
+
+    let gateway_metrics = read_gateway_metrics(gateway_metrics_port)?;
+    record(
+        observations,
+        format!(
+            "Grid Gateway route decision samples: pool-a={}, pool-b={}",
+            metric_counter(
+                &gateway_metrics,
+                "grid_route_decisions_total",
+                &[("site", "pool-a"), ("reason", "routed")]
+            ),
+            metric_counter(
+                &gateway_metrics,
+                "grid_route_decisions_total",
+                &[("site", "pool-b"), ("reason", "routed")]
+            )
+        ),
+    );
+    Ok(())
+}
+
+/// Evidence and run-owned state for rejecting a changed peer certificate pin.
+struct WrongPeerPinProof<'proof> {
+    /// Simulator and transport configuration for this demo.
+    context: &'proof DemoContext,
+    /// Live observations to append as the proof advances.
+    observations: &'proof mut Vec<String>,
+    /// Request attribution collected during the routing assertion.
+    attribution: &'proof mut RoutingAttributionDiagnostics,
+    /// Kubernetes context for the serving site.
+    local_context: &'proof str,
+    /// Run-owned remote GridSite resource name.
+    remote_site: &'proof str,
+    /// Local port for the consumer Gateway.
+    gateway_http_port: u16,
+    /// Local port for the serving site's operator metrics.
+    operator_metrics_port: u16,
+    /// Local port for the peer site's operator metrics.
+    peer_operator_metrics_port: u16,
+    /// Last trusted peer signal before changing its pin.
+    pool_b_before_bad_pin: f64,
+    /// Peer site's local signal before changing the serving site's pin.
+    pool_b_origin_before: f64,
+    /// Failure counters before the invalid pin is installed.
+    poll_failures_before_bad_pin: PeerPollFailureCounts,
+}
+
+impl WrongPeerPinProof<'_> {
+    /// Prove that an untrusted changed signal cannot move routing away from the local pool.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the proof preserves one ordered stimulus, identity check, and routing assertion"
+    )]
+    fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        let Self {
+            context,
+            observations,
+            attribution,
+            local_context,
+            remote_site,
+            gateway_http_port,
+            operator_metrics_port,
+            peer_operator_metrics_port,
+            pool_b_before_bad_pin,
+            pool_b_origin_before,
+            poll_failures_before_bad_pin,
+        } = self;
+        let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
+        let wrong_pin = "0000000000000000000000000000000000000000000000000000000000000000";
+
         record(
             observations,
             "injecting invalid pool-b fingerprint on pool-a".to_owned(),
         );
-        patch_site_pins(&local_context, &remote_site, &[wrong_pin.to_owned()])?;
-        if read_site_pins(&local_context, &remote_site)? != [wrong_pin.to_owned()] {
+        patch_site_pins(local_context, remote_site, &[wrong_pin.to_owned()])?;
+        if read_site_pins(local_context, remote_site)? != [wrong_pin.to_owned()] {
             return Err("pool-a did not retain the injected invalid pool-b fingerprint".into());
         }
         record(
@@ -790,8 +966,8 @@ fn run(
 
         let (phase_during_rejection, reason_during_rejection, site_resource_version) =
             wait_for_gridsite_phase_and_reason(
-                &local_context,
-                &remote_site,
+                local_context,
+                remote_site,
                 "Connecting",
                 "PinMismatch",
                 Duration::from_secs(30),
@@ -803,7 +979,7 @@ fn run(
             ),
         );
 
-        let connected_sites_during_tls_rejection = read_connected_sites(&local_context)?;
+        let connected_sites_during_tls_rejection = read_connected_sites(local_context)?;
         if !has_connected_swim_peer(connected_sites_during_tls_rejection) {
             return Err(format!("SWIM membership did not remain connected during peer-signal TLS rejection: connectedSites={connected_sites_during_tls_rejection}").into());
         }
@@ -923,112 +1099,7 @@ fn run(
             ),
         );
         Ok(())
-    })();
-    record(
-        observations,
-        "restoring the original pool-b fingerprint on pool-a".to_owned(),
-    );
-    let pin_restore = patch_site_pins(&local_context, &remote_site, &original_pins);
-    match &pin_restore {
-        Ok(()) => record(observations, "original pool-b fingerprint restored".to_owned()),
-        Err(error) => record(
-            observations,
-            format!("failed to restore the original pool-b fingerprint: {error}"),
-        ),
     }
-    match (invalid_identity_result, pin_restore) {
-        (Ok(()), Ok(())) => {},
-        (Err(proof_error), Ok(())) => return Err(proof_error),
-        (Ok(()), Err(restore_error)) => {
-            return Err(format!("peer-pin proof passed but pin restoration failed: {restore_error}").into());
-        },
-        (Err(proof_error), Err(restore_error)) => {
-            return Err(format!(
-                "peer-pin proof failed: {proof_error}; peer-pin restoration also failed: {restore_error}"
-            )
-            .into());
-        },
-    }
-
-    let (phase_after_restore, reason_after_restore, restored_site_resource_version) =
-        wait_for_gridsite_phase_and_reason(
-            &local_context,
-            &remote_site,
-            "Active",
-            "TlsVerified",
-            Duration::from_secs(90),
-        )?;
-    record(
-        observations,
-        format!(
-            "pool-b GridSite returned to an eligible state after restoring its trusted identity: phase={phase_after_restore}, reason={reason_after_restore}, resourceVersion={restored_site_resource_version}"
-        ),
-    );
-    wait_for_relay_samples(operator_metrics_port, Duration::from_secs(90))?;
-    let pool_b_restored = wait_for_signal_decrease(
-        operator_metrics_port,
-        "pool-b",
-        pool_b_before_bad_pin,
-        Duration::from_secs(90),
-    )?;
-    wait_for_pressure_order_recorded(
-        operator_metrics_port,
-        "pool-b",
-        Duration::from_secs(90),
-        observations,
-        "pool-a operator observed the recovered pressure order",
-    )?;
-    verify_weighted_site_distribution(
-        gateway_http_port,
-        gateway_metrics_port,
-        "pool-b",
-        true,
-        "restored-peer-identity-routing",
-        attribution,
-        Duration::from_secs(120),
-    )
-    .map(|distribution| {
-        record(
-            observations,
-            format!("restored peer identity and lower-pressure pool-b routing: {distribution}"),
-        );
-    })?;
-    record(
-        observations,
-        format!("pool-a accepted the restored peer's lower-pressure signal: {pool_b_restored}"),
-    );
-    prove_network_partition(
-        context,
-        gateway_http_port,
-        gateway_metrics_port,
-        operator_metrics_port,
-        mtls,
-        &gateway_uid,
-        attribution,
-        observations,
-    )?;
-    if gateway_pod_uid(&local_context)? != gateway_uid {
-        return Err("Grid Gateway pod changed during the cross-site signal proof".into());
-    }
-
-    let gateway_metrics = read_gateway_metrics(gateway_metrics_port)?;
-    record(
-        observations,
-        format!(
-            "Grid Gateway route decision samples: pool-a={}, pool-b={}",
-            metric_counter(
-                &gateway_metrics,
-                "grid_route_decisions_total",
-                &[("site", "pool-a"), ("reason", "routed")]
-            ),
-            metric_counter(
-                &gateway_metrics,
-                "grid_route_decisions_total",
-                &[("site", "pool-b"), ("reason", "routed")]
-            )
-        ),
-    );
-    Ok(())
 }
 
 /// Patch both run-owned networks into poll mode and install the Grid Gateway on pool-a.
@@ -1431,6 +1502,120 @@ fn wait_for_metric_counter_increase(
         std::thread::sleep(Duration::from_secs(2));
     }
     Err(format!("{name} did not increase from {previous}; last value={last}").into())
+}
+
+/// Wait until the operator's current GridNetwork reports a successful bounded relay.
+fn wait_for_relay_capacity_within_budget(cluster: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let deadline = Instant::now() + timeout;
+    let mut last = String::from("condition not observed");
+    while Instant::now() < deadline {
+        if let Ok(network) = kubectl_json(&context, "get", &format!("gridnetwork/{GRID_NETWORK_NAME}")) {
+            let generation = network
+                .pointer("/metadata/generation")
+                .and_then(serde_json::Value::as_i64);
+            let condition = network
+                .pointer("/status/conditions")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|conditions| {
+                    conditions.iter().find(|condition| {
+                        condition.get("type").and_then(serde_json::Value::as_str) == Some("SignalRelayCapacity")
+                    })
+                });
+            let status = condition
+                .and_then(|condition| condition.get("status"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing");
+            let reason = condition
+                .and_then(|condition| condition.get("reason"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing");
+            let observed_generation = condition
+                .and_then(|condition| condition.get("observedGeneration"))
+                .and_then(serde_json::Value::as_i64);
+            last = format!(
+                "status={status}, reason={reason}, observedGeneration={observed_generation:?}, generation={generation:?}"
+            );
+            if status == "False"
+                && reason == "WithinBudget"
+                && generation.is_some()
+                && observed_generation == generation
+            {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err(format!(
+        "{cluster} GridNetwork did not report SignalRelayCapacity=False/WithinBudget for its current generation within {timeout:?}: {last}"
+    )
+    .into())
+}
+
+/// Check the Gateway reporter's relay condition and both operators' omission counters.
+fn verify_relay_capacity(
+    operator_metrics_port: u16,
+    peer_operator_metrics_port: u16,
+    observations: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::with_capacity(CLUSTERS.len());
+    wait_for_relay_capacity_within_budget(GRID_SERVING_SITE, Duration::from_secs(90))?;
+    for cluster in CLUSTERS {
+        let port = if *cluster == GRID_SERVING_SITE {
+            operator_metrics_port
+        } else {
+            peer_operator_metrics_port
+        };
+        checks.push(assert_zero_relay_batch_omissions(
+            &read_operator_metrics(port)?,
+            cluster,
+        )?);
+    }
+    record(
+        observations,
+        format!(
+            "Grid Gateway site {GRID_SERVING_SITE} reported a current-generation within-budget relay; zero provider-batch omissions at both operators: {}",
+            checks.join("; ")
+        ),
+    );
+    Ok(())
+}
+
+/// Wait for relay samples, then check the Gateway reporter and both operators' counters.
+fn wait_for_relay_samples_and_verify_capacity(
+    operator_metrics_port: u16,
+    peer_operator_metrics_port: u16,
+    observations: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_relay_samples(operator_metrics_port, Duration::from_secs(120))?;
+    verify_relay_capacity(operator_metrics_port, peer_operator_metrics_port, observations)
+}
+
+/// Require every fixed-cardinality provider-batch omission counter to be present and zero.
+fn assert_zero_relay_batch_omissions(metrics: &str, cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut checked = Vec::new();
+    for store in ["site", "peers"] {
+        for reason in ["rows", "bytes", "invalid"] {
+            let value = sample_value(
+                metrics,
+                "grid_signals_relay_provider_batches_omitted_total",
+                &[("store", store), ("reason", reason)],
+            )
+            .ok_or_else(|| {
+                format!(
+                    "{cluster} operator does not expose grid_signals_relay_provider_batches_omitted_total{{store=\"{store}\",reason=\"{reason}\"}}"
+                )
+            })?;
+            if value != 0.0 {
+                return Err(format!(
+                    "{cluster} relay omitted {value} provider batches for store={store}, reason={reason}"
+                )
+                .into());
+            }
+            checked.push(format!("{store}/{reason}=0"));
+        }
+    }
+    Ok(format!("{cluster} [{}]", checked.join(", ")))
 }
 
 /// Resolve the mTLS endpoint used by a run-owned provider gateway.
@@ -2822,16 +3007,23 @@ fn parse_site_route_response(raw: &str) -> SiteRouteResponse {
 
 /// Read an operator's `/metrics` through the run-owned Service.
 pub(super) fn read_operator_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, true)
+    read_metrics_url(port, true, None)
 }
 
 /// Read the Grid Gateway's TLS-only `/metrics` endpoint.
 pub(super) fn read_gateway_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, false)
+    let token = GATEWAY_METRICS_BEARER_TOKEN
+        .get()
+        .ok_or("Grid Gateway metrics token was not initialized for this run")?;
+    read_metrics_url(port, false, Some(token))
 }
 
 /// Fetch Prometheus exposition over the forwarded service port.
-fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std::error::Error>> {
+fn read_metrics_url(
+    port: u16,
+    tls_fallback: bool,
+    bearer_token: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let schemes = if tls_fallback {
         ["https", "http"]
     } else {
@@ -2840,9 +3032,27 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
     let mut last_error = String::from("no HTTP response");
     for scheme in schemes {
         let url = format!("{scheme}://127.0.0.1:{port}/metrics");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--insecure", "--max-time", "5", &url])
-            .output()?;
+        let mut command = Command::new("curl");
+        command.args(["--silent", "--show-error", "--fail", "--insecure", "--max-time", "5"]);
+        if bearer_token.is_some() {
+            command.args(["--config", "-"]);
+        }
+        let mut child = command
+            .arg(&url)
+            .stdin(if bearer_token.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(token) = bearer_token {
+            let config = curl_bearer_config(token)?;
+            let mut stdin = child.stdin.take().ok_or("curl stdin was not piped for metrics auth")?;
+            stdin.write_all(config.as_bytes())?;
+        }
+        let output = child.wait_with_output()?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
@@ -2851,6 +3061,54 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
             .clone_into(&mut last_error);
     }
     Err(format!("could not read metrics service: {last_error}").into())
+}
+
+/// Mint a short-lived metrics scrape token for the release-scoped scraper identity.
+fn create_gateway_metrics_token(context: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let service_account = format!("{GRID_SERVING_GATEWAY}-metrics-scraper");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "token",
+            &service_account,
+            "--duration=1h",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not mint the task-owned Gateway metrics scrape token: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let token = String::from_utf8(output.stdout)?.trim().to_owned();
+    curl_bearer_config(&token)?;
+    Ok(token)
+}
+
+/// Initialize the process-local scrape token without keeping it in the proof's large stack frame.
+fn initialize_gateway_metrics_token(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let token = create_gateway_metrics_token(context)?;
+    GATEWAY_METRICS_BEARER_TOKEN
+        .set(token)
+        .map_err(|_token| "Grid Gateway metrics token was initialized more than once")?;
+    Ok(())
+}
+
+/// Render a safe curl config header without putting the bearer token in argv or logs.
+fn curl_bearer_config(token: &str) -> Result<String, &'static str> {
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err("metrics scrape token has an unsupported character");
+    }
+    Ok(format!("header = \"Authorization: Bearer {token}\"\n"))
 }
 
 /// Return the counter value matching a metric name and its required labels.
@@ -3176,6 +3434,60 @@ fn kubectl_patch_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_metrics_bearer_config_rejects_header_injection() {
+        assert_eq!(
+            curl_bearer_config("header.payload-signature_123"),
+            Ok("header = \"Authorization: Bearer header.payload-signature_123\"\n".to_owned())
+        );
+        for invalid in [
+            "",
+            "header\ninjected",
+            "header\rinjected",
+            "header\"injected",
+            "header\\injected",
+        ] {
+            assert_eq!(
+                curl_bearer_config(invalid),
+                Err("metrics scrape token has an unsupported character")
+            );
+        }
+    }
+
+    #[test]
+    fn relay_capacity_gate_requires_all_omission_series_to_be_present_and_zero() {
+        let metrics = "grid_signals_relay_provider_batches_omitted_total{store=\"site\",reason=\"rows\"} 0\n\
+                       grid_signals_relay_provider_batches_omitted_total{store=\"site\",reason=\"bytes\"} 0\n\
+                       grid_signals_relay_provider_batches_omitted_total{store=\"site\",reason=\"invalid\"} 0\n\
+                       grid_signals_relay_provider_batches_omitted_total{store=\"peers\",reason=\"rows\"} 0\n\
+                       grid_signals_relay_provider_batches_omitted_total{store=\"peers\",reason=\"bytes\"} 0\n\
+                       grid_signals_relay_provider_batches_omitted_total{store=\"peers\",reason=\"invalid\"} 0\n";
+        assert_eq!(
+            assert_zero_relay_batch_omissions(metrics, "pool-a")
+                .ok()
+                .map(|summary| summary.contains("pool-a [site/rows=0")),
+            Some(true)
+        );
+        assert_eq!(
+            assert_zero_relay_batch_omissions("", "pool-a")
+                .err()
+                .map(|error| error.to_string().contains("does not expose")),
+            Some(true)
+        );
+        assert_eq!(
+            assert_zero_relay_batch_omissions(
+                &metrics.replace(
+                    "store=\"peers\",reason=\"bytes\"} 0",
+                    "store=\"peers\",reason=\"bytes\"} 1",
+                ),
+                "pool-a",
+            )
+            .err()
+            .map(|error| error.to_string().contains("omitted 1 provider batches")),
+            Some(true)
+        );
+    }
 
     #[test]
     fn cross_site_pressure_keeps_queue_depth_and_gateway_saturation_explicit() {
