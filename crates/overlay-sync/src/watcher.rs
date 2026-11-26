@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use futures::TryStreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Client,
@@ -208,17 +208,13 @@ pub(crate) async fn run_watch_loop(
 /// Execute one watch stream to completion, then return.
 async fn run_single_watch(api: &Api<ConfigMap>, config: &WatcherConfig, status: &SharedStatus, metrics: &Arc<Metrics>) {
     let field_selector = format!("metadata.name={}", config.config_map_name);
-    let w = watcher::watcher(api.clone(), watcher::Config::default().fields(&field_selector));
+    // Keep the Kubernetes watch state on the heap as its dependency types grow.
+    let w = watcher::watcher(api.clone(), watcher::Config::default().fields(&field_selector)).boxed();
 
     let result = w
         .try_for_each(|event| {
-            let config = config.clone();
-            let status = status.clone();
-            let metrics = Arc::clone(metrics);
-            async move {
-                handle_event(event, &config, &status, &metrics);
-                Ok(())
-            }
+            handle_event(event, config, status, metrics);
+            futures::future::ready(Ok(()))
         })
         .await;
 

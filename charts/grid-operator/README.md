@@ -452,7 +452,7 @@ It grants no other Deployment access. A gateway that delegates its Secret
 mounts to the operator renders a Role for its own Deployment from the
 praxis-gateway chart (`mountReconciliation.rbac`), bound to this release's
 ServiceAccount; see
-[Deployment access](../../docs/architecture/operations.md#deployment-access).
+[Deployment access](../../docs/operations/operations.md#deployment-access).
 A v0.2.0 release granted every Deployment in its resource namespaces instead,
 so upgrade or re-grant delegated gateways before upgrading the operator.
 

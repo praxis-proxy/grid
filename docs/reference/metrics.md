@@ -34,7 +34,7 @@ and upgrade requirements.
 
 The operator exports each provider's resolved readings, not the raw engine
 series behind them. The series a gateway routes on travel over
-`/v1/site/signals`, described in [Signals](architecture/signals.md). A series
+`/v1/site/signals`, described in [Signals](../architecture/signals.md). A series
 the operator holds but does not name below never reaches `/metrics`.
 
 A metric with labels does not appear in a scrape until its first observation, so
@@ -69,7 +69,7 @@ from, and `grid_provider` the provider within it.
 ## Operator: polling peer sites
 
 One poll per peer per interval, so every series here is per peer. The poll path
-is described in [Polling Cross-Site Load Signals](architecture/polling-metrics.md).
+is described in [Polling Cross-Site Load Signals](../architecture/polling-metrics.md).
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -155,7 +155,7 @@ already did. Both fire above four fifths of a cap for five minutes:
 
 Certificate expiry is the one to alert on. Renewal starts when a third of the
 lifetime remains, so this falling toward now means renewal has been failing for
-a while. See [Site Identity](installation/enrollment.md).
+a while. See [Site Identity](../installation/enrollment.md).
 
 ## Gateway
 
@@ -200,7 +200,7 @@ state, so two replicas agree only in steady state.
 | `grid_serving_dial_shadowed_clusters` | gauge | | Dials that replace a `load_balancer` cluster of the same name. |
 | `grid_dial_down` | gauge | `cluster` | 1 while a dial is down after 2 consecutive failures to connect or 40 server errors in 50 answers, until 2 consecutive successful probes. A probe answered 503 or 504 counts neither way. A down dial is ordered last for 10 s, then one request may try it again; it is never excluded. |
 | `grid_dial_failures_total` | counter | `cluster` | Dialed requests that got no response head within the connect budget. |
-| `grid_dial_refusals_total` | counter | `cluster` | Dialed requests a provider gateway refused because its site does not serve the provider, which it says in the `x-grid-refusal` response header. One orders that provider last for 10 s, then it returns to its normal place and requests try it again, so a site that still refuses fails the requests sent in about one round trip and one health tick every 10 s. The dial and its other providers are not affected, and the gateway logs a warning when a hold starts. A count that keeps rising means the site, or one replica of its gateway, never loads that provider. A held provider counts as unhealthy for shedding, like one on a down dial. |
+| `grid_dial_refusals_total` | counter | `cluster` | Requests a provider gateway refused because its site does not serve the candidate, a model or a tool, which it says in the `x-grid-refusal` response header. One orders that candidate last for 10 s, then it returns to its normal place and requests try it again, so a site that still refuses fails the requests sent in about one round trip and one health tick every 10 s. The dial and its other candidates are not affected, and the gateway logs a warning when a hold starts. A count that keeps rising means the site, or one replica of its gateway, never loads that candidate. A held candidate counts as unhealthy for shedding, like one on a down dial. |
 | `grid_dial_server_errors_total` | counter | `cluster` | Dialed requests the site answered with a 5xx status other than 503 or 504, which say wait. A consumer gateway and the provider gateway behind it each count the same answer. |
 | `grid_provider_requests_total` | counter | `result` | Peer requests a provider gateway served or refused: `served`, `forbidden`, `method`, `path`, `candidate`, or `malformed` (a missing, repeated, or badly formed `x-ai-routing-candidate`, answered 400). |
 | `grid_provider_config_reload_total` | counter | `result` | Provider-file reloads, `applied` or `rejected`. A rejected file keeps the last good one. |
@@ -221,7 +221,7 @@ topology. All three series read `NaN` after the pair leaves that topology.
 ## Gateway: polling the local operator
 
 Every site's load reaches the gateway through one poll of its local operator,
-described in [Site Selection](site-selection.md).
+described in [Site Selection](../site-selection.md).
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -234,7 +234,7 @@ described in [Site Selection](site-selection.md).
 ## Overlay-sync
 
 The sidecar that delivers the serving overlay to the gateway, described in
-[Routing](architecture/routing.md). One scrape per gateway pod.
+[Routing](../architecture/routing.md). One scrape per gateway pod.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|

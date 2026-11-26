@@ -86,7 +86,7 @@ A generated consumer gateway derives an endpoint for every local
 candidate a member's catalog offers, without `deriveTopology.fromProviders`
 naming it. Under SWIM membership `fromProviders` still gates remote candidates.
 Delete or disable a provider that must not be served before upgrading. See
-[Derived endpoint topology](../architecture/consumer-config.md#derived-endpoint-topology).
+[Derived endpoint topology](../reference/consumer-config.md#derived-endpoint-topology).
 
 If any `GridSite` sets `spec.sovereigntyZone`, upgrade every gateway before the
 operator that publishes the zone map. Before enabling the sovereignty fence in

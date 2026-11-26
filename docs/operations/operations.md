@@ -780,7 +780,8 @@ The trust bootstrap for a remote site progresses through these steps:
          - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
    ```
 
-   See [Authentication and Access Policy](auth.md) for the trust contract.
+   See [Authentication and Access Policy](../architecture/auth.md) for the trust
+   contract.
 
 6. **Data-plane mTLS enforced**: a provider Praxis gateway validates peer
    identity over mTLS on every request, independent of the control-plane
@@ -855,7 +856,7 @@ satisfied.
 ## 7. Register Providers
 
 Users or auto-discovery create provider resources.
-See the [CRDs doc](crds.md) for full specs.
+See the [CRDs doc](../reference/crds.md) for full specs.
 
 Example for an API provider:
 ```yaml
@@ -1032,7 +1033,7 @@ The native path requires a Praxis AI image that includes the
 file-backed filter config today, but runtime deployments must
 use an AI image with that filter merged and published.
 
-See [Auth & Policy](auth.md) for workload access
+See [Auth & Policy](../architecture/auth.md) for workload access
 patterns and authentication strategies.
 
 ## GridSite trust bootstrap

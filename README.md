@@ -1,9 +1,10 @@
 # AI Grid Network (AGN)
 
-AI Grid Network (AGN) connects inference providers across Kubernetes clusters,
-cloud services, and external APIs. Its operator discovers participating sites,
-tracks provider availability, and publishes routing state for [Praxis AI]
-gateways. Gateways select a provider for each request from that local state.
+AI Grid Network (AGN), listed as Praxis Grid on the Praxis website, connects
+inference providers across Kubernetes clusters, cloud services, and external
+APIs. Its operator discovers participating sites, tracks provider availability,
+and publishes routing state for [Praxis AI] gateways. Gateways select a
+provider for each request from that local state.
 
 AGN is a technical preview. Start with the [scope and limitations] before
 choosing a topology or planning an upgrade. You supply the clusters, inference
@@ -142,8 +143,8 @@ The `praxis-gateway` chart deploys the separately released Praxis AI image.
 The `grid-gateway` binary in this repository is a separate operand with its own
 Cargo workspace. Select images with the filters required by the deployment;
 matching version numbers alone does not establish compatibility. The
-[release guide](docs/release.md) distinguishes publication from consumer
-qualification.
+[release guide](docs/developing/release.md) distinguishes publication from
+consumer qualification.
 
 Gateway mTLS, site trust, external caller authorization, and backend credentials
 serve separate purposes. SWIM encryption uses a shared mesh key; it does not by
@@ -160,8 +161,8 @@ not constitute an authoritative billing record or a global quota guarantee.
 
 The root Rust workspace contains the operator, state and scoring libraries,
 sidecars, and development tools. Gateway has a separate workspace and lockfile.
-See the [development guide](docs/development.md) for the complete crate map,
-tool versions, and local/CI gate boundaries.
+See the [development guide](docs/developing/README.md) for the complete crate
+map, tool versions, and local/CI gate boundaries.
 
 ```console
 make build          # build the root workspace
@@ -177,15 +178,16 @@ running environment qualifications. See
 checks.
 
 Read [CONTRIBUTING](CONTRIBUTING.md) and the canonical
-[development conventions](docs/conventions.md) before submitting a change.
+[development conventions](docs/developing/conventions.md) before submitting a
+change.
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
-- [Custom resources](docs/architecture/crds.md)
+- [Custom resources](docs/reference/crds.md)
 - [Routing and overlay contract](docs/architecture/routing.md)
 - [Scoring](docs/architecture/scoring.md)
 - [Authentication and access policy](docs/architecture/auth.md)
-- [Operations and troubleshooting](docs/architecture/operations.md)
+- [Operations and troubleshooting](docs/operations/operations.md)
 - [Security reporting](SECURITY.md)
 - [Apache-2.0 license](LICENSE)

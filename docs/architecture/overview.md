@@ -252,7 +252,7 @@ status: name/version, supported binding metadata, streaming capability, and
 skill IDs with input/output modes. Authentication and TLS references are
 resolved by the operator; secret values never enter status or mesh state.
 
-See [CRDs](crds.md) for field-level details.
+See [CRDs](../reference/crds.md) for field-level details.
 
 ## How a Provider Enters the AI Grid Network
 
@@ -346,8 +346,8 @@ Two things that commonly surprise people on a single or combined cluster:
   (cross-site CRDT) provider records are phase-gated. So a single-site deployment
   routes to its local providers even while its own `GridSite` is `Pending`.
 
-See the [GridSite lifecycle](crds.md#gridsite) for the phase machine and this
-single-site behavior.
+See the [GridSite lifecycle](../reference/crds.md#gridsite) for the phase
+machine and this single-site behavior.
 
 ## Routing Overlays
 

@@ -1826,7 +1826,7 @@ type GridNetworkRollupWatch = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
 /// Keep the primary watch construction out of the controller's async stack frame.
 fn filtered_grid_network_watch(api: Api<GridNetwork>) -> (reflector::Store<GridNetwork>, GridNetworkWatch) {
     let (reader, primary) =
-        operator::network_watch::routing_watch(watcher(api, watcher::Config::default()).default_backoff());
+        operator::network_watch::routing_watch(watcher(api, watcher::Config::default()).default_backoff().boxed());
     (reader, Box::pin(primary))
 }
 
@@ -1834,8 +1834,8 @@ fn filtered_grid_network_watch(api: Api<GridNetwork>) -> (reflector::Store<GridN
 fn filtered_grid_network_rollup_watch(client: Client) -> GridNetworkRollupWatch {
     let api = Api::<GridNetwork>::all(client.clone());
     Box::pin(
-        operator::network_watch::rollup_updates(watcher(api, watcher::Config::default()).default_backoff()).for_each(
-            move |result| {
+        operator::network_watch::rollup_updates(watcher(api, watcher::Config::default()).default_backoff().boxed())
+            .for_each(move |result| {
                 let client = client.clone();
                 async move {
                     match result {
@@ -1843,8 +1843,7 @@ fn filtered_grid_network_rollup_watch(client: Client) -> GridNetworkRollupWatch 
                         Err(error) => tracing::warn!(%error, "GridNetwork roll-up watch failed"),
                     }
                 }
-            },
-        ),
+            }),
     )
 }
 
