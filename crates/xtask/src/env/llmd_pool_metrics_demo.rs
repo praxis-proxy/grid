@@ -2,7 +2,7 @@
 //!
 //! Deploys two Kind clusters, each running an llm-d EPP backed by two
 //! deterministic llm-d-sim inference backends. Grid scrapes EPP pool-level
-//! metrics and adjusts routing when persistent simulator configuration changes.
+//! metrics and adjusts routing when simulator-reported metrics change at runtime.
 #![expect(
     clippy::string_slice,
     clippy::too_many_lines,
@@ -28,10 +28,15 @@ use std::{
 };
 
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 mod cross_site;
+mod simulator_runtime;
 mod site_saturation;
+
+use simulator_runtime::begin_metric_session;
+pub(super) use simulator_runtime::{
+    restore_initial_metrics, set_simulator_fake_metrics, set_simulator_fake_metrics_with_endpoint_kv,
+};
 
 use super::{
     DemoMode, GlbDemoOptions, certs, glb, kubectl, operator,
@@ -121,15 +126,6 @@ const RECOVERY_QUEUE_THRESHOLD: f64 = 3.0;
 
 /// Deterministic simulator Deployments representing the pool endpoints.
 const SIMULATOR_DEPLOYMENTS: &[&str] = &["vcr-1", "vcr-2"];
-/// Persistent simulator ConfigMaps keyed by their Deployment.
-const SIMULATOR_CONFIGMAPS: &[(&str, &str)] = &[("vcr-1", "vcr-1-config"), ("vcr-2", "vcr-2-config")];
-/// Pod template annotation for the simulator's queue metric.
-const SIMULATOR_WAITING_REQUESTS_ANNOTATION: &str = "grid.praxis.fast/fake-waiting-requests";
-/// Pod template annotation for the simulator's running-request metric.
-const SIMULATOR_RUNNING_REQUESTS_ANNOTATION: &str = "grid.praxis.fast/fake-running-requests";
-/// Pod template annotation for the simulator's KV-cache metric.
-const SIMULATOR_KV_CACHE_ANNOTATION: &str = "grid.praxis.fast/fake-kv-cache-usage";
-
 /// GridNetwork resource name.
 const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
 
@@ -495,7 +491,7 @@ pub(crate) fn run(
             eprintln!("ENVIRONMENT READY - Starting proof scenarios");
             eprintln!("{OUTPUT_RULE}");
 
-            let results = run_proof_scenarios(&context, mode);
+            let results = run_proof_scenarios(&context, mode, &evidence_dir);
 
             let failed: Vec<&str> = results
                 .iter()
@@ -960,9 +956,22 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
 // ---------------------------------------------------------------------------
 
 /// Run the demo proof scenarios.
-fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String, ProofResult> {
+fn run_proof_scenarios(context: &DemoContext, mode: DemoMode, evidence_dir: &Path) -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
+    if mode == DemoMode::Full
+        && let Err(error) = begin_metric_session()
+    {
+        results.insert(
+            "simulator_metric_session".to_owned(),
+            ProofResult {
+                success: false,
+                description: "Simulator metric session: failed to initialize saved state".to_owned(),
+                observations: vec![error.to_string()],
+            },
+        );
+        return results;
+    }
 
     // Proof 1: Provenance (image digests and config verification)
     results.insert("provenance".to_owned(), proof_provenance(mtls));
@@ -987,6 +996,24 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
         results.insert("cross_site_signal_poll".to_owned(), cross_site::proof(context));
         // Proof 6: llm-d sites are read by their saturation and weighed by ready units.
         results.insert("site_saturation".to_owned(), site_saturation::proof(context));
+
+        // Runtime metric updates are test-scoped; restore the simulator's original values before teardown.
+        results.insert(
+            "simulator_metric_restoration".to_owned(),
+            match restore_initial_metrics(mtls, evidence_dir) {
+                Ok(observations) => ProofResult {
+                    success: true,
+                    description: "Simulator metric restoration: original runtime metrics and EPP values recovered"
+                        .to_owned(),
+                    observations,
+                },
+                Err(observations) => ProofResult {
+                    success: false,
+                    description: "Simulator metric restoration: one or more saved metrics did not recover".to_owned(),
+                    observations,
+                },
+            },
+        );
     }
 
     // TLS proof stages, only in mTLS mode
@@ -1164,26 +1191,26 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
 
     eprintln!();
     eprintln!(
-        "  [PRESSURE] Persisting deterministic llm-d-sim {} pressure and rolling Pool A",
+        "  [PRESSURE] Updating active llm-d-sim {} pressure through /admin/config",
         context.scoring_flavor.label()
     );
     if let Err(e) = set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls) {
-        observations.push(format!("simulator pressure rollout failed: {e}"));
+        observations.push(format!("simulator runtime metric update failed: {e}"));
         return ProofResult {
             success: false,
-            description: "Pressure & flip: simulator failed to report the requested metric".to_owned(),
+            description: "Pressure & flip: simulator runtime API failed to report the requested metric".to_owned(),
             observations,
         };
     }
     observations.push(format!(
-        "llm-d-sim {} pressure set through persistent Deployment configuration",
+        "llm-d-sim {} pressure set through runtime /admin/config; verified in runtime values and EPP scrape",
         context.scoring_flavor.label()
     ));
 
     eprintln!();
     eprintln!("  Live Metrics Table");
     eprintln!("    Queue/KV/Score/Rank: derived from the Grid overlay (production scoring engine)");
-    eprintln!("    pressure source:     llm-d-sim /metrics (persistent fake-metrics)");
+    eprintln!("    pressure source:     runtime /admin/config values and the EPP scrape");
     eprintln!("    LAST_ROUTE:         most recent confirmed request destination");
     print_live_table_header();
     let deadline = Instant::now() + DATA_PLANE_WAIT;
@@ -1312,17 +1339,19 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
     eprintln!();
-    eprintln!("  [RECOVERY] Persisting llm-d-sim waiting-requests=0 and rolling Pool A");
+    eprintln!("  [RECOVERY] Restoring llm-d-sim waiting-requests=0 through its runtime API");
     if let Err(e) = set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls) {
-        observations.push(format!("simulator recovery rollout failed: {e}"));
+        observations.push(format!("simulator runtime metric recovery failed: {e}"));
         return ProofResult {
             success: false,
             description: "Recovery: simulator failed to report waiting-requests=0".to_owned(),
             observations,
         };
     }
-    observations
-        .push("llm-d-sim waiting-requests restored to 0 through persistent Deployment configuration".to_owned());
+    observations.push(
+        "llm-d-sim waiting-requests restored to 0 through runtime /admin/config and verified in the EPP scrape"
+            .to_owned(),
+    );
 
     eprintln!("  [RECOVERY] Pressure stopped; waiting for Pool A to drain and regain rank 0");
 
@@ -1429,9 +1458,7 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
 // Pressure generator
 // ---------------------------------------------------------------------------
 
-/// Persist deterministic fake metrics and roll simulator pods from template annotations.
-/// The annotations make KV-cache-only changes alter the pod template and trigger rollout.
-/// The EPP metric and overlay checks remain the authoritative downstream observations.
+/// Update deterministic simulator metrics through the runtime admin API.
 fn set_simulator_waiting_requests(
     cluster: &str,
     waiting_requests: u32,
@@ -1440,176 +1467,6 @@ fn set_simulator_waiting_requests(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (waiting_requests, kv_cache_usage) = simulator_metrics(waiting_requests, scoring_flavor);
     set_simulator_fake_metrics(cluster, waiting_requests, 0, kv_cache_usage, mtls)
-}
-
-/// Persist all fake simulator metrics and roll its run-owned pods.
-fn set_simulator_fake_metrics(
-    cluster: &str,
-    waiting_requests: u32,
-    running_requests: u32,
-    kv_cache_usage: f64,
-    mtls: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    set_simulator_fake_metrics_with_endpoint_kv(
-        cluster,
-        waiting_requests,
-        running_requests,
-        kv_cache_usage,
-        kv_cache_usage,
-        mtls,
-    )
-}
-
-/// Persist pool metrics with a distinct KV-cache value on each run-owned endpoint.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the queue, running load, and each endpoint's cache value describe the stimulus directly"
-)]
-fn set_simulator_fake_metrics_with_endpoint_kv(
-    cluster: &str,
-    waiting_requests: u32,
-    running_requests: u32,
-    vcr1_kv_cache_usage: f64,
-    vcr2_kv_cache_usage: f64,
-    mtls: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = kind_context(cluster);
-    for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
-        let kv_cache_usage = match *deployment {
-            "vcr-1" => vcr1_kv_cache_usage,
-            "vcr-2" => vcr2_kv_cache_usage,
-            _ => return Err(format!("no KV-cache stimulus was specified for {deployment}").into()),
-        };
-        kubectl::apply_manifest(
-            &ctx,
-            &simulator_config(configmap, waiting_requests, running_requests, kv_cache_usage),
-        )
-        .map_err(|e| format!("apply persistent simulator configmap/{configmap} on {cluster}: {e}"))?;
-    }
-
-    for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
-        let kv_cache_usage = match *deployment {
-            "vcr-1" => vcr1_kv_cache_usage,
-            "vcr-2" => vcr2_kv_cache_usage,
-            _ => return Err(format!("no KV-cache stimulus was specified for {deployment}").into()),
-        };
-        let before = deployment_generation(&ctx, deployment)?;
-        let patch = serde_json::json!({
-            "spec": {
-                "template": {
-                    "metadata": {
-                        "annotations": simulator_rollout_annotations(waiting_requests, running_requests, kv_cache_usage)
-                    }
-                }
-            }
-        })
-        .to_string();
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                &ctx,
-                "-n",
-                GRID_SYSTEM_NS,
-                "patch",
-                &format!("deployment/{deployment}"),
-                "--type=merge",
-                "-p",
-                &patch,
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "patch simulator deployment/{deployment}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        let after = deployment_generation(&ctx, deployment)?;
-        if simulator_rollout_needed(before, after).map_err(|error| format!("deployment/{deployment}: {error}"))? {
-            eprintln!("  restarting {deployment} for simulator metric configuration");
-        } else {
-            eprintln!("  {deployment} already has the requested simulator metric configuration; no restart needed");
-        }
-        kubectl::wait_for_rollout_ns(&ctx, deployment, GRID_SYSTEM_NS, cluster)
-            .map_err(|e| format!("wait for simulator deployment/{deployment} rollout: {e}"))?;
-
-        let expected_config = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
-        let config_text = get_configmap_data_key(&ctx, GRID_SYSTEM_NS, configmap, "config.yaml").map_err(|error| {
-            format!("could not read configmap/{configmap} on {cluster} after applying the simulator metrics: {error}")
-        })?;
-        if config_text != expected_config {
-            let expected_digest = hex::encode(Sha256::digest(expected_config.as_bytes()));
-            let actual_digest = hex::encode(Sha256::digest(config_text.as_bytes()));
-            return Err(format!(
-                "configmap/{configmap} on {cluster} does not contain its requested simulator metrics (expected {} bytes sha256={expected_digest}; found {} bytes sha256={actual_digest})",
-                expected_config.len(),
-                config_text.len(),
-            )
-            .into());
-        }
-    }
-
-    let ready_replicas = wait_for_simulator_service_endpoints(&ctx)?;
-    let expected_endpoints = ready_replicas.total().map_err(std::io::Error::other)?;
-    let expected_kv_cache = simulator_kv_cache_mean(vcr1_kv_cache_usage, vcr2_kv_cache_usage, ready_replicas)
-        .map_err(std::io::Error::other)?;
-    let expected_endpoint_metric = u32::try_from(expected_endpoints).map(f64::from).map_err(|error| {
-        std::io::Error::other(format!(
-            "simulator endpoint count exceeds EPP metric precision: {error}"
-        ))
-    })?;
-    let deadline = Instant::now() + DATA_PLANE_WAIT;
-    let mut last_observed = String::from("no valid EPP metric sample");
-    while Instant::now() < deadline {
-        match kubectl_exec_epp_metrics(cluster, mtls) {
-            Ok(text) => match parse_required_epp_metrics(&text) {
-                Ok(metrics) => {
-                    let observed_endpoints = first_prom_value(&text, EPP_READY_METRICS);
-                    last_observed = format!(
-                        "queue-size={}, KV-cache mean={}, ready endpoints={observed_endpoints:?}, per-deployment ready replicas={ready_replicas:?}",
-                        metrics.queue_size, metrics.kv_cache,
-                    );
-                    if (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
-                        && (metrics.kv_cache - expected_kv_cache).abs() < KV_CACHE_METRIC_TOLERANCE
-                        && observed_endpoints
-                            .is_some_and(|ready| (ready - expected_endpoint_metric).abs() < f64::EPSILON)
-                    {
-                        eprintln!(
-                            "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, endpoint-weighted KV-cache mean={expected_kv_cache:.3}, ready endpoints={expected_endpoints} (vcr-1={}, vcr-2={}) are live in EPP metrics",
-                            ready_replicas.vcr_1, ready_replicas.vcr_2,
-                        );
-                        return Ok(());
-                    }
-                },
-                Err(error) => last_observed = format!("EPP metrics parse failed: {error}"),
-            },
-            Err(error) => last_observed = format!("EPP metrics scrape failed: {error}"),
-        }
-        std::thread::sleep(DATA_PLANE_INTERVAL);
-    }
-    Err(format!(
-        "{cluster}: simulator did not expose waiting-requests={waiting_requests}, endpoint-weighted KV-cache mean={expected_kv_cache:.6}, and ready-endpoints={expected_endpoints} within timeout; last observation: {last_observed}"
-    )
-    .into())
-}
-
-/// Render the complete simulator ConfigMap for the requested fake metrics.
-fn simulator_config(configmap: &str, waiting_requests: u32, running_requests: u32, kv_cache_usage: f64) -> String {
-    let config_data = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
-    let config_data_block = config_data
-        .lines()
-        .map(|line| format!("    {line}\n"))
-        .collect::<String>();
-    format!(
-        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {configmap}\n  namespace: {GRID_SYSTEM_NS}\ndata:\n  config.yaml: |\n{config_data_block}"
-    )
-}
-
-/// Render the simulator's `config.yaml` ConfigMap value for fake metrics.
-fn simulator_config_data(waiting_requests: u32, running_requests: u32, kv_cache_usage: f64) -> String {
-    format!(
-        "port: 8000\nmodel: {VCR_MODEL}\nserved-model-name: [{VCR_MODEL}]\nmode: echo\nfake-metrics:\n  waiting-requests: {waiting_requests}\n  running-requests: {running_requests}\n  kv-cache-usage: {kv_cache_usage}\n"
-    )
 }
 
 /// Select deterministic simulator metrics for the active scoring strategy.
@@ -1623,49 +1480,20 @@ fn simulator_metrics(pressure: u32, scoring_flavor: ScoringFlavor) -> (u32, f64)
     }
 }
 
-/// Return the pod-template annotations that identify the complete fake-metric state.
-fn simulator_rollout_annotations(
-    waiting_requests: u32,
-    running_requests: u32,
-    kv_cache_usage: f64,
-) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        (
-            SIMULATOR_WAITING_REQUESTS_ANNOTATION.to_owned(),
-            waiting_requests.to_string(),
-        ),
-        (
-            SIMULATOR_RUNNING_REQUESTS_ANNOTATION.to_owned(),
-            running_requests.to_string(),
-        ),
-        (SIMULATOR_KV_CACHE_ANNOTATION.to_owned(), kv_cache_usage.to_string()),
-    ])
-}
-
-/// Whether a Deployment generation change requires waiting for a new simulator rollout.
-fn simulator_rollout_needed(before: i64, after: i64) -> Result<bool, String> {
-    if after < before {
-        return Err(format!("generation moved backwards ({before} -> {after})"));
-    }
-    Ok(after > before)
-}
-
 /// Sum the desired replicas of the run-owned simulator Deployments.
 fn simulator_desired_replicas(context: &str) -> Result<usize, Box<dyn std::error::Error>> {
     let mut replicas = 0_usize;
     for deployment in SIMULATOR_DEPLOYMENTS {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                context,
-                "-n",
-                GRID_SYSTEM_NS,
-                "get",
-                &format!("deployment/{deployment}"),
-                "-o",
-                "jsonpath={.spec.replicas}",
-            ])
-            .output()?;
+        let output = simulator_runtime::timed_kubectl(&[
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            &format!("deployment/{deployment}"),
+            "-o",
+            "jsonpath={.spec.replicas}",
+        ])?;
         if !output.status.success() {
             return Err(format!(
                 "read deployment/{deployment} replica count: {}",
@@ -1710,18 +1538,16 @@ impl SimulatorReadyReplicas {
 fn simulator_ready_replicas(context: &str) -> Result<SimulatorReadyReplicas, Box<dyn std::error::Error>> {
     let mut counts = SimulatorReadyReplicas::default();
     for deployment in SIMULATOR_DEPLOYMENTS {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                context,
-                "-n",
-                GRID_SYSTEM_NS,
-                "get",
-                &format!("deployment/{deployment}"),
-                "-o",
-                "json",
-            ])
-            .output()?;
+        let output = simulator_runtime::timed_kubectl(&[
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            &format!("deployment/{deployment}"),
+            "-o",
+            "json",
+        ])?;
         if !output.status.success() {
             return Err(format!(
                 "read deployment/{deployment} ready replicas: {}",
@@ -1821,18 +1647,16 @@ fn parse_simulator_service_endpoints(
 
 /// Read the Service endpoints that provider Gateways connect to.
 fn simulator_service_endpoints(context: &str) -> Result<SimulatorServiceEndpoints, Box<dyn std::error::Error>> {
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "get",
-            "endpoints/vcr-service",
-            "-o",
-            "json",
-        ])
-        .output()?;
+    let output = simulator_runtime::timed_kubectl(&[
+        "--context",
+        context,
+        "-n",
+        GRID_SYSTEM_NS,
+        "get",
+        "endpoints/vcr-service",
+        "-o",
+        "json",
+    ])?;
     if !output.status.success() {
         return Err(format!(
             "read vcr-service Endpoints: {}",
@@ -1887,34 +1711,6 @@ fn wait_for_simulator_service_endpoints(context: &str) -> Result<SimulatorReadyR
         std::thread::sleep(DATA_PLANE_INTERVAL);
     }
     Err(format!("{context}: vcr-service endpoints did not converge: {last}").into())
-}
-
-/// Read a Deployment generation before and after a deterministic simulator
-/// configuration change.
-fn deployment_generation(context: &str, deployment: &str) -> Result<i64, Box<dyn std::error::Error>> {
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "get",
-            &format!("deployment/{deployment}"),
-            "-o",
-            "jsonpath={.metadata.generation}",
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "read deployment/{deployment} generation: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<i64>()
-        .map_err(|e| format!("invalid deployment/{deployment} generation: {e}").into())
 }
 
 // ---------------------------------------------------------------------------
@@ -2417,52 +2213,49 @@ fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::er
 /// In direct-HTTP mode, uses the Kubernetes API server proxy to reach
 /// the metrics Service without requiring extra images or containers.
 fn kubectl_exec_epp_metrics(cluster: &str, mtls: bool) -> Result<String, Box<dyn std::error::Error>> {
+    kubectl_exec_epp_metrics_with_timeout(cluster, mtls, Duration::from_secs(15))
+}
+
+/// Limit the entire API/exec command, not just wget inside the remote Pod.
+fn kubectl_exec_epp_metrics_with_timeout(
+    cluster: &str,
+    mtls: bool,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
     let ctx = kind_context(cluster);
+    let mut command = Command::new("kubectl");
+    command.args(["--context", &ctx]);
     if mtls {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                &ctx,
-                "-n",
-                GRID_SYSTEM_NS,
-                "exec",
-                "deploy/llmd-epp",
-                "-c",
-                "metrics-tls-proxy",
-                "--",
-                "wget",
-                "-qO-",
-                "--timeout=5",
-                "http://127.0.0.1:9090/metrics",
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "kubectl exec metrics failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        command.args([
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "deploy/llmd-epp",
+            "-c",
+            "metrics-tls-proxy",
+            "--",
+            "wget",
+            "-qO-",
+            "--timeout=5",
+            "http://127.0.0.1:9090/metrics",
+        ]);
     } else {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                &ctx,
-                "get",
-                "--raw",
-                "/api/v1/namespaces/grid-system/services/llmd-epp-metrics:9090/proxy/metrics",
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "kubectl api proxy metrics failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        command.args([
+            "get",
+            "--raw",
+            "/api/v1/namespaces/grid-system/services/llmd-epp-metrics:9090/proxy/metrics",
+        ]);
     }
+    let output = super::operator_routing_qualification::bounded_command(command, timeout, "EPP metrics scrape")
+        .map_err(std::io::Error::other)?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl EPP metrics failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Captured output from a curl probe run in a temporary pod.
@@ -3092,6 +2885,28 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// Find an imported containerd reference that resolves to the requested image digest.
+fn imported_reference_for_digest<'refs>(image: &str, references: &'refs str) -> Option<&'refs str> {
+    let (_, digest) = image.rsplit_once('@')?;
+    let suffix = format!("@{digest}");
+    let references: Vec<_> = references
+        .lines()
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+        .collect();
+
+    references
+        .iter()
+        .copied()
+        .find(|reference| *reference == image)
+        .or_else(|| {
+            references
+                .iter()
+                .copied()
+                .find(|reference| reference.ends_with(&suffix))
+        })
+}
+
 /// Stream a Docker image directly into Kind's containerd image store.
 ///
 /// `kind load docker-image` imports with `ctr --all-platforms`. Docker's
@@ -3131,6 +2946,82 @@ fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<d
     }
     if !import_status.success() {
         return Err(format!("failed to import {image} into {control_plane}").into());
+    }
+
+    if image.contains("@sha256:") {
+        let listed = Command::new("docker")
+            .args([
+                "exec",
+                &control_plane,
+                "ctr",
+                "--namespace=k8s.io",
+                "images",
+                "ls",
+                "-q",
+            ])
+            .output()?;
+        if !listed.status.success() {
+            return Err(format!(
+                "failed to list imported images in {control_plane}: {}",
+                String::from_utf8_lossy(&listed.stderr)
+            )
+            .into());
+        }
+
+        let references = String::from_utf8_lossy(&listed.stdout);
+        for (imported_reference, normalized_reference) in unqualified_import_aliases_for_digest(image, &references) {
+            let status = Command::new("docker")
+                .args([
+                    "exec",
+                    &control_plane,
+                    "ctr",
+                    "--namespace=k8s.io",
+                    "images",
+                    "tag",
+                    "--force",
+                    &imported_reference,
+                    &normalized_reference,
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(format!(
+                    "failed to tag imported image {imported_reference} with Docker-normalized name {normalized_reference} in {control_plane}"
+                )
+                .into());
+            }
+            eprintln!(
+                "  tagged imported image {imported_reference} with Docker-normalized name {normalized_reference} in {control_plane}"
+            );
+        }
+
+        let imported_reference = imported_reference_for_digest(image, &references)
+            .ok_or_else(|| format!("{image} was not found in {control_plane} after import"))?;
+        let normalized = normalized_requested_digest_alias(image);
+        for requested in std::iter::once(image).chain(normalized.as_deref()) {
+            if imported_reference == requested {
+                continue;
+            }
+            let status = Command::new("docker")
+                .args([
+                    "exec",
+                    &control_plane,
+                    "ctr",
+                    "--namespace=k8s.io",
+                    "images",
+                    "tag",
+                    "--force",
+                    imported_reference,
+                    requested,
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(format!(
+                    "failed to tag imported image {imported_reference} as {requested} in {control_plane}"
+                )
+                .into());
+            }
+            eprintln!("  tagged imported image {imported_reference} as {requested} in {control_plane}");
+        }
     }
     Ok(())
 }
@@ -3986,6 +3877,55 @@ fn capture_restart_snapshot(cluster: &str) -> RestartSnapshot {
         epp: capture_pod_snapshots(cluster, "app.kubernetes.io/name=llmd-epp"),
         gateway: capture_pod_snapshots(cluster, "app.kubernetes.io/name=praxis-gateway"),
     }
+}
+
+/// Return the Docker-normalized name for an unqualified imported reference.
+///
+/// `ctr images import` can name an untagged Docker-save image `import-<date>@<digest>`.
+/// The CRI image service normalizes that reference to `docker.io/library/...` when
+/// it checks image metadata, so the normalized name must also exist in containerd.
+fn canonicalized_unqualified_reference(reference: &str) -> Option<String> {
+    let (name, digest) = reference.split_once('@')?;
+    let first_component = name.split('/').next()?;
+    if first_component.contains('.') || first_component.contains(':') || first_component == "localhost" {
+        return None;
+    }
+
+    let normalized = if name.contains('/') {
+        format!("docker.io/{name}")
+    } else {
+        format!("docker.io/library/{name}")
+    };
+    Some(format!("{normalized}@{digest}"))
+}
+
+/// Normalize a requested digest reference, dropping an optional tag before CRI lookup.
+fn normalized_requested_digest_alias(reference: &str) -> Option<String> {
+    let (name, digest) = reference.rsplit_once('@')?;
+    let untagged = match name.rsplit_once(':') {
+        Some((repository, tag)) if !tag.contains('/') => repository,
+        _ => name,
+    };
+    let digest_reference = format!("{untagged}@{digest}");
+    canonicalized_unqualified_reference(&digest_reference)
+        .or_else(|| (digest_reference != reference).then_some(digest_reference))
+}
+
+/// Find imported digest references whose Docker-normalized names need an alias.
+fn unqualified_import_aliases_for_digest(image: &str, references: &str) -> Vec<(String, String)> {
+    let Some((_, digest)) = image.rsplit_once('@') else {
+        return Vec::new();
+    };
+    let suffix = format!("@{digest}");
+
+    references
+        .lines()
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty() && reference.ends_with(&suffix))
+        .filter_map(|reference| {
+            canonicalized_unqualified_reference(reference).map(|normalized| (reference.to_owned(), normalized))
+        })
+        .collect()
 }
 
 /// Compare restart snapshots and emit observations.
@@ -4853,6 +4793,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requested_digest_aliases_follow_docker_lookup_names() {
+        for (input, expected) in [
+            ("sim@sha256:abc", Some("docker.io/library/sim@sha256:abc")),
+            ("sim:tag@sha256:abc", Some("docker.io/library/sim@sha256:abc")),
+            ("team/sim:tag@sha256:abc", Some("docker.io/team/sim@sha256:abc")),
+            (
+                "registry.local:5000/team/sim:tag@sha256:abc",
+                Some("registry.local:5000/team/sim@sha256:abc"),
+            ),
+            ("ghcr.io/team/sim@sha256:abc", None),
+        ] {
+            assert_eq!(normalized_requested_digest_alias(input).as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn imported_reference_for_digest_matches_the_requested_immutable_image() {
+        let image = "ghcr.io/praxis-proxy/ai@sha256:expected";
+        let references = "import-2026-11-21@sha256:other\nimport-2026-11-21@sha256:expected\n";
+
+        assert_eq!(
+            imported_reference_for_digest(image, references),
+            Some("import-2026-11-21@sha256:expected")
+        );
+    }
+
+    #[test]
+    fn imported_reference_for_digest_prefers_the_requested_name_when_present() {
+        let image = "ghcr.io/praxis-proxy/ai@sha256:expected";
+        let references = "import-2026-11-21@sha256:expected\nghcr.io/praxis-proxy/ai@sha256:expected\n";
+
+        assert_eq!(imported_reference_for_digest(image, references), Some(image));
+    }
+
+    #[test]
+    fn imported_reference_for_digest_rejects_other_digests_and_tags() {
+        let references = "import-2026-11-21@sha256:other\nllm-d-inference-sim:deterministic\n";
+
+        assert_eq!(
+            imported_reference_for_digest("ghcr.io/praxis-proxy/ai@sha256:expected", references),
+            None
+        );
+        assert_eq!(imported_reference_for_digest("grid-gateway:local", references), None);
+    }
+
+    #[test]
+    fn unqualified_import_digest_gets_the_docker_library_alias_used_by_cri() {
+        let image = "ghcr.io/llm-d/llm-d-inference-sim@sha256:expected";
+        let references = concat!(
+            "import-2026-11-21@sha256:other\n",
+            "import-2026-11-21@sha256:expected\n",
+            "ghcr.io/llm-d/llm-d-inference-sim@sha256:expected\n",
+        );
+
+        assert_eq!(
+            unqualified_import_aliases_for_digest(image, references),
+            vec![(
+                "import-2026-11-21@sha256:expected".to_owned(),
+                "docker.io/library/import-2026-11-21@sha256:expected".to_owned(),
+            )]
+        );
+    }
+
+    #[test]
+    fn canonicalized_import_reference_respects_registry_and_repository_components() {
+        assert_eq!(
+            canonicalized_unqualified_reference("import-2026-11-21@sha256:expected"),
+            Some("docker.io/library/import-2026-11-21@sha256:expected".to_owned())
+        );
+        assert_eq!(
+            canonicalized_unqualified_reference("llm-d/sim@sha256:expected"),
+            Some("docker.io/llm-d/sim@sha256:expected".to_owned())
+        );
+        assert_eq!(
+            canonicalized_unqualified_reference("ghcr.io/llm-d/sim@sha256:expected"),
+            None
+        );
+        assert_eq!(
+            canonicalized_unqualified_reference("localhost:5000/sim@sha256:expected"),
+            None
+        );
+    }
+
+    #[test]
     fn curl_probe_waits_for_a_terminal_pod_before_reading_logs() -> Result<(), Box<dyn std::error::Error>> {
         let running: serde_json::Value = serde_json::from_str(r#"{"status":{"phase":"Running"}}"#)?;
         assert_eq!(
@@ -5173,117 +5197,10 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
-    fn simulator_config_persists_zero_queue_value() {
-        let config = simulator_config("vcr-1-config", 0, 0, 0.0);
-        assert!(config.contains("fake-metrics:"));
-        assert!(config.contains("name: vcr-1-config"));
-        assert!(config.contains("waiting-requests: 0"));
-        assert!(config.contains("running-requests: 0"));
-        assert!(config.contains("kv-cache-usage: 0"));
-    }
-
-    #[test]
-    fn simulator_config_persists_pressure_queue_value() {
-        let config = simulator_config("vcr-2-config", 9, 0, 0.0);
-        assert!(config.contains("name: vcr-2-config"));
-        assert!(config.contains("waiting-requests: 9"));
-        assert!(!config.contains("pressure-generator"));
-    }
-
-    #[test]
-    fn simulator_config_supports_distinct_endpoint_kv_cache_values() {
-        let high_endpoint = simulator_config("vcr-1-config", 1, 8, 1.0);
-        let low_endpoint = simulator_config("vcr-2-config", 1, 8, 0.0);
-
-        assert!(high_endpoint.contains("name: vcr-1-config"));
-        assert!(high_endpoint.contains("waiting-requests: 1"));
-        assert!(high_endpoint.contains("running-requests: 8"));
-        assert!(high_endpoint.contains("kv-cache-usage: 1"));
-        assert!(low_endpoint.contains("name: vcr-2-config"));
-        assert!(low_endpoint.contains("waiting-requests: 1"));
-        assert!(low_endpoint.contains("running-requests: 8"));
-        assert!(low_endpoint.contains("kv-cache-usage: 0"));
-    }
-
-    #[test]
-    fn simulator_config_data_matches_the_manifest_block_value() {
-        let waiting_requests = 1;
-        let running_requests = 8;
-        let kv_cache_usage = 1.0;
-        let config = simulator_config("vcr-1-config", waiting_requests, running_requests, kv_cache_usage);
-        let config_data = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
-        let indented_config_data = config_data
-            .lines()
-            .map(|line| format!("    {line}\n"))
-            .collect::<String>();
-
-        assert!(
-            config.ends_with(&format!("data:\n  config.yaml: |\n{indented_config_data}")),
-            "the readback value should be rendered from the same simulator configuration data"
-        );
-    }
-
-    #[test]
     fn kv_cache_pressure_sets_only_the_selected_signal() {
         let (queue, kv_cache) = simulator_metrics(9, ScoringFlavor::KvCachePressure);
-        let config = simulator_config("vcr-1-config", queue, 0, kv_cache);
-        assert!(config.contains("waiting-requests: 0"));
-        assert!(config.contains("kv-cache-usage: 0.95"));
-    }
-
-    #[test]
-    fn simulator_rollout_annotations_change_for_kv_cache_pressure() {
-        let idle = simulator_rollout_annotations(0, 0, 0.0);
-        let pressured = simulator_rollout_annotations(0, 0, 0.95);
-
-        assert_eq!(
-            idle.get(SIMULATOR_WAITING_REQUESTS_ANNOTATION).map(String::as_str),
-            Some("0"),
-            "idle configuration should annotate the zero queue value"
-        );
-        assert_eq!(
-            pressured.get(SIMULATOR_WAITING_REQUESTS_ANNOTATION).map(String::as_str),
-            Some("0"),
-            "KV-cache pressure must leave queue pressure unchanged"
-        );
-        assert_eq!(
-            idle.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
-            Some("0"),
-            "idle configuration should annotate zero KV-cache use"
-        );
-        assert_eq!(
-            idle.get(SIMULATOR_RUNNING_REQUESTS_ANNOTATION).map(String::as_str),
-            Some("0"),
-            "idle configuration should annotate the zero running-request value"
-        );
-        assert_eq!(
-            pressured.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
-            Some("0.95"),
-            "KV-cache pressure should be present in the simulator pod template"
-        );
-        assert_ne!(
-            idle, pressured,
-            "KV-cache-only changes must change pod-template annotations and trigger rollout"
-        );
-    }
-
-    #[test]
-    fn unchanged_simulator_generation_does_not_require_a_rollout() {
-        assert_eq!(
-            simulator_rollout_needed(3, 3),
-            Ok(false),
-            "an unchanged generation is already current"
-        );
-        assert_eq!(
-            simulator_rollout_needed(3, 4),
-            Ok(true),
-            "a newer generation requires rollout readiness"
-        );
-        assert_eq!(
-            simulator_rollout_needed(4, 3),
-            Err("generation moved backwards (4 -> 3)".to_owned()),
-            "a generation moving backwards indicates inconsistent rollout evidence"
-        );
+        assert_eq!(queue, 0);
+        assert!((kv_cache - 0.95).abs() < f64::EPSILON);
     }
 
     #[test]

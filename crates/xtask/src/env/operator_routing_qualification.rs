@@ -396,7 +396,7 @@ fn scope_environment_name(config: &mut serde_yaml::Value, suffix: &str) -> Resul
 }
 
 /// Run a subprocess with bounded execution and output collection.
-fn bounded_command(mut command: Command, timeout: Duration, label: &str) -> Result<Output, String> {
+pub(super) fn bounded_command(mut command: Command, timeout: Duration, label: &str) -> Result<Output, String> {
     let started = Instant::now();
     let mut stdout_file =
         tempfile::NamedTempFile::new().map_err(|error| format!("create {label} stdout capture: {error}"))?;

@@ -51,6 +51,52 @@ must make both sites full and recover when it drains. Neither site may publish
 a learned ceiling. The proof restores simulator load and replica counts on
 success and failure.
 
+The saturation proof also sends three samples of 1,024 ordinary
+requests through the local `grid_site_route` Gateway: an idle baseline, pool-B
+with synthetic simulator-reported KV utilization of `0.9` and no waiting
+requests, and an idle recovery. The pressured batch requires fresh Gateway
+`rho >= 1`, `full = 0`, successful provider/site/backend attribution, and the
+two-site weighted selector path for every request. Each sample runs in batches
+of 32, and both positive ready-unit weights and route metrics must match the
+initial readings at every before/after checkpoint. The
+observed pool-B share must match the equal-capacity two-site selector formula,
+where each site's contribution is proportional to `1 / (1 + rho)`, within five
+percentage points. Baseline and recovery must remain within
+five points of the equal-share expectation; pressure must lower pool-B share by
+at least ten points while keeping it above ten percent. At 1,024 requests, the
+five-point share tolerance is about 3.2 binomial standard errors at an equal
+share, while the ten-point reduction exceeds four standard errors for two
+independent equal-share samples. The selector's mixed-turn sequence is
+deterministic, so these standard errors are a scale reference rather than a
+formal confidence interval; each sample also checks the signal-derived share
+formula and matching metric window. The real-selector closed-loop simulation
+remains the quantitative acceptance test. The fake KV metric is a synthetic
+simulator stimulus, not naturally accumulated GPU saturation or a throughput
+benchmark.
+
+The same full-mode proof separately qualifies a site losing half its effective
+capacity while aggregate synthetic work stays fixed. Pool-B starts with two
+ready simulator endpoints; the run removes `vcr-2`, verifies its ready-unit
+weight changes from 2 to 1, and then restores it. Pool-A stays at two units and
+keeps `waiting=0`, `running=2`, and KV `0.45` per endpoint. Pool-B carries the
+same aggregate running work and KV use before and during the loss: each of two
+endpoints reports `running=2` and KV `0.45`, then its one remaining endpoint
+reports `running=4` and KV `0.9`. Waiting and held requests stay zero. The
+Gateway must report `full=0` throughout; pool-B's non-full `rho` rises above 1
+under the synthetic KV stimulus, where the soft preference still applies.
+Each phase sends exactly 1,024 requests. The observed pool-B share must match
+the live capacity-and-pressure formula, which predicts about
+`0.50 -> 0.269 -> 0.50` from the measured weights and rho values. The run
+requires both sites to receive traffic in every sample and verifies
+per-response provider-marker/backend matching. It also records eight observed
+128-request windows per phase, with time bounds, before/after signal readings,
+and route counts. Both sites must receive traffic in each window, and pool-B's
+share must stay within 20 percentage points of the measured prediction. This
+window tolerance is wider than the five-point aggregate gate because there are
+fewer requests per window. These observations do not prove behavior at every
+underlying EPP or operator tick. This is a controlled two-site ready-unit loss,
+not a throughput or real hardware-capacity benchmark.
+
 For pressure-driven routing, the full-mode cross-site proof checks the live
 Gateway queue-score order and compares attributed responses with its measured
 two-site capacity-weighted share. This preserves the routing assertion after
@@ -73,8 +119,22 @@ the Gateway's observed weighted share.
 
 The qualification uses upstream `llm-d-inference-sim` as the inference
 backend. Each simulator's startup `fake-metrics` values are mounted from its own
-ConfigMap. The runner updates those persistent configurations and normally
-rolls the simulator pods, so a restart cannot lose the requested values.
+ConfigMap. During qualification, the runner changes the queue, running, and
+KV-cache scalars through the simulator's `GET` and `POST /admin/config` runtime
+API. It verifies the returned configuration, waits for the corresponding EPP
+metrics, and checks that Pod UIDs and restart counts stay unchanged across each
+update. The original values are saved at the first mutation and restored at the
+end of the full proof. Replica scaling in the separate half-capacity case is an
+explicit capacity change, not a metric-update mechanism.
+
+Simulator admin connections use ports allocated by their own `kubectl` child,
+not a free-port guess. Restoration keeps saved values until all target writes
+and EPP readings verify for that cluster. It tries each target up to three times
+through fresh forwards, reads before writing, and checks readback after a POST
+error. Remaining values are retained in `pending-simulator-restores.json` under
+the evidence directory; a successful restoration leaves an empty array. This
+file preserves manual recovery targets when a failed run is kept.
+
 The local scoring proofs use the deterministic state sequence `0 -> 9 -> 0`
 for queue depth and `0.0 -> 0.95 -> 0.0` for KV-cache pressure. Pool-B's pinned
 EPP enables its `flowControl` feature gate, so it publishes its own pool
