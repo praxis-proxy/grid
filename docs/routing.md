@@ -68,6 +68,12 @@ site, trust, and authentication settings for your deployment. See the
 If `selectionPolicy` is omitted, Praxis uses deterministic selection. Set it
 explicitly when you want traffic sharing; `noMetrics` alone does not enable
 round robin or weighted selection.
+
+This `selectionPolicy` table describes the consumer `intelligent_route` path.
+The embedded Grid Gateway's `grid_site_route` is a separate selector and does
+not implement these GridNetwork modes. It does use the candidate `weight` the
+operator renders from `capacityWeight` in its no-pressure fallback; see
+[Cross-site site selection](site-selection.md) for that contract.
 The `grid-site` Helm chart explicitly sets `roundRobin` for a new network
 unless configured otherwise; it preserves an existing network's selection
 policy on upgrade. Check the rendered resource when comparing Helm and direct

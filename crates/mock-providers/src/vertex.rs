@@ -134,10 +134,7 @@ mod tests {
 
     /// Build a test `AppState` with a known provider site.
     fn test_state() -> AppState {
-        AppState {
-            provider_site: Arc::from("test-site"),
-            queue_depth: 0.1,
-        }
+        AppState::new(Arc::from("test-site"), 0.1)
     }
 
     /// Send a request to the router and return the response.
