@@ -2146,6 +2146,23 @@ mod tests {
     }
 
     #[test]
+    fn only_explicit_legacy_affinity_timings_log_a_deprecation() {
+        for (yaml, deprecated) in [
+            ("{}", false),
+            ("prefix_tokens_per_queued_request: 20000", false),
+            ("prefix_tokens_per_queued_request: 0", false),
+            ("prefill_tokens_per_second: 10000", true),
+            ("queued_request_seconds: 2", true),
+            ("prefill_tokens_per_second: 10000\nqueued_request_seconds: 0", true),
+        ] {
+            let raw: serde_yaml::Value = serde_yaml::from_str(yaml).expect("yaml");
+            let settings: AffinitySettings = serde_yaml::from_value(raw.clone()).expect("settings");
+            let log = info_log(|| settings.validate_config(Some(&raw)).expect("valid settings"));
+            assert_eq!(log.contains("deprecated"), deprecated, "{yaml}: {log}");
+        }
+    }
+
+    #[test]
     fn unchanged_reload_logs_nothing_at_info() {
         let tally = WatchCounts::default();
         let quiet = info_log(|| report(&Ok(None), &tally, "grid: serving config reloaded"));

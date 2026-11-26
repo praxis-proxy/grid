@@ -57,15 +57,15 @@ soft and hard capacity bounds, and provider-reported KV-cache fullness. The fiel
 | `exploration` | 0.02 | Share of requests that skip affinity, so a second site learns a shared prefix. |
 | `capacity` | 16384 | Positive entry limit for each backend cluster's LRU in each gateway replica. |
 | `ttl_secs` | 600 | Positive lifetime in seconds after a successful response confirms a prefix entry. |
-| `prefill_tokens_per_second` | 10000 | Prompt tokens a site prefills per second, pricing the cache a match saves. |
-| `queued_request_seconds` | 2.0 | Seconds one queued request adds to a wait, turning that price into queue depth. |
+| `prefix_tokens_per_queued_request` | 20000 | Matching prefix tokens worth one queued request. Set to zero to skip the queue-cost comparison during prefix-affinity routing. |
 | `tag_key_path` | none | A file holding the key that authenticates stored-state tags. |
 
 Cache limits reserve space separately for each backend cluster; total entry
 capacity grows with the cluster count. Plugin reconfiguration resizes existing
 LRUs while preserving their most recent entries. TTL changes affect subsequent
 confirmations; previously recorded deadlines stay unchanged. See
-[prefix affinity](../../docs/architecture/prefix-affinity.md) for the lifecycle.
+[prefix affinity](../../docs/architecture/prefix-affinity.md) for the lifecycle
+and legacy load-cost migration.
 
 Tuning order, one metric against one truth per step: the soft and hard ceiling gauges against
 queue-free load and demonstrated limits, `grid_route_site_rho` against the engine queue and KV

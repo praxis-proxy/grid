@@ -53,23 +53,71 @@ impl Queued for Site<'_> {
 
 /// Whether load outweighs a match, in whatever load signal selection orders by.
 pub(crate) trait LoadGate {
-    /// Whether `stuck`, the best sticky site, is busier than `other`, the best
-    /// other site, by more than `saved` seconds of prefill.
-    fn outweighs(&self, stuck: &Site<'_>, other: &Site<'_>, saved: f64) -> bool;
+    /// Whether the load comparison is enabled.
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    /// Whether the extra queue at the best sticky site outweighs `tokens` cached prompt tokens.
+    fn outweighs(&self, stuck: &Site<'_>, other: &Site<'_>, tokens: f64) -> bool;
 }
 
-/// Weighs queue depth, taking each queued request to add a fixed wait.
+/// Prices cached prompt tokens against the extra queue depth at a matching site.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct QueueGate {
-    /// Seconds one queued request adds to a new request's wait.
-    pub(crate) queued_request_seconds: f64,
+pub(crate) enum QueueGate {
+    /// Matching prefix tokens worth one queued request.
+    TokensPerRequest(f64),
+    /// Original timing settings, retaining their division order during migration.
+    Legacy {
+        /// Prompt tokens prefilled per second.
+        prefill_tokens_per_second: f64,
+        /// Seconds added per queued request.
+        queued_request_seconds: f64,
+    },
+}
+
+impl From<&AffinitySettings> for QueueGate {
+    fn from(settings: &AffinitySettings) -> Self {
+        settings.prefix_tokens_per_queued_request.map_or(
+            Self::Legacy {
+                prefill_tokens_per_second: settings.prefill_tokens_per_second,
+                queued_request_seconds: settings.queued_request_seconds,
+            },
+            Self::TokensPerRequest,
+        )
+    }
 }
 
 impl LoadGate for QueueGate {
-    fn outweighs(&self, stuck: &Site<'_>, other: &Site<'_>, saved: f64) -> bool {
-        // An unmeasured sticky site loses to a measured one; two unmeasured sites compare as NaN and stay.
-        stuck.queue - other.queue > saved / self.queued_request_seconds
+    fn enabled(&self) -> bool {
+        match self {
+            Self::TokensPerRequest(tokens) => *tokens > 0.0,
+            Self::Legacy {
+                queued_request_seconds, ..
+            } => *queued_request_seconds > 0.0,
+        }
     }
+
+    fn outweighs(&self, stuck: &Site<'_>, other: &Site<'_>, tokens: f64) -> bool {
+        let queue_gap = match self {
+            Self::TokensPerRequest(per_request) => tokens / per_request,
+            Self::Legacy {
+                prefill_tokens_per_second,
+                queued_request_seconds,
+            } => (tokens / prefill_tokens_per_second) / queued_request_seconds,
+        };
+        // An unmeasured sticky site loses to a measured one; two unmeasured sites compare as NaN and stay.
+        stuck.queue - other.queue > queue_gap
+    }
+}
+
+/// Deserialize a supplied number without treating null as an omitted setting.
+///
+/// # Errors
+///
+/// Returns the deserializer's error when the value is not a number.
+fn supplied_load_cost<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    f64::deserialize(deserializer).map(Some)
 }
 
 /// Prefix affinity settings from the grid serving config.
@@ -84,9 +132,13 @@ pub struct AffinitySettings {
     pub threshold: f64,
     /// Share of requests that skip affinity, so a second site learns a shared prefix.
     pub exploration: f64,
-    /// Prompt tokens a site prefills per second, to price the cache a match saves.
+    /// Matching prefix tokens worth one queued request. Zero skips the load comparison.
+    /// Omission uses the legacy timings, whose defaults are equivalent to 20,000 tokens.
+    #[serde(default, deserialize_with = "supplied_load_cost")]
+    pub prefix_tokens_per_queued_request: Option<f64>,
+    /// Deprecated prompt tokens prefilled per second. Retained for one release.
     pub prefill_tokens_per_second: f64,
-    /// Seconds one queued request adds to a new request's wait, to turn that price into queue depth.
+    /// Deprecated seconds added per queued request. Zero skips the comparison. Retained for one release.
     pub queued_request_seconds: f64,
     /// A file holding the key that authenticates stored-state tags. Without one, tags carry no mac.
     pub tag_key_path: Option<String>,
@@ -101,6 +153,7 @@ impl Default for AffinitySettings {
             enabled: true,
             threshold: 0.8,
             exploration: 0.02,
+            prefix_tokens_per_queued_request: None,
             prefill_tokens_per_second: 10_000.0,
             queued_request_seconds: 2.0,
             tag_key_path: None,
@@ -134,13 +187,50 @@ impl AffinitySettings {
                 self.exploration
             ));
         }
-        for (name, value) in [
-            ("prefill_tokens_per_second", self.prefill_tokens_per_second),
-            ("queued_request_seconds", self.queued_request_seconds),
-        ] {
-            if !(value.is_finite() && value > 0.0) {
-                return Err(format!("prefix_affinity.{name} must be above 0, got {value}"));
-            }
+        if let Some(tokens) = self.prefix_tokens_per_queued_request
+            && !(tokens.is_finite() && tokens >= 0.0)
+        {
+            return Err(format!(
+                "prefix_affinity.prefix_tokens_per_queued_request must be finite and 0 or above, got {tokens}"
+            ));
+        }
+        if !(self.prefill_tokens_per_second.is_finite() && self.prefill_tokens_per_second > 0.0) {
+            return Err(format!(
+                "prefix_affinity.prefill_tokens_per_second must be above 0, got {}",
+                self.prefill_tokens_per_second
+            ));
+        }
+        if !(self.queued_request_seconds.is_finite() && self.queued_request_seconds >= 0.0) {
+            return Err(format!(
+                "prefix_affinity.queued_request_seconds must be 0 or above, got {}",
+                self.queued_request_seconds
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate plugin settings and report explicitly configured legacy timing keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid values or a mix of new and legacy load-cost settings.
+    pub(crate) fn validate_config(&self, config: Option<&serde_yaml::Value>) -> Result<(), String> {
+        let legacy: Vec<_> = ["prefill_tokens_per_second", "queued_request_seconds"]
+            .into_iter()
+            .filter(|key| config.is_some_and(|config| config.get(*key).is_some()))
+            .collect();
+        if self.prefix_tokens_per_queued_request.is_some() && !legacy.is_empty() {
+            return Err(
+                "prefix_affinity.prefix_tokens_per_queued_request cannot be combined with legacy timing settings"
+                    .to_owned(),
+            );
+        }
+        self.validate()?;
+        if !legacy.is_empty() {
+            tracing::warn!(
+                settings = ?legacy,
+                "prefix affinity timing settings are deprecated. Use prefix_tokens_per_queued_request. Legacy keys will be removed after one release"
+            );
         }
         Ok(())
     }
@@ -237,7 +327,7 @@ impl Affinity<'_> {
             return Outcome::NoMatch;
         }
         // Deepest first, so a site holding only a shared system prompt cannot pull a conversation away.
-        if self.overloaded(sites, &depths, deepest, gate) {
+        if gate.enabled() && Self::overloaded(sites, &depths, deepest, gate) {
             return Outcome::LoadOverride;
         }
         for (slot, depth) in keep.iter_mut().zip(depths) {
@@ -248,7 +338,7 @@ impl Affinity<'_> {
 
     /// Whether load outweighs the match: the best sticky site is busier than the
     /// best other site by more than the prefill the match saves.
-    fn overloaded(&self, sites: &[impl Queued], depths: &[usize], depth: usize, gate: &impl LoadGate) -> bool {
+    fn overloaded(sites: &[impl Queued], depths: &[usize], depth: usize, gate: &impl LoadGate) -> bool {
         let best = |pick: bool| {
             sites
                 .iter()
@@ -260,8 +350,6 @@ impl Affinity<'_> {
         let (Some(stuck), Some(other)) = (best(true), best(false)) else {
             return false;
         };
-        // Tokens estimated at 4 bytes each, as the canonical stream is.
-        let saved = tokens(depth) / self.settings.prefill_tokens_per_second;
         // Two stack values for the gate; the view type stays selection's own.
         let stuck = Site {
             cluster: stuck.cluster(),
@@ -271,7 +359,7 @@ impl Affinity<'_> {
             cluster: other.cluster(),
             queue: other.queue(),
         };
-        gate.outweighs(&stuck, &other, saved)
+        gate.outweighs(&stuck, &other, tokens(depth))
     }
 }
 
@@ -331,7 +419,8 @@ mod tests {
         }
     }
 
-    const GATE: QueueGate = QueueGate {
+    const GATE: QueueGate = QueueGate::Legacy {
+        prefill_tokens_per_second: 10_000.0,
         queued_request_seconds: 2.0,
     };
 
@@ -396,6 +485,148 @@ mod tests {
         assert_eq!(run(&holding("east", 40), 40, &queues).0, Outcome::LoadOverride);
         // 400 keys is 25,600 tokens: 2.56s of prefill, 1.28 queued requests.
         assert_eq!(run(&holding("east", 400), 400, &queues).0, Outcome::Sticky);
+    }
+
+    #[test]
+    fn zero_queue_cost_preserves_the_other_affinity_gates() -> Result<(), serde_json::Error> {
+        for (held, total, exploration, outcome, expected) in [
+            (40, 40, 0.0, Outcome::Sticky, [true, false]),
+            (4, 8, 0.0, Outcome::NoMatch, [true, true]),
+            (40, 40, 1.0, Outcome::Exploration, [true, true]),
+        ] {
+            let index = holding("east", held);
+            let keys = keys(total);
+            let mut settings: AffinitySettings = serde_json::from_str(r#"{"queued_request_seconds":0}"#)?;
+            settings.exploration = exploration;
+            assert!(settings.validate().is_ok(), "zero queue cost is valid");
+            let affinity = Affinity {
+                index: &index,
+                keys: Some(&keys),
+                settings: &settings,
+                turn: 0,
+            };
+            let mut keep = vec![true; 2];
+            let sites = sites(&[("east", f64::INFINITY), ("west", 0.0)]);
+            assert_eq!(affinity.narrow(&sites, &mut keep, &QueueGate::from(&settings)), outcome);
+            assert_eq!(keep, expected, "only a qualifying match narrows the candidates");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_token_cost_controls_the_load_comparison() {
+        let index = holding("east", 40);
+        let keys = keys(40);
+        for (cost, queue, outcome, expected) in [
+            (20_000.0, 1.0, Outcome::LoadOverride, [true, true]),
+            (1_000.0, 1.0, Outcome::Sticky, [true, false]),
+            (0.0, f64::INFINITY, Outcome::Sticky, [true, false]),
+            (-0.0, f64::INFINITY, Outcome::Sticky, [true, false]),
+        ] {
+            let settings = AffinitySettings {
+                prefix_tokens_per_queued_request: Some(cost),
+                ..settings()
+            };
+            settings.validate().expect("valid token cost");
+            let affinity = Affinity {
+                index: &index,
+                keys: Some(&keys),
+                settings: &settings,
+                turn: 0,
+            };
+            let mut keep = vec![true; 2];
+            assert_eq!(
+                affinity.narrow(
+                    &sites(&[("east", queue), ("west", 0.0)]),
+                    &mut keep,
+                    &QueueGate::from(&settings)
+                ),
+                outcome
+            );
+            assert_eq!(keep, expected, "cost {cost} and queue {queue}");
+        }
+    }
+
+    #[test]
+    fn token_cost_defaults_match_legacy_defaults_at_the_queue_boundary() {
+        let legacy = QueueGate::from(&AffinitySettings::default());
+        let current = QueueGate::TokensPerRequest(20_000.0);
+        for tokens in [256.0, 2_560.0, 25_600.0] {
+            for queue in [0.0, tokens / 20_000.0, 1.0, f64::INFINITY] {
+                let stuck = Site { cluster: "east", queue };
+                let other = Site {
+                    cluster: "west",
+                    queue: 0.0,
+                };
+                assert_eq!(
+                    legacy.outweighs(&stuck, &other, tokens),
+                    current.outweighs(&stuck, &other, tokens)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_timings_keep_the_original_division_order() {
+        for (prefill, wait) in [(10_000.0, 2.0), (1.0e-308, 1.0e308), (f64::MAX, f64::MIN_POSITIVE)] {
+            let settings = AffinitySettings {
+                prefill_tokens_per_second: prefill,
+                queued_request_seconds: wait,
+                ..settings()
+            };
+            let gate = QueueGate::from(&settings);
+            let threshold = (2_560.0 / prefill) / wait;
+            for queue in [0.0, 1.0, 1.0e300, f64::INFINITY] {
+                assert_eq!(
+                    gate.outweighs(
+                        &Site { cluster: "east", queue },
+                        &Site {
+                            cluster: "west",
+                            queue: 0.0
+                        },
+                        2_560.0
+                    ),
+                    queue > threshold,
+                    "prefill {prefill}, wait {wait}, queue {queue}"
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<AffinitySettings>(r#"{"prefill_tokens_per_second":5000}"#)
+                .unwrap()
+                .queued_request_seconds,
+            2.0,
+            "a single legacy key retains the other default"
+        );
+        assert_eq!(
+            serde_json::from_str::<AffinitySettings>(r#"{"queued_request_seconds":4}"#)
+                .unwrap()
+                .prefill_tokens_per_second,
+            10_000.0,
+            "the other single legacy key retains its default"
+        );
+    }
+
+    #[test]
+    fn token_cost_requires_a_finite_nonnegative_number() {
+        for cost in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                AffinitySettings {
+                    prefix_tokens_per_queued_request: Some(cost),
+                    ..settings()
+                }
+                .validate()
+                .is_err(),
+                "cost {cost}"
+            );
+        }
+        for value in ["null", r#""0""#] {
+            assert!(
+                serde_json::from_str::<AffinitySettings>(&format!(r#"{{"prefix_tokens_per_queued_request":{value}}}"#))
+                    .is_err(),
+                "value {value}"
+            );
+        }
     }
 
     #[test]
@@ -557,6 +788,14 @@ mod tests {
             },
             AffinitySettings {
                 prefill_tokens_per_second: 0.0,
+                ..base.clone()
+            },
+            AffinitySettings {
+                queued_request_seconds: -1.0,
+                ..base.clone()
+            },
+            AffinitySettings {
+                queued_request_seconds: f64::INFINITY,
                 ..base.clone()
             },
             AffinitySettings {
