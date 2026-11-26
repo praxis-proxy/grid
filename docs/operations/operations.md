@@ -35,7 +35,7 @@ release installed.
 
 Uninstalling the chart removes namespaced resources but retains CRDs.
 Custom resources created by other chart releases (e.g., grid-site) are
-not affected. See the [chart README](../../charts/grid-operator/README.md)
+not affected. See the [chart README](https://github.com/praxis-proxy/grid/blob/main/charts/grid-operator/README.md)
 for the full values reference.
 
 **Option 2: Kustomize**

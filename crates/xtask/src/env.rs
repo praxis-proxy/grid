@@ -1097,7 +1097,8 @@ pub(crate) enum Action {
         /// Path to the Forge environment config file.
         #[arg(long, default_value = "tests/e2e/topologies/grid-provider-traffic/forge.yaml")]
         forge_config: PathBuf,
-        /// Run mode and teardown options. Only `--quick` is supported.
+        /// Run mode and teardown options. `--full` adds consumer-config,
+        /// regional-policy, and provider-lifecycle coverage.
         #[command(flatten)]
         options: GlbDemoOptions,
     },

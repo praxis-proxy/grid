@@ -8,7 +8,7 @@
 This quickstart runs a two-site grid on one Linux machine with kind: a hub
 cluster and a site cluster, with SPIFFE peer trust and polled signals. The
 repository's hub-and-site test script creates the clusters, runs the
-[hub and site Helm install](../../examples/helm/hub-site/README.md), and checks
+[hub and site Helm install](https://github.com/praxis-proxy/grid/blob/main/examples/helm/hub-site/README.md), and checks
 that the grid works. CI runs the same script on every pull request.
 
 To install AGN on clusters you already run, use the
@@ -24,6 +24,15 @@ instead.
 - Rust from `rust-toolchain.toml`, used to install [Forge](../developing/forge.md),
   the tool that creates the clusters.
 - 4 vCPU, 16 GB memory, and 20 GB of free disk.
+- On non-amd64 Linux hosts, the script loads the amd64-only VCR simulator
+  image and requires container-runtime emulation.
+
+The script uses the fixed Kind cluster names <code>grid-hub-site-hub</code>
+and <code>grid-hub-site-site</code>, with contexts
+<code>kind-grid-hub-site-hub</code> and <code>kind-grid-hub-site-site</code>.
+Check <code>kind get clusters</code> before starting. The <code>down</code>
+command deletes both named clusters, so use these names only when they are
+free and owned by this evaluation.
 
 ## Create the grid
 
@@ -97,10 +106,24 @@ curl -sS -D - -H 'Content-Type: application/json' \
   http://127.0.0.1:18080/v1/chat/completions
 ```
 
-A working grid returns HTTP 200 with a `choices` array. The backend is a
-simulator that replays recorded responses, so the content is not a live model
-answer. The `x-grid-provider-site: site-a` response header shows that
-the hub routed the request to the site cluster. Stop the port-forward with Ctrl+C.
+A working grid returns HTTP 200 with a <code>choices</code> array. The
+backend is a simulator that replays recorded responses, so the content is not
+a live model answer. In this example, the
+<code>x-grid-provider-site: site-a</code> and <code>x-grid-backend: vcr</code>
+response headers identify the route and simulator. Stop the port-forward with
+Ctrl+C.
+
+## What you just verified
+
+This run exercises Grid Gateway's <code>grid_site_route</code> path with
+serving configuration rendered by the operator. It does not exercise Praxis
+AI's separate <code>intelligent_route</code> overlay path; see the
+[routing guide](../routing.md) for that integration. The response headers above
+belong to this example and are not guaranteed by every Grid deployment.
+
+This procedure demonstrates the configured route and response path. It does
+not measure model capacity or inference performance, and signal polling is
+enabled by this quickstart configuration.
 
 ## Clean up
 
@@ -113,7 +136,7 @@ Delete both clusters:
 ## Notes
 
 - The Helm commands the script runs are in
-  [examples/helm/hub-site](../../examples/helm/hub-site/README.md).
+  [hub and site Helm example](https://github.com/praxis-proxy/grid/blob/main/examples/helm/hub-site/README.md).
 - `grid.membership.source` picks where a site learns its members. `Swim`, the
   default, discovers them by SWIM gossip. `Local` means this site's
   configuration lists its peers as `GridSite` objects, polls their signals, and

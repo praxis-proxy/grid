@@ -9,8 +9,8 @@ Development and validation guidance for AI Grid Network (AGN) contributors.
 - [Type design](type-design.md): examples of the type-design rules in the
   conventions.
 - [Forge tooling](forge.md): the pinned Forge that creates test clusters.
-- [CI Kind E2E](ci-kind-e2e.md): validation tiers, gate sequence, sequencing
-  requirements, and environment dependencies.
+- [Grid evaluation and E2E scenarios](ci-kind-e2e.md): scenario selection,
+  run guides, resource requirements, and current workflow coverage.
 - [Release process](release.md): versioning, validation, artifact
   publication, and release workflow.
 - [Unicode audit](unicode-audit.md): tracked text inventory and intentional
@@ -49,23 +49,23 @@ directory.
 
 | Package | Source | Responsibility |
 | --- | --- | --- |
-| `operator` | [`crates/operator/`](../../crates/operator/) | Kubernetes controllers, CRDs, and the operator binary. |
-| `grid-overlay-sync` | [`crates/overlay-sync/`](../../crates/overlay-sync/) | Watches overlay ConfigMaps and delivers local gateway files. |
-| `swim` | [`crates/swim/`](../../crates/swim/) | Membership, gossip transport, and encryption. |
-| `crdt` | [`crates/crdt/`](../../crates/crdt/) | Replicated state primitives and provider state. |
-| `scoring` | [`crates/scoring/`](../../crates/scoring/) | Provider scoring and overlay contract types. |
-| `certs` | [`crates/certs/`](../../crates/certs/) | Site certificates and certificate-provider interfaces. |
-| `enrollment` | [`crates/enrollment/`](../../crates/enrollment/) | Site enrollment service and API types. |
-| `grid-signals` | [`crates/signals/`](../../crates/signals/) | Shared load-signal store, Prometheus exposition parser, and labels. |
-| `grid-client` | [`crates/client/`](../../crates/client/) | Grid-root HTTP clients and the mTLS site-signal poller. |
-| `mock-providers` | [`crates/mock-providers/`](../../crates/mock-providers/) | Mock inference-provider APIs. |
-| `fleet-dashboard` | [`crates/fleet-dashboard/`](../../crates/fleet-dashboard/) | Optional fleet UI and Prometheus-backed views. |
-| `xtask` | [`crates/xtask/`](../../crates/xtask/) | Repository generation, environments, and qualification commands. |
-| `version` | [`crates/version/`](../../crates/version/) | Shared build identity for binaries and container provenance. |
+| `operator` | [`crates/operator/`](https://github.com/praxis-proxy/grid/tree/main/crates/operator) | Kubernetes controllers, CRDs, and the operator binary. |
+| `grid-overlay-sync` | [`crates/overlay-sync/`](https://github.com/praxis-proxy/grid/tree/main/crates/overlay-sync) | Watches overlay ConfigMaps and delivers local gateway files. |
+| `swim` | [`crates/swim/`](https://github.com/praxis-proxy/grid/tree/main/crates/swim) | Membership, gossip transport, and encryption. |
+| `crdt` | [`crates/crdt/`](https://github.com/praxis-proxy/grid/tree/main/crates/crdt) | Replicated state primitives and provider state. |
+| `scoring` | [`crates/scoring/`](https://github.com/praxis-proxy/grid/tree/main/crates/scoring) | Provider scoring and overlay contract types. |
+| `certs` | [`crates/certs/`](https://github.com/praxis-proxy/grid/tree/main/crates/certs) | Site certificates and certificate-provider interfaces. |
+| `enrollment` | [`crates/enrollment/`](https://github.com/praxis-proxy/grid/tree/main/crates/enrollment) | Site enrollment service and API types. |
+| `grid-signals` | [`crates/signals/`](https://github.com/praxis-proxy/grid/tree/main/crates/signals) | Shared load-signal store, Prometheus exposition parser, and labels. |
+| `grid-client` | [`crates/client/`](https://github.com/praxis-proxy/grid/tree/main/crates/client) | Grid-root HTTP clients and the mTLS site-signal poller. |
+| `mock-providers` | [`crates/mock-providers/`](https://github.com/praxis-proxy/grid/tree/main/crates/mock-providers) | Mock inference-provider APIs. |
+| `fleet-dashboard` | [`crates/fleet-dashboard/`](https://github.com/praxis-proxy/grid/tree/main/crates/fleet-dashboard) | Optional fleet UI and Prometheus-backed views. |
+| `xtask` | [`crates/xtask/`](https://github.com/praxis-proxy/grid/tree/main/crates/xtask) | Repository generation, environments, and qualification commands. |
+| `version` | [`crates/version/`](https://github.com/praxis-proxy/grid/tree/main/crates/version) | Shared build identity for binaries and container provenance. |
 
-[`crates/gateway/`](../../crates/gateway/) is a separate Cargo workspace with
+[`crates/gateway/`](https://github.com/praxis-proxy/grid/tree/main/crates/gateway) is a separate Cargo workspace with
 its own lockfile. It contains `gateway` (the `grid-gateway` binary) and
-[`ai-grid-filters`](../../crates/gateway/crates/ai-grid-filters/). Root
+[`ai-grid-filters`](https://github.com/praxis-proxy/grid/tree/main/crates/gateway/crates/ai-grid-filters). Root
 `cargo --workspace` commands do not include it. Keep its TLS feature choices and
 production no-ring check intact when changing shared dependencies.
 

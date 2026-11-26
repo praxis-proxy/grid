@@ -205,7 +205,7 @@ LoadBalancer, so give it the platform too:
 --set platform=aws
 ```
 
-The rest of a provider's values are in the [praxis-gateway chart](../../charts/praxis-gateway/README.md).
+The rest of a provider's values are in the [praxis-gateway chart](https://github.com/praxis-proxy/grid/blob/main/charts/praxis-gateway/README.md).
 
 ## Internet-facing load balancers
 

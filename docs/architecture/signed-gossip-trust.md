@@ -141,7 +141,7 @@ for those checks.
 
 ## Implementation references
 
-- [Controller identity and peer-certificate validation](../../crates/operator/src/controller/grid_network.rs)
-- [Runtime trust snapshot and broadcast signing](../../crates/operator/src/swim_runtime.rs)
-- [SWIM signature verification and trust gate](../../crates/swim/src/state_broadcast.rs)
-- [Scoped peer pins and origin-state eviction](../../crates/swim/src/node.rs)
+- [Controller identity and peer-certificate validation](https://github.com/praxis-proxy/grid/blob/main/crates/operator/src/controller/grid_network.rs)
+- [Runtime trust snapshot and broadcast signing](https://github.com/praxis-proxy/grid/blob/main/crates/operator/src/swim_runtime.rs)
+- [SWIM signature verification and trust gate](https://github.com/praxis-proxy/grid/blob/main/crates/swim/src/state_broadcast.rs)
+- [Scoped peer pins and origin-state eviction](https://github.com/praxis-proxy/grid/blob/main/crates/swim/src/node.rs)
