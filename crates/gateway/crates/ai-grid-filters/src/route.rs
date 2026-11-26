@@ -1972,6 +1972,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn zero_queue_cost_keeps_affinity_but_not_excluded_sites() {
+        let settings = AffinitySettings {
+            queued_request_seconds: 0.0,
+            ..steady()
+        };
+        let sticky = filter(queued(&[("a", 1.0, OPEN), ("b", 0.0, OPEN)]), settings.clone());
+        assert_eq!(
+            pick_for_a_prompt(&sticky).as_deref(),
+            Some("a"),
+            "a deeper queue does not reopen the match"
+        );
+        let excluded = filter(
+            queued(&[("a", 1.0, AdmissionState::Excluded), ("b", 0.0, OPEN)]),
+            settings,
+        );
+        assert_eq!(
+            pick_for_a_prompt(&excluded).as_deref(),
+            Some("b"),
+            "affinity cannot restore an excluded site"
+        );
+    }
+
+    #[test]
     fn a_site_that_admits_nothing_never_takes_its_conversations() {
         let filter = filter(
             queued(&[("a", 0.0, AdmissionState::Excluded), ("b", 0.5, OPEN), ("c", 0.6, OPEN)]),

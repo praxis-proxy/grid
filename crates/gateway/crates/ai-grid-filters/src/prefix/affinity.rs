@@ -86,7 +86,7 @@ pub struct AffinitySettings {
     pub exploration: f64,
     /// Prompt tokens a site prefills per second, to price the cache a match saves.
     pub prefill_tokens_per_second: f64,
-    /// Seconds one queued request adds to a new request's wait, to turn that price into queue depth.
+    /// Seconds one queued request adds to a new request's wait. Zero disables the load comparison.
     pub queued_request_seconds: f64,
     /// A file holding the key that authenticates stored-state tags. Without one, tags carry no mac.
     pub tag_key_path: Option<String>,
@@ -134,13 +134,17 @@ impl AffinitySettings {
                 self.exploration
             ));
         }
-        for (name, value) in [
-            ("prefill_tokens_per_second", self.prefill_tokens_per_second),
-            ("queued_request_seconds", self.queued_request_seconds),
-        ] {
-            if !(value.is_finite() && value > 0.0) {
-                return Err(format!("prefix_affinity.{name} must be above 0, got {value}"));
-            }
+        if !(self.prefill_tokens_per_second.is_finite() && self.prefill_tokens_per_second > 0.0) {
+            return Err(format!(
+                "prefix_affinity.prefill_tokens_per_second must be above 0, got {}",
+                self.prefill_tokens_per_second
+            ));
+        }
+        if !(self.queued_request_seconds.is_finite() && self.queued_request_seconds >= 0.0) {
+            return Err(format!(
+                "prefix_affinity.queued_request_seconds must be 0 or above, got {}",
+                self.queued_request_seconds
+            ));
         }
         Ok(())
     }
@@ -237,7 +241,7 @@ impl Affinity<'_> {
             return Outcome::NoMatch;
         }
         // Deepest first, so a site holding only a shared system prompt cannot pull a conversation away.
-        if self.overloaded(sites, &depths, deepest, gate) {
+        if self.settings.queued_request_seconds > 0.0 && self.overloaded(sites, &depths, deepest, gate) {
             return Outcome::LoadOverride;
         }
         for (slot, depth) in keep.iter_mut().zip(depths) {
@@ -399,6 +403,32 @@ mod tests {
     }
 
     #[test]
+    fn zero_queue_cost_preserves_the_other_affinity_gates() -> Result<(), serde_json::Error> {
+        for (held, total, exploration, outcome, expected) in [
+            (40, 40, 0.0, Outcome::Sticky, [true, false]),
+            (4, 8, 0.0, Outcome::NoMatch, [true, true]),
+            (40, 40, 1.0, Outcome::Exploration, [true, true]),
+        ] {
+            let index = holding("east", held);
+            let keys = keys(total);
+            let mut settings: AffinitySettings = serde_json::from_str(r#"{"queued_request_seconds":0}"#)?;
+            settings.exploration = exploration;
+            assert!(settings.validate().is_ok(), "zero queue cost is valid");
+            let affinity = Affinity {
+                index: &index,
+                keys: Some(&keys),
+                settings: &settings,
+                turn: 0,
+            };
+            let mut keep = vec![true; 2];
+            let sites = sites(&[("east", f64::INFINITY), ("west", 0.0)]);
+            assert_eq!(affinity.narrow(&sites, &mut keep, &GATE), outcome);
+            assert_eq!(keep, expected, "only a qualifying match narrows the candidates");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn an_unmeasured_sticky_site_gives_way_to_a_measured_one() {
         let index = holding("east", 400);
         assert_eq!(
@@ -557,6 +587,14 @@ mod tests {
             },
             AffinitySettings {
                 prefill_tokens_per_second: 0.0,
+                ..base.clone()
+            },
+            AffinitySettings {
+                queued_request_seconds: -1.0,
+                ..base.clone()
+            },
+            AffinitySettings {
+                queued_request_seconds: f64::INFINITY,
                 ..base.clone()
             },
             AffinitySettings {

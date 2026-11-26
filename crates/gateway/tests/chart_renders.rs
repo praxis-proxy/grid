@@ -135,31 +135,33 @@ mod tests {
 
     #[test]
     fn a_grid_serving_render_with_site_route_tuning_loads() {
-        let Some(yaml) = render(&[
-            "--set=image.flavor=grid-gateway",
-            "--set=praxisConfig.render.gridServing.enabled=true",
-            "--set=praxisConfig.render.gridServing.networkName=grid",
-            "--set=praxisConfig.render.gridServing.siteRoute.availability.shedding=true",
-            // A float through --set is a string, which the schema refuses; a bool parses.
-            "--set=praxisConfig.render.gridServing.siteRoute.prefixAffinity.enabled=false",
-            "--set=gridIdentity.tlsSecretName=grid-site-identity",
-            "--set=gridIdentity.caSecretName=grid-ca",
-            "--set=praxisConfig.render.backends[0].cluster=pool-b",
-            "--set=praxisConfig.render.backends[0].transport.mode=mutual_tls",
-            "--set=praxisConfig.render.backends[0].transport.sni=site-b.grid.internal",
-            "--set=praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443",
-        ]) else {
-            return;
-        };
-        assert!(
-            yaml.contains("availability:") && yaml.contains("shedding: true"),
-            "the availability block is rendered:\n{yaml}"
-        );
-        assert!(
-            yaml.contains("prefix_affinity:"),
-            "prefixAffinity renders as the filter's prefix_affinity:\n{yaml}"
-        );
-        load(&yaml).unwrap_or_else(|error| panic!("grid serving with site route tuning: {error}"));
+        for (setting, value) in [("enabled", "false"), ("queued_request_seconds", "0")] {
+            let switch = format!("--set=praxisConfig.render.gridServing.siteRoute.prefixAffinity.{setting}={value}");
+            let Some(yaml) = render(&[
+                "--set=image.flavor=grid-gateway",
+                "--set=praxisConfig.render.gridServing.enabled=true",
+                "--set=praxisConfig.render.gridServing.networkName=grid",
+                "--set=praxisConfig.render.gridServing.siteRoute.availability.shedding=true",
+                &switch,
+                "--set=gridIdentity.tlsSecretName=grid-site-identity",
+                "--set=gridIdentity.caSecretName=grid-ca",
+                "--set=praxisConfig.render.backends[0].cluster=pool-b",
+                "--set=praxisConfig.render.backends[0].transport.mode=mutual_tls",
+                "--set=praxisConfig.render.backends[0].transport.sni=site-b.grid.internal",
+                "--set=praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443",
+            ]) else {
+                return;
+            };
+            assert!(
+                yaml.contains("availability:") && yaml.contains("shedding: true"),
+                "the availability block is rendered:\n{yaml}"
+            );
+            assert!(
+                yaml.contains("prefix_affinity:") && yaml.contains(&format!("{setting}: {value}")),
+                "the prefix affinity {setting} switch renders:\n{yaml}"
+            );
+            load(&yaml).unwrap_or_else(|error| panic!("grid serving with site route tuning: {error}"));
+        }
     }
 
     #[test]
