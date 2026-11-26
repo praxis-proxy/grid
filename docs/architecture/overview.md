@@ -5,6 +5,9 @@ gateways.  It watches Kubernetes resources, learns remote provider state,
 scores candidates, and writes a local routing overlay.  The gateway then uses
 that overlay on the request path.
 
+The [certificate lifecycle reference](certificates/README.md) identifies issuers,
+writers, validity periods, rotation owners, and installation dependencies.
+
 The important boundary is simple:
 
 ```text
